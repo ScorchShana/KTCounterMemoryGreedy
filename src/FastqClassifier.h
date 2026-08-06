@@ -353,7 +353,7 @@ private:
                 {
                     const kmer<N>& val = local_block_for_copy[read_offset];
 
-                    if (bloom_filter.insert(val))
+                    if (bloom_filter.insert(val) == Occurrence::FIRST)
                     {
                         export_block_ptr->k_mers[export_kmer_block_count++] = val;
                         prefix_export_count++;
@@ -401,7 +401,7 @@ private:
                 const uint64_t idx = prefix_begin + i;
                 const kmer<N>& val = local_block_for_copy[idx];
 
-                const bool is_first = bloom_filter.insert_prepared(probes[slot]);
+                const Occurrence occ = bloom_filter.insert_prepared(probes[slot]);
 
                 const uint32_t next_i = i + BLOOM_PREFETCH_DISTANCE;
                 if (next_i < prefix_count)
@@ -411,7 +411,7 @@ private:
                     bloom_filter.prefetch_insert(probes[slot]);
                 }
 
-                if (is_first)
+                if (occ == Occurrence::FIRST)
                 {
                     export_block_ptr->k_mers[export_kmer_block_count++] = val;
                     prefix_export_count++;
@@ -545,7 +545,7 @@ private:
             {
                 const kmer<N>& val = local_block_for_copy[read_offset];
 
-                if (bloom_filter.insert(val))
+                if (bloom_filter.insert(val) == Occurrence::FIRST)
                 {
                     export_block_ptr->k_mers[export_kmer_block_count++] = val;
                     prefix_export_count++;

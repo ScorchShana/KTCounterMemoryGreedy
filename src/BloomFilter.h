@@ -138,12 +138,19 @@ private:
 };
 
 
+enum class Occurrence : uint8_t
+{
+    FIRST = 0,      
+    SECOND = 1,     
+    THIRD_PLUS = 2, 
+};
+
 template <uint32_t N>
 class ConcurrentBloomFilter
 {
 
 private:
-    std::atomic<uint64_t>* filter_bins = nullptr;
+    std::atomic<uint64_t>* bins = nullptr; //  bins[2i]=BF1(初始全1), bins[2i+1]=BF2(初始全0)
     uint64_t capacity_;
     uint64_t mod;
 
@@ -165,10 +172,11 @@ public:
         : capacity_(in_capacity), mod(capacity_ - 1)
     {
         // capacity_ must be power of 2
-        filter_bins = static_cast<std::atomic<uint64_t>*>(memory_pool->allocate_large(capacity_ * sizeof(std::atomic<uint64_t>)));
+        bins = static_cast<std::atomic<uint64_t>*>(memory_pool->allocate_large(2 * capacity_ * sizeof(std::atomic<uint64_t>)));
         for (size_t i = 0; i < capacity_; ++i)
         {
-            new (&filter_bins[i]) std::atomic<uint64_t>(0); // 值初始化
+            new (&bins[2 * i]) std::atomic<uint64_t>(~0ULL); // BF1 全置1
+            new (&bins[2 * i + 1]) std::atomic<uint64_t>(0); // BF2 全置0
         }
     }
 
@@ -176,11 +184,11 @@ public:
     ConcurrentBloomFilter& operator=(const ConcurrentBloomFilter&) = delete;
 
     ConcurrentBloomFilter(ConcurrentBloomFilter&& other) noexcept
-        : filter_bins(other.filter_bins),
+        : bins(other.bins),
         capacity_(other.capacity_),
         mod(other.mod)
     {
-        other.filter_bins = nullptr;
+        other.bins = nullptr;
         other.capacity_ = 0;
         other.mod = 0;
     }
@@ -189,11 +197,11 @@ public:
     {
         if (this != &other)
         {
-            filter_bins = other.filter_bins;
+            bins = other.bins;
             capacity_ = other.capacity_;
             mod = other.mod;
 
-            other.filter_bins = nullptr;
+            other.bins = nullptr;
             other.capacity_ = 0;
             other.mod = 0;
         }
@@ -216,32 +224,42 @@ public:
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(filter_bins + probe.block_idx, 1, 0);
+        __builtin_prefetch(bins + probe.block_idx * 2, 1, 0);
 #else
         (void)probe;
 #endif
     }
 
-    bool insert_prepared(const InsertProbe& probe) noexcept
+    Occurrence insert_prepared(const InsertProbe& probe) noexcept
     {
-        const uint64_t first_snapshot = filter_bins[probe.block_idx].load(std::memory_order_relaxed);
-        if ((first_snapshot & probe.insert_num) == probe.insert_num)
+        std::atomic<uint64_t>* cell = bins + probe.block_idx * 2;
+        const uint64_t bf1_word = cell[0].load(std::memory_order_relaxed);
+        if ((bf1_word & probe.insert_num) == probe.insert_num) [[likely]]
         {
-            return false;// kmer exists in first filters
+            const uint64_t bf2_word = cell[1].load(std::memory_order_relaxed);
+            if ((bf2_word & probe.insert_num) == probe.insert_num)
+            {
+                // BF1、BF2均命中：已出现1次，本次为第2次出现，清BF1对应位
+                cell[0].fetch_and(~probe.insert_num, std::memory_order_relaxed);
+                return Occurrence::SECOND;
+            }
+            // BF1命中、BF2未命中：首次出现，置BF2对应位
+            cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
+            return Occurrence::FIRST;
         }
-        const uint64_t old_val = filter_bins[probe.block_idx].fetch_or(probe.insert_num, std::memory_order_relaxed);
-        return (old_val & probe.insert_num) != probe.insert_num; // kmer not exists in first filters
+        // BF1未命中：已出现2次及以上，本次为第3次及以上出现，直接进基数树
+        return Occurrence::THIRD_PLUS;
     }
 
-    bool insert(const kmer<N>& k_mer) noexcept
+    Occurrence insert(const kmer<N>& k_mer) noexcept
     {
         const InsertProbe probe = prepare_insert(k_mer);
-        return insert_prepared(probe); 
+        return insert_prepared(probe);
     }
 
-    std::atomic<uint64_t>* get_filter_bins()
+    std::atomic<uint64_t>* get_bins()
     {
-        return filter_bins;
+        return bins;
     }
 
 private:
