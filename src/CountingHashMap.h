@@ -112,7 +112,7 @@ private:
     // Extract fingerprint from hash (high 7 bits, ensure non-zero)
     static uint8_t fingerprint(uint64_t hash)
     {
-        return static_cast<uint8_t>((hash >> 57) | 0x01);
+        return static_cast<uint8_t>((hash >> 56) | 0x01);
     }
 
     // SIMD match and empty detection
@@ -223,7 +223,7 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func)
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
-        if (controls_[i] != 0) [[likely]]
+        if (controls_[i] != 0)
         {
             func(keys_[i], counts_[i]);
         }
@@ -236,7 +236,7 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func) const
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
-        if (controls_[i] != 0) [[likely]]
+        if (controls_[i] != 0)
         {
             func(keys_[i], counts_[i]);
         }
