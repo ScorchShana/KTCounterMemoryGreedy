@@ -140,9 +140,9 @@ private:
 
 enum class Occurrence : uint8_t
 {
-    FIRST = 0,      
-    SECOND = 1,     
-    THIRD_PLUS = 2, 
+    FIRST = 0,
+    SECOND = 1,
+    THIRD_PLUS = 2,
 };
 
 template <uint32_t N>
@@ -150,7 +150,7 @@ class ConcurrentBloomFilter
 {
 
 private:
-    std::atomic<uint64_t>* bins = nullptr; //  bins[2i]=BF1(初始全1), bins[2i+1]=BF2(初始全0)
+    std::atomic<uint64_t>* bins = nullptr; //  bins[2i]=BF1(初始全0), bins[2i+1]=BF2(初始全0)
     uint64_t capacity_;
     uint64_t mod;
 
@@ -175,7 +175,7 @@ public:
         bins = static_cast<std::atomic<uint64_t>*>(memory_pool->allocate_large(2 * capacity_ * sizeof(std::atomic<uint64_t>)));
         for (size_t i = 0; i < capacity_; ++i)
         {
-            new (&bins[2 * i]) std::atomic<uint64_t>(~0ULL); // BF1 全置1
+            new (&bins[2 * i]) std::atomic<uint64_t>(0); // BF1 全置0
             new (&bins[2 * i + 1]) std::atomic<uint64_t>(0); // BF2 全置0
         }
     }
@@ -234,21 +234,26 @@ public:
     {
         std::atomic<uint64_t>* cell = bins + probe.block_idx * 2;
         const uint64_t bf1_word = cell[0].load(std::memory_order_relaxed);
-        if ((bf1_word & probe.insert_num) == probe.insert_num) [[likely]]
+        if ((bf1_word & probe.insert_num) == probe.insert_num)
+        {
+            // BF1命中：已出现2次，本次为第3次及以上出现
+            return Occurrence::THIRD_PLUS;
+        }
+        else
         {
             const uint64_t bf2_word = cell[1].load(std::memory_order_relaxed);
             if ((bf2_word & probe.insert_num) == probe.insert_num)
             {
-                // BF1、BF2均命中：已出现1次，本次为第2次出现，清BF1对应位
-                cell[0].fetch_and(~probe.insert_num, std::memory_order_relaxed);
+                // BF1未命中，BF2命中：已出现1次，本次为第2次出现，置BF1对应位
+                cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
                 return Occurrence::SECOND;
             }
-            // BF1命中、BF2未命中：首次出现，置BF2对应位
-            cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
-            return Occurrence::FIRST;
+            else {
+                // BF1未命中、BF2未命中：首次出现，置BF2对应位
+                cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                return Occurrence::FIRST;
+            }
         }
-        // BF1未命中：已出现2次及以上，本次为第3次及以上出现，直接进基数树
-        return Occurrence::THIRD_PLUS;
     }
 
     Occurrence insert(const kmer<N>& k_mer) noexcept
