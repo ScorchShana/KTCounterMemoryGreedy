@@ -245,12 +245,28 @@ public:
             if ((bf2_word & probe.insert_num) == probe.insert_num)
             {
                 // BF1未命中，BF2命中：已出现1次，本次为第2次出现，置BF1对应位
-                cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                if ((bf1_word_before & probe.insert_num) == probe.insert_num)
+                {
+                    // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
+                    return Occurrence::THIRD_PLUS;
+                }
                 return Occurrence::SECOND;
             }
             else {
                 // BF1未命中、BF2未命中：首次出现，置BF2对应位
-                cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                const uint64_t bf2_word_before = cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                if((bf2_word_before & probe.insert_num) == probe.insert_num)
+                {
+                    // 可能存在竞争，BF2命中，已出现1次，本次为第2次出现，置BF1对应位
+                    const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                    if ((bf1_word_before & probe.insert_num) == probe.insert_num)
+                    {
+                        // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
+                        return Occurrence::THIRD_PLUS;
+                    }
+                    return Occurrence::SECOND;
+                }
                 return Occurrence::FIRST;
             }
         }

@@ -179,7 +179,7 @@ public:
 
                     kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
                     const uint64_t kmer_count = content.length; // length 就是 k-mer数量
-                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
+                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likely]]
                     {
                         process_owned_block(kmer_data, kmer_count);
                     }
@@ -602,37 +602,42 @@ private:
                 continue;
             }
 
-            uint32_t prefix_export_count = 0;
+            uint32_t third_count = 0;
 
+            // Bloom 保持原样：共享 filter + 逐个 insert，无 prefetch
             ConcurrentBloomFilter<N>& bloom_filter = *local_global_bloom_filter[prefix];
 
             for (uint32_t i = 0; i < prefix_count; i++)
             {
                 const kmer<N>& val = local_block_for_copy[read_offset];
 
-                if (bloom_filter.insert(val) == Occurrence::FIRST)
+                const Occurrence occ = bloom_filter.insert(val);
+                if (occ == Occurrence::FIRST)
                 {
-                    export_one_kmer(val);
-                    prefix_export_count++;
+                    push_occurrence_first(val);
+                }
+                else if (occ == Occurrence::SECOND)
+                {
+                    push_occurrence_second(val);
                 }
                 else
                 {
                     local_block_for_copy[local_block_count++] = val;
+                    third_count++;
                 }
 
                 read_offset++;
             }
 
-            local_block_prefix_counts[prefix] -= prefix_export_count;
+            local_block_prefix_counts[prefix] = third_count;
 #ifdef TEST_MODE
-            // export 已在 export_one_kmer 中计数；此处只计进树
-            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+            // FIRST/SECOND 经 flush 计数；此处只计本块 THIRD+ 进树
+            total_kmers_send_to_tree += third_count;
 #endif
         }
 
         if (local_block_count > 0) [[likely]]
         {
-
             tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
         }
     }
