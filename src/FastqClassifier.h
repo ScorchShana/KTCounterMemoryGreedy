@@ -37,11 +37,11 @@ class FastqClassifier
     // Owned 双缓冲 + HashSet 容量（Buf2 ≤ ~0.875 * HashSet CAPACITY）
     static constexpr size_t OCC_HASHSET_CAPACITY =
         std::bit_ceil(static_cast<size_t>(
-            2 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15));
+            4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15));
     static constexpr size_t OCC_BUF2_CAPACITY =
         static_cast<size_t>(OCC_HASHSET_CAPACITY * 7 / 8);
     static constexpr size_t OCC_BUF1_CAPACITY =
-        std::max<size_t>(EXPORT_KMER_BLOCK_CAPACITY, OCC_BUF2_CAPACITY * 4);
+        std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY, OCC_BUF2_CAPACITY * 4);
     static constexpr size_t TREE_CHUNK_KMER_CAP =
         PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr size_t OCC_FLUSH_TREE_CAP = OCC_BUF1_CAPACITY + OCC_BUF2_CAPACITY;
@@ -602,37 +602,33 @@ private:
                 continue;
             }
 
-            uint32_t third_count = 0;
+            uint32_t prefix_export_count = 0;
 
-            // Bloom 保持原样：共享 filter + 逐个 insert，无 prefetch
+            // Bloom 保持原样：共享 filter + 逐个 insert，无 prefetch；不走本线程 Buf 去重
             ConcurrentBloomFilter<N>& bloom_filter = *local_global_bloom_filter[prefix];
 
             for (uint32_t i = 0; i < prefix_count; i++)
             {
                 const kmer<N>& val = local_block_for_copy[read_offset];
 
-                const Occurrence occ = bloom_filter.insert(val);
-                if (occ == Occurrence::FIRST)
+                if (bloom_filter.insert(val) == Occurrence::FIRST)
                 {
-                    push_occurrence_first(val);
-                }
-                else if (occ == Occurrence::SECOND)
-                {
-                    push_occurrence_second(val);
+                    export_one_kmer(val);
+                    prefix_export_count++;
                 }
                 else
                 {
+                    // SECOND 与 THIRD_PLUS：立刻进树缓冲
                     local_block_for_copy[local_block_count++] = val;
-                    third_count++;
                 }
 
                 read_offset++;
             }
 
-            local_block_prefix_counts[prefix] = third_count;
+            local_block_prefix_counts[prefix] -= prefix_export_count;
 #ifdef TEST_MODE
-            // FIRST/SECOND 经 flush 计数；此处只计本块 THIRD+ 进树
-            total_kmers_send_to_tree += third_count;
+            // export 已在 export_one_kmer 中计数；此处计非 FIRST 进树
+            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
 #endif
         }
 
