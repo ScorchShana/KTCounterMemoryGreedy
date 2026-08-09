@@ -92,14 +92,14 @@ private:
     std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const noexcept
     {
 
-// #if defined(__AVX2__)
-//         __m256i ctrl = _mm256_loadu_si256(
-//             reinterpret_cast<const __m256i*>(&controls_[base]));
-//         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
+        // #if defined(__AVX2__)
+        //         __m256i ctrl = _mm256_loadu_si256(
+        //             reinterpret_cast<const __m256i*>(&controls_[base]));
+        //         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
 
-//         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
-//         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
-//         return { match_mask, empty_mask };
+        //         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
+        //         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
+        //         return { match_mask, empty_mask };
 
 #if defined(__SSE4_2__) || defined(__AVX2__)
         __m128i ctrl = _mm_loadu_si128(
@@ -142,10 +142,11 @@ void HashSet<N, CAPACITY>::insert(const KeyType& key)
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
     size_t idx = h & mod;
+    size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & mod;
+        size_t base = idx;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -176,6 +177,11 @@ void HashSet<N, CAPACITY>::insert(const KeyType& key)
             ++size_;
             return;
         }
+
+        offset += GROUP_SIZE;
+        offset &= mod;
+        idx += offset;
+        idx &= mod;
     }
 }
 
@@ -187,10 +193,11 @@ bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
     size_t idx = h & mod;
+    size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & mod;
+        size_t base = idx;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -211,6 +218,11 @@ bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
         {
             return false;
         }
+
+        offset += GROUP_SIZE;
+        offset &= mod;
+        idx += offset;
+        idx &= mod;
     }
 
     return false;
