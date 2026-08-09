@@ -10,11 +10,15 @@
 #include "MPSCRingQueue.h"
 #include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
+#include "HashSet.h"
 
 #include <array>
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <bitset>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <barrier>
 
@@ -28,7 +32,24 @@ class FastqClassifier
     static constexpr int MAX_BACKOFF = 64;
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 4; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+
+    // Owned 双缓冲 + HashSet 容量（Buf2 ≤ ~0.875 * HashSet CAPACITY）
+    static constexpr size_t OCC_HASHSET_CAPACITY =
+        std::bit_ceil(static_cast<size_t>(
+            4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15));
+    static constexpr size_t OCC_BUF2_CAPACITY =
+        static_cast<size_t>(OCC_HASHSET_CAPACITY * 7 / 8);
+    static constexpr size_t OCC_BUF1_CAPACITY =
+        std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY, OCC_BUF2_CAPACITY * 4);
+    static constexpr size_t TREE_CHUNK_KMER_CAP =
+        PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+    static constexpr size_t OCC_FLUSH_TREE_CAP = OCC_BUF1_CAPACITY + OCC_BUF2_CAPACITY;
+
+    static_assert(OCC_HASHSET_CAPACITY >= 8 && (OCC_HASHSET_CAPACITY & (OCC_HASHSET_CAPACITY - 1)) == 0,
+        "OCC_HASHSET_CAPACITY must be a power of two");
+    static_assert(OCC_BUF2_CAPACITY <= OCC_HASHSET_CAPACITY * 7 / 8 + 1,
+        "OCC_BUF2_CAPACITY must fit HashSet load factor");
 
     int k_len;
     uint32_t classifier_index;
@@ -55,7 +76,17 @@ class FastqClassifier
 
     std::vector<ConcurrentBloomFilter<N>> local_bloom_filters;
 
+    // Owned FIRST/SECOND 缓冲与 HashSet（仅 owned 路径）
+    std::array<kmer<N>, OCC_BUF1_CAPACITY> occ_buf1_{};
+    std::array<kmer<N>, OCC_BUF2_CAPACITY> occ_buf2_{};
+    uint32_t occ_buf1_size_ = 0;
+    uint32_t occ_buf2_size_ = 0;
+    HashSet<N, OCC_HASHSET_CAPACITY> occ_hash_set_{};
 
+    // flush 进树：按 prefix 有序的全量列表 + 分片 chunk（不得复用 local_block_for_copy）
+    std::array<kmer<N>, OCC_FLUSH_TREE_CAP> occ_flush_tree_kmers_{};
+    std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_{};
+    std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_chunk_prefix_counts_{};
 
     SplitMix64 rng;
 
@@ -148,7 +179,7 @@ public:
 
                     kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
                     const uint64_t kmer_count = content.length; // length 就是 k-mer数量
-                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
+                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likely]]
                     {
                         process_owned_block(kmer_data, kmer_count);
                     }
@@ -274,6 +305,8 @@ public:
             }
         }*/
 
+        flush_occurrence_buffers();
+
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
 
@@ -327,6 +360,128 @@ private:
         }
     }
 
+    void export_one_kmer(const kmer<N>& val) noexcept
+    {
+        export_block_ptr->k_mers[export_kmer_block_count++] = val;
+        if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
+        {
+            enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
+            export_kmer_block_count = 0;
+            char* raw_block_ptr = nullptr;
+            dequeue_data_to_export_writer(raw_block_ptr);
+            export_block_ptr = reinterpret_cast<ExportBlock<N>*>(raw_block_ptr);
+        }
+#ifdef TEST_MODE
+        total_kmers_exported++;
+#endif
+    }
+
+    void push_occurrence_first(const kmer<N>& val) noexcept
+    {
+        occ_buf1_[occ_buf1_size_++] = val;
+        if (occ_buf1_size_ == OCC_BUF1_CAPACITY)
+        {
+            flush_occurrence_buffers();
+        }
+    }
+
+    void push_occurrence_second(const kmer<N>& val) noexcept
+    {
+        occ_buf2_[occ_buf2_size_++] = val;
+        if (occ_buf2_size_ == OCC_BUF2_CAPACITY)
+        {
+            flush_occurrence_buffers();
+        }
+    }
+
+    void flush_occurrence_buffers() noexcept
+    {
+        if (occ_buf1_size_ == 0 && occ_buf2_size_ == 0)
+        {
+            return;
+        }
+
+        occ_hash_set_.clear();
+
+        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
+        {
+            occ_hash_set_.insert(occ_buf2_[i]);
+        }
+
+        // 统计将进树的 k-mer 的 prefix 分布；未配对 FIRST 直接 export
+        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> tree_prefix_counts{};
+        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
+        {
+            tree_prefix_counts[get_root_prefix(occ_buf2_[i])]++;
+        }
+        for (uint32_t i = 0; i < occ_buf1_size_; ++i)
+        {
+            const kmer<N>& x = occ_buf1_[i];
+            if (occ_hash_set_.contains(x))
+            {
+                tree_prefix_counts[get_root_prefix(x)]++;
+            }
+            else
+            {
+                export_one_kmer(x);
+            }
+        }
+
+        // exclusive prefix sums → scatter 写入有序缓冲
+        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> scatter_pos{};
+        uint32_t tree_n = 0;
+        for (uint64_t p = 0; p < tree_prefix_counts.size(); ++p)
+        {
+            scatter_pos[p] = tree_n;
+            tree_n += tree_prefix_counts[p];
+        }
+
+        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
+        {
+            const uint64_t p = get_root_prefix(occ_buf2_[i]);
+            occ_flush_tree_kmers_[scatter_pos[p]++] = occ_buf2_[i];
+        }
+        for (uint32_t i = 0; i < occ_buf1_size_; ++i)
+        {
+            const kmer<N>& x = occ_buf1_[i];
+            if (occ_hash_set_.contains(x))
+            {
+                const uint64_t p = get_root_prefix(x);
+                occ_flush_tree_kmers_[scatter_pos[p]++] = x;
+            }
+        }
+
+        // 按 TREE_CHUNK 分片 main_add（片内保持全局 prefix 序）
+        uint32_t offset = 0;
+        while (offset < tree_n)
+        {
+            const uint32_t take = static_cast<uint32_t>(
+                std::min<uint32_t>(static_cast<uint32_t>(TREE_CHUNK_KMER_CAP), tree_n - offset));
+
+            std::memset(occ_tree_chunk_prefix_counts_.data(), 0,
+                occ_tree_chunk_prefix_counts_.size() * sizeof(uint32_t));
+
+            for (uint32_t j = 0; j < take; ++j)
+            {
+                const kmer<N>& k = occ_flush_tree_kmers_[offset + j];
+                occ_tree_chunk_[j] = k;
+                occ_tree_chunk_prefix_counts_[get_root_prefix(k)]++;
+            }
+
+            tree->main_add_kmer_block_with_local_root_nodes(
+                occ_tree_chunk_, occ_tree_chunk_prefix_counts_, local_root_nodes.data());
+
+#ifdef TEST_MODE
+            total_kmers_send_to_tree += take;
+#endif
+            offset += take;
+        }
+
+        occ_buf1_size_ = 0;
+        occ_buf2_size_ = 0;
+        occ_hash_set_.clear();
+    }
+
     void classify_owned_local_block() noexcept
     {
 
@@ -341,7 +496,7 @@ private:
                 continue;
             }
 
-            uint32_t prefix_export_count = 0;
+            uint32_t third_count = 0;
 
             const uint32_t bloom_filter_index = prefix_to_bloom_filter_index[prefix];
 
@@ -353,33 +508,28 @@ private:
                 {
                     const kmer<N>& val = local_block_for_copy[read_offset];
 
-                    if (bloom_filter.insert(val) == Occurrence::FIRST)
+                    const Occurrence occ = bloom_filter.insert(val);
+                    if (occ == Occurrence::FIRST)
                     {
-                        export_block_ptr->k_mers[export_kmer_block_count++] = val;
-                        prefix_export_count++;
-
-                        if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
-                        {
-                            enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
-                            export_kmer_block_count = 0;
-                            char* raw_block_ptr = nullptr;
-                            dequeue_data_to_export_writer(raw_block_ptr);
-                            export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-                        }
+                        push_occurrence_first(val);
+                    }
+                    else if (occ == Occurrence::SECOND)
+                    {
+                        push_occurrence_second(val);
                     }
                     else
                     {
                         local_block_for_copy[local_block_count++] = val;
+                        third_count++;
                     }
 
                     read_offset++;
                 }
 
-                local_block_prefix_counts[prefix] -= prefix_export_count;
+                local_block_prefix_counts[prefix] = third_count;
 
 #ifdef TEST_MODE
-                total_kmers_exported += prefix_export_count;
-                total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+                total_kmers_send_to_tree += third_count;
 #endif
                 continue;
             }
@@ -413,29 +563,23 @@ private:
 
                 if (occ == Occurrence::FIRST)
                 {
-                    export_block_ptr->k_mers[export_kmer_block_count++] = val;
-                    prefix_export_count++;
-
-                    if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
-                    {
-                        enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
-                        export_kmer_block_count = 0;
-                        char* raw_block_ptr = nullptr;
-                        dequeue_data_to_export_writer(raw_block_ptr);
-                        export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-                    }
+                    push_occurrence_first(val);
+                }
+                else if (occ == Occurrence::SECOND)
+                {
+                    push_occurrence_second(val);
                 }
                 else
                 {
                     local_block_for_copy[local_block_count++] = val;
+                    third_count++;
                 }
             }
 
             read_offset += prefix_count;
-            local_block_prefix_counts[prefix] -= prefix_export_count;
+            local_block_prefix_counts[prefix] = third_count;
 #ifdef TEST_MODE
-            total_kmers_exported += prefix_export_count;
-            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+            total_kmers_send_to_tree += third_count;
 #endif
         }
 
@@ -460,86 +604,8 @@ private:
 
             uint32_t prefix_export_count = 0;
 
+            // Bloom 保持原样：共享 filter + 逐个 insert，无 prefetch；不走本线程 Buf 去重
             ConcurrentBloomFilter<N>& bloom_filter = *local_global_bloom_filter[prefix];
-
-            // if (prefix_count < BLOOM_PREFETCH_DISTANCE / 2) [[unlikely]]
-            // {
-            //     for (uint32_t i = 0; i < prefix_count; ++i)
-            //     {
-            //         const kmer<N>& val = local_block_for_copy[read_offset];
-
-            //         if (bloom_filter.insert(val))
-            //         {
-            //             export_block_ptr->k_mers[export_kmer_block_count++] = val;
-            //             prefix_export_count++;
-
-            //             if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
-            //             {
-            //                 enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
-            //                 export_kmer_block_count = 0;
-            //                 char* raw_block_ptr = nullptr;
-            //                 dequeue_data_to_export_writer(raw_block_ptr);
-            //                 export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-            //             }
-            //         }
-            //         else
-            //         {
-            //             local_block_for_copy[local_block_count++] = val;
-            //         }
-
-            //         read_offset++;
-            //     }
-
-            //     local_block_prefix_counts[prefix] -= prefix_export_count;
-            //     continue;
-            // }
-
-            // std::array<typename ConcurrentBloomFilter<N>::InsertProbe, BLOOM_PREFETCH_DISTANCE> probes;
-            // const uint64_t prefix_begin = read_offset;
-            // const uint32_t warmup_count = (prefix_count < BLOOM_PREFETCH_DISTANCE) ? prefix_count : BLOOM_PREFETCH_DISTANCE;
-
-            // for (uint32_t i = 0; i < warmup_count; ++i)
-            // {
-            //     const uint64_t idx = prefix_begin + i;
-            //     probes[i] = bloom_filter.prepare_insert(local_block_for_copy[idx]);
-            //     bloom_filter.prefetch_insert(probes[i]);
-            // }
-
-            // for (uint32_t i = 0; i < prefix_count; ++i)
-            // {
-            //     const uint32_t slot = i % BLOOM_PREFETCH_DISTANCE;
-            //     const uint64_t idx = prefix_begin + i;
-            //     const kmer<N>& val = local_block_for_copy[idx];
-
-            //     const bool is_first = bloom_filter.insert_prepared(probes[slot]);
-
-            //     const uint32_t next_i = i + BLOOM_PREFETCH_DISTANCE;
-            //     if (next_i < prefix_count)
-            //     {
-            //         const uint64_t next_idx = prefix_begin + next_i;
-            //         probes[slot] = bloom_filter.prepare_insert(local_block_for_copy[next_idx]);
-            //         bloom_filter.prefetch_insert(probes[slot]);
-            //     }
-
-            //     if (is_first)
-            //     {
-            //         export_block_ptr->k_mers[export_kmer_block_count++] = val;
-            //         prefix_export_count++;
-
-            //         if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
-            //         {
-            //             enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
-            //             export_kmer_block_count = 0;
-            //             char* raw_block_ptr = nullptr;
-            //             dequeue_data_to_export_writer(raw_block_ptr);
-            //             export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-            //         }
-            //     }
-            //     else
-            //     {
-            //         local_block_for_copy[local_block_count++] = val;
-            //     }
-            // }
 
             for (uint32_t i = 0; i < prefix_count; i++)
             {
@@ -547,37 +613,27 @@ private:
 
                 if (bloom_filter.insert(val) == Occurrence::FIRST)
                 {
-                    export_block_ptr->k_mers[export_kmer_block_count++] = val;
+                    export_one_kmer(val);
                     prefix_export_count++;
-
-                    if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
-                    {
-                        enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
-                        export_kmer_block_count = 0;
-                        char* raw_block_ptr = nullptr;
-                        dequeue_data_to_export_writer(raw_block_ptr);
-                        export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-                    }
                 }
                 else
                 {
+                    // SECOND 与 THIRD_PLUS：立刻进树缓冲
                     local_block_for_copy[local_block_count++] = val;
                 }
 
                 read_offset++;
             }
 
-            //read_offset += prefix_count;
             local_block_prefix_counts[prefix] -= prefix_export_count;
 #ifdef TEST_MODE
-            total_kmers_exported += prefix_export_count;
+            // export 已在 export_one_kmer 中计数；此处计非 FIRST 进树
             total_kmers_send_to_tree += local_block_prefix_counts[prefix];
 #endif
         }
 
         if (local_block_count > 0) [[likely]]
         {
-
             tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
         }
     }
