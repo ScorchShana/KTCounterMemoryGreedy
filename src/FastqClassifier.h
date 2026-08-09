@@ -19,6 +19,7 @@
 #include <bitset>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 #include <barrier>
 
@@ -34,22 +35,24 @@ class FastqClassifier
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 4; // 预取 Bloom Filter 的距离（单位：k-mer数量）
 
-    // Owned 双缓冲 + HashSet 容量（Buf2 ≤ ~0.875 * HashSet CAPACITY）
-    static constexpr size_t OCC_HASHSET_CAPACITY =
-        std::bit_ceil(static_cast<size_t>(
-            4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15));
-    static constexpr size_t OCC_BUF2_CAPACITY =
-        static_cast<size_t>(OCC_HASHSET_CAPACITY * 7 / 8);
-    static constexpr size_t OCC_BUF1_CAPACITY =
-        std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY, OCC_BUF2_CAPACITY * 4);
+    // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
+    // per_thread ≈ (B1+B2)*sizeof(kmer) + sizeof(HashSet) + 2*TREE_CHUNK*sizeof(kmer)
+    // static constexpr size_t OCC_BUF1_CAPACITY =
+    //     std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY,
+    //         std::bit_ceil(static_cast<size_t>(
+    //             4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15)) * 4);
+    static constexpr size_t OCC_BUF1_CAPACITY = 512 * 1024 * 1024 / sizeof(kmer<N>); // 512 M
+    static constexpr size_t OCC_HASHSET_CAPACITY = std::bit_ceil(std::max<size_t>(size_t{ 32 }, OCC_BUF1_CAPACITY / 4));
+    static constexpr size_t OCC_BUF2_CAPACITY = OCC_HASHSET_CAPACITY * 7 / 8;
     static constexpr size_t TREE_CHUNK_KMER_CAP =
         PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr size_t OCC_FLUSH_TREE_CAP = OCC_BUF1_CAPACITY + OCC_BUF2_CAPACITY;
 
-    static_assert(OCC_HASHSET_CAPACITY >= 8 && (OCC_HASHSET_CAPACITY & (OCC_HASHSET_CAPACITY - 1)) == 0,
-        "OCC_HASHSET_CAPACITY must be a power of two");
-    static_assert(OCC_BUF2_CAPACITY <= OCC_HASHSET_CAPACITY * 7 / 8 + 1,
+    static_assert(OCC_HASHSET_CAPACITY >= 32 && (OCC_HASHSET_CAPACITY & (OCC_HASHSET_CAPACITY - 1)) == 0,
+        "OCC_HASHSET_CAPACITY must be a power of two and >= 32");
+    static_assert(OCC_BUF2_CAPACITY <= OCC_HASHSET_CAPACITY * 7 / 8,
         "OCC_BUF2_CAPACITY must fit HashSet load factor");
+    static_assert(OCC_BUF1_CAPACITY >= OCC_BUF2_CAPACITY && OCC_BUF2_CAPACITY >= 1,
+        "OCC_BUF capacities invalid");
 
     int k_len;
     uint32_t classifier_index;
@@ -76,16 +79,16 @@ class FastqClassifier
 
     std::vector<ConcurrentBloomFilter<N>> local_bloom_filters;
 
-    // Owned FIRST/SECOND 缓冲与 HashSet（仅 owned 路径）
-    std::array<kmer<N>, OCC_BUF1_CAPACITY> occ_buf1_{};
-    std::array<kmer<N>, OCC_BUF2_CAPACITY> occ_buf2_{};
-    uint32_t occ_buf1_size_ = 0;
-    uint32_t occ_buf2_size_ = 0;
-    HashSet<N, OCC_HASHSET_CAPACITY> occ_hash_set_{};
+    // Owned FIRST/SECOND 缓冲与 HashSet：allocate_large（仅 owned 路径写入）
+    kmer<N>* occ_buf1_ = nullptr;
+    kmer<N>* occ_buf2_ = nullptr;
+    size_t occ_buf1_size_ = 0;
+    size_t occ_buf2_size_ = 0;
+    HashSet<N, OCC_HASHSET_CAPACITY>* occ_hash_set_ = nullptr;
 
-    // flush 进树：按 prefix 有序的全量列表 + 分片 chunk（不得复用 local_block_for_copy）
-    std::array<kmer<N>, OCC_FLUSH_TREE_CAP> occ_flush_tree_kmers_{};
+    // F-batch flush：无序累积 → counting sort → main_add（不得复用 local_block_for_copy）
     std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_{};
+    std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_sorted_{};
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_chunk_prefix_counts_{};
 
     SplitMix64 rng;
@@ -117,6 +120,16 @@ public:
         dequeue_data_to_export_writer(raw_block_ptr);
         export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
 
+        // Buf1/Buf2/HashSet：pool large 分配（须 init_arenas 之后；本线程 Arena）
+        occ_buf1_ = static_cast<kmer<N>*>(
+            in_memory_pool->allocate_large(OCC_BUF1_CAPACITY * sizeof(kmer<N>)));
+        occ_buf2_ = static_cast<kmer<N>*>(
+            in_memory_pool->allocate_large(OCC_BUF2_CAPACITY * sizeof(kmer<N>)));
+        void* hash_set_mem = in_memory_pool->allocate_large(sizeof(HashSet<N, OCC_HASHSET_CAPACITY>));
+        occ_hash_set_ = new (hash_set_mem) HashSet<N, OCC_HASHSET_CAPACITY>();
+        occ_buf1_size_ = 0;
+        occ_buf2_size_ = 0;
+
         local_prefix_owners = prefix_owners;
 
         for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); i++)
@@ -147,6 +160,13 @@ public:
 
     ~FastqClassifier()
     {
+        if (occ_hash_set_ != nullptr)
+        {
+            occ_hash_set_->~HashSet();
+            occ_hash_set_ = nullptr;
+        }
+        occ_buf1_ = nullptr;
+        occ_buf2_ = nullptr;
     }
 
     void classify_and_push()
@@ -394,6 +414,48 @@ private:
         }
     }
 
+    // F-batch：对 occ_tree_chunk_[0..chunk_n) counting sort → occ_tree_chunk_sorted_ → main_add
+    void commit_tree_chunk(const size_t chunk_n) noexcept
+    {
+        if (chunk_n == 0)
+        {
+            return;
+        }
+
+        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> cnt{};
+        for (size_t i = 0; i < chunk_n; ++i)
+        {
+            cnt[get_root_prefix(occ_tree_chunk_[i])]++;
+        }
+
+        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> scatter_pos{};
+        scatter_pos[0] = 0;
+        for (uint64_t p = 1; p < scatter_pos.size(); ++p)
+        {
+            scatter_pos[p] = scatter_pos[p - 1] + cnt[p - 1];
+        }
+
+        for (size_t i = 0; i < chunk_n; ++i)
+        {
+            const uint64_t p = get_root_prefix(occ_tree_chunk_[i]);
+            occ_tree_chunk_sorted_[scatter_pos[p]++] = occ_tree_chunk_[i];
+        }
+
+        std::memset(occ_tree_chunk_prefix_counts_.data(), 0,
+            occ_tree_chunk_prefix_counts_.size() * sizeof(uint32_t));
+        for (uint64_t p = 0; p < cnt.size(); ++p)
+        {
+            occ_tree_chunk_prefix_counts_[p] = cnt[p];
+        }
+
+        tree->main_add_kmer_block_with_local_root_nodes(
+            occ_tree_chunk_sorted_, occ_tree_chunk_prefix_counts_, local_root_nodes.data());
+
+#ifdef TEST_MODE
+        total_kmers_send_to_tree += chunk_n;
+#endif
+    }
+
     void flush_occurrence_buffers() noexcept
     {
         if (occ_buf1_size_ == 0 && occ_buf2_size_ == 0)
@@ -401,25 +463,32 @@ private:
             return;
         }
 
-        occ_hash_set_.clear();
+        occ_hash_set_->clear();
 
-        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
+        size_t chunk_n = 0;
+
+        auto append_tree_kmer = [&](const kmer<N>& k) noexcept
+            {
+                occ_tree_chunk_[chunk_n++] = k;
+                if (chunk_n == TREE_CHUNK_KMER_CAP)
+                {
+                    commit_tree_chunk(chunk_n);
+                    chunk_n = 0;
+                }
+            };
+
+        for (size_t i = 0; i < occ_buf2_size_; ++i)
         {
-            occ_hash_set_.insert(occ_buf2_[i]);
+            occ_hash_set_->insert(occ_buf2_[i]);
+            append_tree_kmer(occ_buf2_[i]);
         }
 
-        // 统计将进树的 k-mer 的 prefix 分布；未配对 FIRST 直接 export
-        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> tree_prefix_counts{};
-        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
-        {
-            tree_prefix_counts[get_root_prefix(occ_buf2_[i])]++;
-        }
-        for (uint32_t i = 0; i < occ_buf1_size_; ++i)
+        for (size_t i = 0; i < occ_buf1_size_; ++i)
         {
             const kmer<N>& x = occ_buf1_[i];
-            if (occ_hash_set_.contains(x))
+            if (occ_hash_set_->contains(x))
             {
-                tree_prefix_counts[get_root_prefix(x)]++;
+                append_tree_kmer(x);
             }
             else
             {
@@ -427,59 +496,14 @@ private:
             }
         }
 
-        // exclusive prefix sums → scatter 写入有序缓冲
-        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> scatter_pos{};
-        uint32_t tree_n = 0;
-        for (uint64_t p = 0; p < tree_prefix_counts.size(); ++p)
+        if (chunk_n > 0)
         {
-            scatter_pos[p] = tree_n;
-            tree_n += tree_prefix_counts[p];
-        }
-
-        for (uint32_t i = 0; i < occ_buf2_size_; ++i)
-        {
-            const uint64_t p = get_root_prefix(occ_buf2_[i]);
-            occ_flush_tree_kmers_[scatter_pos[p]++] = occ_buf2_[i];
-        }
-        for (uint32_t i = 0; i < occ_buf1_size_; ++i)
-        {
-            const kmer<N>& x = occ_buf1_[i];
-            if (occ_hash_set_.contains(x))
-            {
-                const uint64_t p = get_root_prefix(x);
-                occ_flush_tree_kmers_[scatter_pos[p]++] = x;
-            }
-        }
-
-        // 按 TREE_CHUNK 分片 main_add（片内保持全局 prefix 序）
-        uint32_t offset = 0;
-        while (offset < tree_n)
-        {
-            const uint32_t take = static_cast<uint32_t>(
-                std::min<uint32_t>(static_cast<uint32_t>(TREE_CHUNK_KMER_CAP), tree_n - offset));
-
-            std::memset(occ_tree_chunk_prefix_counts_.data(), 0,
-                occ_tree_chunk_prefix_counts_.size() * sizeof(uint32_t));
-
-            for (uint32_t j = 0; j < take; ++j)
-            {
-                const kmer<N>& k = occ_flush_tree_kmers_[offset + j];
-                occ_tree_chunk_[j] = k;
-                occ_tree_chunk_prefix_counts_[get_root_prefix(k)]++;
-            }
-
-            tree->main_add_kmer_block_with_local_root_nodes(
-                occ_tree_chunk_, occ_tree_chunk_prefix_counts_, local_root_nodes.data());
-
-#ifdef TEST_MODE
-            total_kmers_send_to_tree += take;
-#endif
-            offset += take;
+            commit_tree_chunk(chunk_n);
         }
 
         occ_buf1_size_ = 0;
         occ_buf2_size_ = 0;
-        occ_hash_set_.clear();
+        occ_hash_set_->clear();
     }
 
     void classify_owned_local_block() noexcept
@@ -624,6 +648,30 @@ private:
 
                 read_offset++;
             }
+
+            // uint32_t third_count = 0;
+            // for (uint32_t i = 0; i < prefix_count; i++)
+            // {
+            //     const kmer<N>& val = local_block_for_copy[read_offset];
+
+            //     const Occurrence occ = bloom_filter.insert(val);
+
+            //     if (occ == Occurrence::FIRST)
+            //     {
+            //         push_occurrence_first(val);
+            //     }
+            //     else if (occ == Occurrence::SECOND)
+            //     {
+            //         push_occurrence_second(val);
+            //     }
+            //     else
+            //     {
+            //         local_block_for_copy[local_block_count++] = val;
+            //         third_count++;
+            //     }
+
+            //     read_offset++;
+            // }
 
             local_block_prefix_counts[prefix] -= prefix_export_count;
 #ifdef TEST_MODE

@@ -58,9 +58,9 @@ public:
 private:
 
     // SIMD group size
-#if defined(__AVX2__)
-    static constexpr size_t GROUP_SIZE = 32;
-#elif defined(__SSE4_2__)
+// #if defined(__AVX2__)
+//     static constexpr size_t GROUP_SIZE = 32;
+#if defined(__SSE4_2__) || defined(__AVX2__)
     static constexpr size_t GROUP_SIZE = 16;
 #else
     static constexpr size_t GROUP_SIZE = 8;
@@ -92,16 +92,16 @@ private:
     std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const noexcept
     {
 
-#if defined(__AVX2__)
-        __m256i ctrl = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(&controls_[base]));
-        __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
+// #if defined(__AVX2__)
+//         __m256i ctrl = _mm256_loadu_si256(
+//             reinterpret_cast<const __m256i*>(&controls_[base]));
+//         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
 
-        uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
-        uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
-        return { match_mask, empty_mask };
+//         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
+//         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
+//         return { match_mask, empty_mask };
 
-#elif defined(__SSE4_2__)
+#if defined(__SSE4_2__) || defined(__AVX2__)
         __m128i ctrl = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(&controls_[base]));
         __m128i fp_vec = _mm_set1_epi8(static_cast<char>(fp));
