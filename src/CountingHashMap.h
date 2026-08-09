@@ -21,7 +21,7 @@
  *
  * Features:
  * - Header-only, single-threaded
- * - Open addressing with linear probing
+ * - Open addressing with quadratic probing
  * - SIMD-accelerated control byte matching (AVX2/SSE4.2/scalar fallback)
  * - Fixed capacity, no expansion
  * - No deletion support
@@ -108,7 +108,7 @@ private:
         const uint64_t h = rapidhash(&key, sizeof(KeyType));
         return h;
     }
-    
+
     // Extract fingerprint from hash (high 8 bits, ensure non-zero)
     static uint8_t fingerprint(const uint64_t h)
     {
@@ -121,14 +121,14 @@ private:
     std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const noexcept
     {
 
-// #if defined(__AVX2__)
-//         __m256i ctrl = _mm256_loadu_si256(
-//             reinterpret_cast<const __m256i*>(&controls_[base]));
-//         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
+        // #if defined(__AVX2__)
+        //         __m256i ctrl = _mm256_loadu_si256(
+        //             reinterpret_cast<const __m256i*>(&controls_[base]));
+        //         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
 
-//         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
-//         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
-//         return { match_mask, empty_mask };
+        //         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
+        //         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
+        //         return { match_mask, empty_mask };
 
 #if defined(__SSE4_2__) || defined(__AVX2__)
         __m128i ctrl = _mm_loadu_si128(
@@ -148,10 +148,10 @@ private:
                 empty_mask |= (1u << i);
             else if (c == fp)
                 match_mask |= (1u << i);
-    }
+        }
         return { match_mask, empty_mask };
 #endif
-}
+    }
 
     // Data members
     // Extra GROUP_SIZE-1 bytes for safe SIMD load at boundary (no branch needed)
@@ -168,7 +168,7 @@ template <uint32_t N, size_t MaxBytes, typename ValueType>
 bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
 {
 
-    if(size_ >= MAX_ENTRIES) [[unlikely]]
+    if (size_ >= MAX_ENTRIES) [[unlikely]]
     {
         return false; // Table is full
     }
@@ -177,10 +177,11 @@ bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
     size_t idx = h & mod;
+    size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & mod;
+        size_t base = idx;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -213,6 +214,11 @@ bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
             ++size_;
             return true;
         }
+
+        offset += GROUP_SIZE;
+        offset &= mod;
+        idx += offset;
+        idx &= mod;
     }
 
     return false;

@@ -23,7 +23,7 @@
  *
  * Features:
  * - Header-only, single-threaded
- * - Open addressing with linear probing
+ * - Open addressing with quadratic probing
  * - SIMD-accelerated control byte matching (AVX2/SSE4.2/scalar fallback)
  * - Fixed capacity, no expansion
  * - No deletion support
