@@ -33,7 +33,7 @@ class FastqClassifier
     static constexpr int MAX_BACKOFF = 64;
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 4; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
 
     // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
     // per_thread ≈ (B1+B2)*sizeof(kmer) + sizeof(HashSet) + 2*TREE_CHUNK*sizeof(kmer)
@@ -408,7 +408,7 @@ private:
     void push_occurrence_second(const kmer<N>& val) noexcept
     {
         occ_buf2_[occ_buf2_size_++] = val;
-        if (occ_buf2_size_ == OCC_BUF2_CAPACITY)
+        if (occ_buf2_size_ == OCC_BUF2_CAPACITY) [[unlikely]]
         {
             flush_occurrence_buffers();
         }
@@ -470,7 +470,7 @@ private:
         auto append_tree_kmer = [&](const kmer<N>& k) noexcept
             {
                 occ_tree_chunk_[chunk_n++] = k;
-                if (chunk_n == TREE_CHUNK_KMER_CAP)
+                if (chunk_n == TREE_CHUNK_KMER_CAP) [[unlikely]]
                 {
                     commit_tree_chunk(chunk_n);
                     chunk_n = 0;
@@ -480,7 +480,6 @@ private:
         for (size_t i = 0; i < occ_buf2_size_; ++i)
         {
             occ_hash_set_->insert(occ_buf2_[i]);
-            append_tree_kmer(occ_buf2_[i]);
         }
 
         for (size_t i = 0; i < occ_buf1_size_; ++i)
@@ -520,7 +519,7 @@ private:
                 continue;
             }
 
-            uint32_t third_count = 0;
+            uint32_t to_tree_count = 0;
 
             const uint32_t bloom_filter_index = prefix_to_bloom_filter_index[prefix];
 
@@ -540,20 +539,22 @@ private:
                     else if (occ == Occurrence::SECOND)
                     {
                         push_occurrence_second(val);
+                        local_block_for_copy[local_block_count++] = val;
+                        to_tree_count++;
                     }
                     else
                     {
                         local_block_for_copy[local_block_count++] = val;
-                        third_count++;
+                        to_tree_count++;
                     }
 
                     read_offset++;
                 }
 
-                local_block_prefix_counts[prefix] = third_count;
+                local_block_prefix_counts[prefix] = to_tree_count;
 
 #ifdef TEST_MODE
-                total_kmers_send_to_tree += third_count;
+                total_kmers_send_to_tree += to_tree_count;
 #endif
                 continue;
             }
@@ -592,18 +593,20 @@ private:
                 else if (occ == Occurrence::SECOND)
                 {
                     push_occurrence_second(val);
+                    local_block_for_copy[local_block_count++] = val;
+                    to_tree_count++;
                 }
                 else
                 {
                     local_block_for_copy[local_block_count++] = val;
-                    third_count++;
+                    to_tree_count++;
                 }
             }
 
             read_offset += prefix_count;
-            local_block_prefix_counts[prefix] = third_count;
+            local_block_prefix_counts[prefix] = to_tree_count;
 #ifdef TEST_MODE
-            total_kmers_send_to_tree += third_count;
+            total_kmers_send_to_tree += to_tree_count;
 #endif
         }
 

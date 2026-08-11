@@ -27,13 +27,13 @@
  * - No deletion support
  *
  * @tparam KeyCount Number of uint64_t elements in the key (1-4)
- * @tparam ValueType Counter type (default uint32_t)
- * @tparam MaxBytes Maximum memory usage (default 1MB)
+ * @tparam ValueType Counter type (default uint16_t)
+ * @tparam MaxBytes Maximum memory usage (default 128 KB)
  */
 template <
     uint32_t N,
     size_t MaxBytes = 128 * 1024,
-    typename ValueType = uint32_t>
+    typename ValueType = uint16_t>
 class CountingHashMap
 {
 
