@@ -240,7 +240,7 @@ void get_numa_nodes()
     numa_nodes.push_back(0);
 #endif
 
-    }
+}
 
 template<uint32_t N>
 int process_main()

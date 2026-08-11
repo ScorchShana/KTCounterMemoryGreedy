@@ -54,16 +54,16 @@ constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 
 constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE = 32ULL * 1024; // 环形内存池块大小（字节）
 
 // Parser与Classifier之间的RingMemoryPool配置常量
-constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 环形内存池容量（块数），必须为2的幂
-constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 32ULL * 1024; // 环形内存池块大小（字节）
+constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY = 1ULL << 11;     // 环形内存池容量（块数），必须为2的幂
+constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
 
 // Classifier 线程的任务队列配置常量
-constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 16ULL << 10; // 全局分类器任务队列容量
+constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 10; // 全局分类器任务队列容量
 constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 64;
 
 // 写入文件部分的RingMemoryPool配置常量
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 1ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 128ULL * 1024; // 导出环形内存池块大小（字节）
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024; // 导出环形内存池块大小（字节）
 
 // RingMemoryPool 生产者队列的内容
 struct content_type

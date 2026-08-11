@@ -23,7 +23,7 @@
  *
  * Features:
  * - Header-only, single-threaded
- * - Open addressing with linear probing
+ * - Open addressing with quadratic probing
  * - SIMD-accelerated control byte matching (AVX2/SSE4.2/scalar fallback)
  * - Fixed capacity, no expansion
  * - No deletion support
@@ -58,9 +58,9 @@ public:
 private:
 
     // SIMD group size
-#if defined(__AVX2__)
-    static constexpr size_t GROUP_SIZE = 32;
-#elif defined(__SSE4_2__)
+// #if defined(__AVX2__)
+//     static constexpr size_t GROUP_SIZE = 32;
+#if defined(__SSE4_2__) || defined(__AVX2__)
     static constexpr size_t GROUP_SIZE = 16;
 #else
     static constexpr size_t GROUP_SIZE = 8;
@@ -92,16 +92,16 @@ private:
     std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const noexcept
     {
 
-#if defined(__AVX2__)
-        __m256i ctrl = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(&controls_[base]));
-        __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
+        // #if defined(__AVX2__)
+        //         __m256i ctrl = _mm256_loadu_si256(
+        //             reinterpret_cast<const __m256i*>(&controls_[base]));
+        //         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
 
-        uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
-        uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
-        return { match_mask, empty_mask };
+        //         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
+        //         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
+        //         return { match_mask, empty_mask };
 
-#elif defined(__SSE4_2__)
+#if defined(__SSE4_2__) || defined(__AVX2__)
         __m128i ctrl = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(&controls_[base]));
         __m128i fp_vec = _mm_set1_epi8(static_cast<char>(fp));
@@ -142,10 +142,11 @@ void HashSet<N, CAPACITY>::insert(const KeyType& key)
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
     size_t idx = h & mod;
+    size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & mod;
+        size_t base = idx;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -176,6 +177,11 @@ void HashSet<N, CAPACITY>::insert(const KeyType& key)
             ++size_;
             return;
         }
+
+        offset += GROUP_SIZE;
+        offset &= mod;
+        idx += offset;
+        idx &= mod;
     }
 }
 
@@ -187,10 +193,11 @@ bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
     size_t idx = h & mod;
+    size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & mod;
+        size_t base = idx;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -211,6 +218,11 @@ bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
         {
             return false;
         }
+
+        offset += GROUP_SIZE;
+        offset &= mod;
+        idx += offset;
+        idx &= mod;
     }
 
     return false;
