@@ -62,7 +62,7 @@ constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 10; // 全局
 constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 64;
 
 // 写入文件部分的RingMemoryPool配置常量
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 1ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 4ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024; // 导出环形内存池块大小（字节）
 
 // RingMemoryPool 生产者队列的内容
@@ -111,7 +111,7 @@ constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节
 
 // FinalDrain 环形内存池配置
 constexpr uint64_t FINAL_DRAIN_RING_POOL_CAPACITY = 1ULL << 10;     // 1024 块
-constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 128KB/块
+constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 256KB/块
 
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
