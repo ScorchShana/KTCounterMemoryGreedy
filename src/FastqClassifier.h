@@ -33,7 +33,7 @@ class FastqClassifier
     static constexpr int MAX_BACKOFF = 64;
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 4; // 预取 Bloom Filter 的距离（单位：k-mer数量）
     static constexpr size_t OCC_HASHSET_PREFETCH_DISTANCE = 32; // flush buf1 contains 预取流水线深度
 
     // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
@@ -42,7 +42,7 @@ class FastqClassifier
     //     std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY,
     //         std::bit_ceil(static_cast<size_t>(
     //             4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15)) * 4);
-    static constexpr size_t OCC_BUF1_CAPACITY = 512 * 1024 * 1024 / sizeof(kmer<N>); // 512 M
+    static constexpr size_t OCC_BUF1_CAPACITY = 128 * 1024 * 1024 / sizeof(kmer<N>); // 128 M
     static constexpr size_t OCC_HASHSET_CAPACITY = std::bit_ceil(std::max<size_t>(size_t{ 32 }, OCC_BUF1_CAPACITY / 4));
     static constexpr size_t OCC_BUF2_CAPACITY = OCC_HASHSET_CAPACITY * 7 / 8;
     static constexpr size_t TREE_CHUNK_KMER_CAP =
