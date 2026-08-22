@@ -267,4 +267,199 @@ private:
     }
 };
 
+/*
+class FinalDrainWriterThread
+{
+    static constexpr uint64_t RAW_BUFFER_SIZE = 4ULL * 1024 * 1024;
+    static_assert(RAW_BUFFER_SIZE >= FINAL_DRAIN_RING_POOL_BLOCK_SIZE,
+        "RAW_BUFFER_SIZE must be greater than or equal to FINAL_DRAIN_RING_POOL_BLOCK_SIZE");
+
+    RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY> pool_;
+    int fd_;
+    std::thread thread_;
+
+    char* buffer_ = nullptr;
+    uint64_t buffer_count_ = 0;
+
+    SpinBackoff<> consumer_enqueue_backoff;
+
+public:
+
+#ifdef TEST_MODE
+    bool first_flag = false;
+    uint64_t consumer_enqueue_spin_time{ 0 };
+    uint64_t consumer_dequeue_spin_time{ 0 };
+#endif
+    FinalDrainWriterThread(uint32_t block_size, uint32_t producer_count)
+        : pool_(block_size, producer_count), fd_(-1) {
+    }
+
+    auto* pool() { return &pool_; }
+
+    void start()
+    {
+        fd_ = ::open((temp_dir + "high.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) [[unlikely]]
+        {
+            std::cerr << "Failed to open high.bin\n";
+            std::exit(-1);
+        }
+        thread_ = std::thread(&FinalDrainWriterThread::writer_loop, this);
+    }
+
+    void join()
+    {
+        if (thread_.joinable()) thread_.join();
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        if (buffer_ != nullptr)
+        {
+            ::free(buffer_);
+            buffer_ = nullptr;
+        }
+    }
+
+    FinalDrainWriterThread(const FinalDrainWriterThread&) = delete;
+    FinalDrainWriterThread& operator=(const FinalDrainWriterThread&) = delete;
+
+    ~FinalDrainWriterThread()
+    {
+        join();
+#ifdef TEST_MODE
+        std::cout << "Final Drain Writer Thread consumer enqueue spin time: " << consumer_enqueue_spin_time << std::endl;
+        std::cout << "Final Drain Writer Thread consumer dequeue spin time: " << consumer_dequeue_spin_time << std::endl;
+#endif
+    }
+
+private:
+    void writer_loop()
+    {
+        void* buffer_ptr = nullptr;
+        int ret = ::posix_memalign(&buffer_ptr, 4096, RAW_BUFFER_SIZE);
+        if (ret != 0) {
+            std::cerr << "posix_memalign failed for buffer: " << strerror(ret) << std::endl;
+            std::exit(-1);
+        }
+        buffer_ = static_cast<char*>(buffer_ptr);
+        buffer_count_ = 0;
+
+        SpinBackoff<> backoff;
+        content_type content;
+
+        while (true)
+        {
+            if (pool_.consumer_try_dequeue(content))
+            {
+#ifdef TEST_MODE
+                first_flag = true;
+#endif
+
+                backoff.double_decay();
+                process_block(content);
+            }
+            else if (pool_.producer_finished())
+            {
+                while (pool_.consumer_try_dequeue(content))
+                {
+                    process_block(content);
+                    cpu_relax();
+                }
+                break;
+            }
+            else
+            {
+#ifdef TEST_MODE
+                if (first_flag) consumer_dequeue_spin_time++;
+#endif
+
+                backoff.backoff();
+            }
+        }
+
+        if (buffer_count_ > 0)
+        {
+            sync_write();
+        }
+
+        if (buffer_)
+        {
+            ::free(buffer_);
+            buffer_ = nullptr;
+        }
+    }
+
+    void process_block(const content_type& content)
+    {
+        if (content.length == 0) [[unlikely]]
+        {
+            pool_.consumer_enqueue(content.data);
+            return;
+        }
+
+        if (buffer_count_ + content.length >= RAW_BUFFER_SIZE)
+        {
+            uint64_t to_copy = RAW_BUFFER_SIZE - buffer_count_;
+            std::memcpy(buffer_ + buffer_count_, content.data, to_copy);
+            buffer_count_ += to_copy;
+            uint64_t remaining = content.length - to_copy;
+
+            sync_write();
+
+            std::memcpy(buffer_, content.data + to_copy, remaining);
+            buffer_count_ = remaining;
+        }
+        else
+        {
+            std::memcpy(buffer_ + buffer_count_, content.data, content.length);
+            buffer_count_ += content.length;
+        }
+
+        if (pool_.consumer_try_enqueue(content.data))
+        {
+            consumer_enqueue_backoff.double_decay();
+        }
+        else
+        {
+#ifdef TEST_MODE
+            consumer_enqueue_spin_time++;
+#endif
+            consumer_enqueue_backoff.backoff();
+            while (!pool_.consumer_try_enqueue(content.data))
+            {
+#ifdef TEST_MODE
+                consumer_enqueue_spin_time++;
+#endif
+                consumer_enqueue_backoff.backoff();
+            }
+            consumer_enqueue_backoff.decay();
+        }
+    }
+
+    void sync_write()
+    {
+        uint64_t written = 0;
+        while (written < buffer_count_)
+        {
+            const ssize_t n = ::write(fd_, buffer_ + written, buffer_count_ - written);
+            if (n < 0)
+            {
+                if (errno == EINTR) continue;
+                std::cerr << "write failed\n";
+                std::exit(-1);
+            }
+            if (n == 0)
+            {
+                std::cerr << "write returned 0\n";
+                std::exit(-1);
+            }
+            written += static_cast<uint64_t>(n);
+        }
+        buffer_count_ = 0;
+    }
+};
+*/
+
 #endif // FINAL_DRAIN_WRITER_THREAD_HEADER

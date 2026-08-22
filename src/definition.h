@@ -1,7 +1,7 @@
 #ifndef TREE_DEFINITION_HEADER
 #define TREE_DEFINITION_HEADER
 
-// #define TEST_MODE
+#define TEST_MODE
 
 #include "SpinLock.h"
 
@@ -58,12 +58,12 @@ constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY = 1ULL << 11;    
 constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
 
 // Classifier 线程的任务队列配置常量
-constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 10; // 全局分类器任务队列容量
-constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 64;
+constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 9; // 全局分类器任务队列容量
+constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 32;
 
 // 写入文件部分的RingMemoryPool配置常量
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 4ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024; // 导出环形内存池块大小（字节）
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 2ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL  * 1024; // 导出环形内存池块大小（字节）
 
 // RingMemoryPool 生产者队列的内容
 struct content_type
@@ -105,9 +105,6 @@ constexpr uint64_t KMER_BATCH_PREFIX_BASES = ROOT_BASES;    // 根节点使用�
 // FastqParser配置常量
 constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节），包括计数和前缀
 
-// ExportWriter配置常量
-constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
-constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节点的导出缓冲区大小（字节）
 
 // FinalDrain 环形内存池配置
 constexpr uint64_t FINAL_DRAIN_RING_POOL_CAPACITY = 1ULL << 10;     // 1024 块

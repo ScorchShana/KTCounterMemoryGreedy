@@ -29,13 +29,13 @@ class SchedulerThreadPool final
     static constexpr uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 3;
     static constexpr uint32_t MAX_PROCESS_TASKS = 128;
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
-    static constexpr uint32_t LAST_DEPTH_DENOMINATOR = 4;
+    static constexpr uint32_t LAST_DEPTH_DENOMINATOR = 2;
     // Scheduler algorithm constants
     static constexpr uint32_t SCHEDULE_INTERVAL_NS = 500;
     static constexpr double PRESSURE_EMA_ALPHA = 0.6;
-    static constexpr double HYSTERESIS_LOG_DELTA = std::log2(1.7);          // log2(1.5)
+    static constexpr double HYSTERESIS_LOG_DELTA = std::log2(1.7);          // log2(1.7)
     static constexpr uint32_t DRAIN_INTERVAL_NS = 250;
-    static constexpr double SELF_SCHEDULE_LOG_DELTA = HYSTERESIS_LOG_DELTA * 0.3;
+    static constexpr double SELF_SCHEDULE_LOG_DELTA = std::log2(1.5); // log2(1.5)
 
     struct WorkerInfo
     {
@@ -209,7 +209,7 @@ private:
         {
             if (self_schedule_depth != INVALID_DEPTH)
             {
-                self_schedule_denominator = (self_schedule_depth == new_depth) ? 2 : 1;
+                self_schedule_denominator = (self_schedule_depth == new_depth) ? 4 : 1;
                 self_schedule_depth = INVALID_DEPTH;
             }
             worker_infos[worker_id].depth.store(new_depth, std::memory_order_release);
