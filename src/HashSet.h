@@ -37,11 +37,24 @@ class HashSet
 public:
     using KeyType = kmer<N>;
 
+    struct LookupProbe
+    {
+        uint64_t h;
+        uint8_t fp;
+        size_t idx; // 第一组 base = h & (CAPACITY - 1)
+    };
+
     HashSet() = default;
 
     void insert(const KeyType& key);
 
     bool contains(const KeyType& key) const;
+
+    LookupProbe prepare_lookup(const KeyType& key) const noexcept;
+
+    void prefetch_lookup(const LookupProbe& p) const noexcept;
+
+    bool contains_prepared(const KeyType& key, const LookupProbe& p) const noexcept;
 
     void clear();
 
@@ -186,13 +199,38 @@ void HashSet<N, CAPACITY>::insert(const KeyType& key)
 }
 
 template <uint32_t N, size_t CAPACITY>
-bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
+typename HashSet<N, CAPACITY>::LookupProbe
+HashSet<N, CAPACITY>::prepare_lookup(const KeyType& key) const noexcept
 {
+    const uint64_t h = hash_key(key);
+    return { h, fingerprint(h), static_cast<size_t>(h & (CAPACITY - 1)) };
+}
 
+template <uint32_t N, size_t CAPACITY>
+void HashSet<N, CAPACITY>::prefetch_lookup(const LookupProbe& p) const noexcept
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(controls_ + p.idx, 0, 0);
+    __builtin_prefetch(keys_ + p.idx, 0, 0);
+    if constexpr (sizeof(KeyType) * GROUP_SIZE > 64)
+    {
+        const size_t half = p.idx + GROUP_SIZE / 2;
+        if (half < CAPACITY)
+        {
+            __builtin_prefetch(keys_ + half, 0, 0);
+        }
+    }
+#else
+    (void)p;
+#endif
+}
+
+template <uint32_t N, size_t CAPACITY>
+bool HashSet<N, CAPACITY>::contains_prepared(const KeyType& key, const LookupProbe& p) const noexcept
+{
     constexpr uint64_t mod = CAPACITY - 1;
-    uint64_t h = hash_key(key);
-    uint8_t fp = fingerprint(h);
-    size_t idx = h & mod;
+    const uint8_t fp = p.fp;
+    size_t idx = p.idx;
     size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
@@ -226,6 +264,12 @@ bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
     }
 
     return false;
+}
+
+template <uint32_t N, size_t CAPACITY>
+bool HashSet<N, CAPACITY>::contains(const KeyType& key) const
+{
+    return contains_prepared(key, prepare_lookup(key));
 }
 
 template <uint32_t N, size_t CAPACITY>

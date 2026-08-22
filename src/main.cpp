@@ -156,7 +156,7 @@ void calculate_concurrent_map_capacity(
     const std::vector<std::atomic<uint32_t>>& prefix_counts)
 {
     const uint64_t max_cap = kmer_concurrent_hash_map_capacity;
-    const uint64_t min_cap = 1024ULL;
+    const uint64_t min_cap = 4096ULL;
     const uint64_t mid_cap = std::max<uint64_t>(min_cap, max_cap / 2ULL);
 
     std::array<uint64_t, 256> sorted;

@@ -34,6 +34,7 @@ class FastqClassifier
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+    static constexpr size_t OCC_HASHSET_PREFETCH_DISTANCE = 32; // flush buf1 contains 预取流水线深度
 
     // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
     // per_thread ≈ (B1+B2)*sizeof(kmer) + sizeof(HashSet) + 2*TREE_CHUNK*sizeof(kmer)
@@ -502,7 +503,6 @@ private:
 
         occ_buf1_size_ = 0;
         occ_buf2_size_ = 0;
-        occ_hash_set_->clear();
     }
 
     void classify_owned_local_block() noexcept
