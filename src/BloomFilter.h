@@ -224,7 +224,7 @@ public:
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx * 2, 1, 0);
+        __builtin_prefetch(bins + probe.block_idx, 1, 0);
 #else
         (void)probe;
 #endif
@@ -232,8 +232,9 @@ public:
 
     Occurrence insert_prepared(const InsertProbe& probe) noexcept
     {
-        std::atomic<uint64_t>* cell = bins + probe.block_idx * 2;
-        const uint64_t bf1_word = cell[0].load(std::memory_order_relaxed);
+        std::atomic<uint64_t> &cell1 = bins[probe.block_idx];
+        std::atomic<uint64_t> &cell2 = bins[probe.block_idx + capacity_];
+        const uint64_t bf1_word = cell1.load(std::memory_order_relaxed);
         if ((bf1_word & probe.insert_num) == probe.insert_num)
         {
             // BF1命中：已出现2次，本次为第3次及以上出现
@@ -241,11 +242,11 @@ public:
         }
         else
         {
-            const uint64_t bf2_word = cell[1].load(std::memory_order_relaxed);
+            const uint64_t bf2_word = cell2.load(std::memory_order_relaxed);
             if ((bf2_word & probe.insert_num) == probe.insert_num)
             {
                 // BF1未命中，BF2命中：已出现1次，本次为第2次出现，置BF1对应位
-                const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
                 if ((bf1_word_before & probe.insert_num) == probe.insert_num)
                 {
                     // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
@@ -255,11 +256,11 @@ public:
             }
             else {
                 // BF1未命中、BF2未命中：首次出现，置BF2对应位
-                const uint64_t bf2_word_before = cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                const uint64_t bf2_word_before = cell2.fetch_or(probe.insert_num, std::memory_order_relaxed);
                 if((bf2_word_before & probe.insert_num) == probe.insert_num)
                 {
                     // 可能存在竞争，BF2命中，已出现1次，本次为第2次出现，置BF1对应位
-                    const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                    const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
                     if ((bf1_word_before & probe.insert_num) == probe.insert_num)
                     {
                         // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现

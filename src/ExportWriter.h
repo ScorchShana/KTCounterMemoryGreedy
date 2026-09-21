@@ -33,8 +33,8 @@ class ExportWriter
 {
 
     // constexpr static uint64_t RAW_BUFFER_SIZE = 4ULL * 1024 * 1024; // 4MB 原始数据块大小
-    constexpr static uint64_t RAW_BUFFER_SIZE = 512 * 1024;
-    constexpr static uint32_t NUM_AIO_BUFFERS = 4;
+    constexpr static uint64_t RAW_BUFFER_SIZE = 2 * 1024 * 1024;
+    constexpr static uint32_t NUM_AIO_BUFFERS = 2;
     static_assert(RAW_BUFFER_SIZE >= EXPORT_RING_MEMORY_POOL_BLOCK_SIZE, "RAW_BUFFER_SIZE must be greater than or equal to EXPORT_RING_MEMORY_POOL_BLOCK_SIZE");
     constexpr static uint64_t BUFFER_KMER_CAPACITY = RAW_BUFFER_SIZE / sizeof(kmer<N>);
 
