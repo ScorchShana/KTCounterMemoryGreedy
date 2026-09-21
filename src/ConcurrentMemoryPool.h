@@ -704,7 +704,7 @@ inline void ConcurrentMemoryPool::init_arenas()
         remaining_blocks -= arena_blocks;
     }
 
-    // apply_arena_mbind();
+    apply_arena_mbind();
 
     // 所有 Arena 设置完成后，release 发布，确保对后续线程可见
     arenas_initialized_.store(true, std::memory_order_release);

@@ -122,7 +122,7 @@ public:
                     not_first_flag = true;
 #endif
 
-                    dequeue_backoff.double_decay();
+                    dequeue_backoff.reset();
 
                     parse(reader_parser_content.data, reader_parser_content.length);
 
@@ -310,23 +310,20 @@ private:
             uint32_t bits = all_valid_bits | invalid_bits;
             while (bits)
             {
-                int idx = __builtin_ctz(bits);
-                uint32_t bit = 1u << idx;
+                const uint32_t idx = static_cast<uint32_t>(__builtin_ctz(bits));
+                const uint32_t bit = 1u << idx;
 
                 if (base_bits & bit)
                 {
-                    // 找到一段连续碱基运行；计算其长度
-                    uint32_t run_bits = base_bits >> idx;
-                    int run_len = 1;
-                    // 限定最长 32 个碱基
-                    while ((idx + run_len < 32) && (run_len < 32) && (run_bits & (1u << run_len)))
-                    {
-                        ++run_len;
-                    }
+                    const uint32_t run_bits = base_bits >> idx;
+                    const uint32_t inverted_run_bits = ~run_bits;
+                    const uint32_t run_len = inverted_run_bits != 0
+                        ? static_cast<uint32_t>(__builtin_ctz(inverted_run_bits))
+                        : 32u;
 
                     // 将此运行中的所有碱基编码打包为一个 uint64_t
                     uint64_t packed = 0;
-                    for (int i = 0; i < run_len; ++i)
+                    for (uint32_t i = 0; i < run_len; ++i)
                     {
                         packed = (packed << 2) | codes[idx + i];
                     }
@@ -350,8 +347,8 @@ private:
                         &kmer_buffer[kmer_buffer_count]);
                     kmer_buffer_count += new_kmers;
 
-                    // 清除已处理的位
-                    uint32_t clear_mask = static_cast<uint32_t>(((1ULL << run_len) - 1ULL) << idx);
+                    const uint32_t clear_mask = static_cast<uint32_t>(
+                        ((1ULL << run_len) - 1ULL) << idx);
                     bits &= ~clear_mask;
                 }
                 else
@@ -420,20 +417,19 @@ private:
             uint16_t bits = all_valid | invalid;
             while (bits)
             {
-                int idx = __builtin_ctz(bits);
-                uint16_t bit = 1u << idx;
+                const uint32_t idx = static_cast<uint32_t>(__builtin_ctz(bits));
+                const uint16_t bit = static_cast<uint16_t>(1u << idx);
 
                 if (base_bits & bit)
                 {
-                    uint16_t run_bits = base_bits >> idx;
-                    int run_len = 1;
-                    while ((idx + run_len < 16) && (run_len < 16) && (run_bits & (1u << run_len)))
-                    {
-                        ++run_len;
-                    }
+                    const uint16_t run_bits = static_cast<uint16_t>(base_bits >> idx);
+                    const uint16_t inverted_run_bits = static_cast<uint16_t>(~run_bits);
+                    const uint32_t run_len = inverted_run_bits != 0
+                        ? static_cast<uint32_t>(__builtin_ctz(inverted_run_bits))
+                        : 16u;
 
                     uint32_t packed = 0;
-                    for (int i = 0; i < run_len; ++i)
+                    for (uint32_t i = 0; i < run_len; ++i)
                     {
                         packed = (packed << 2) | codes[idx + i];
                     }
@@ -455,8 +451,9 @@ private:
                         &kmer_buffer[kmer_buffer_count]);
                     kmer_buffer_count += new_kmers;
 
-                    uint16_t clear_mask = static_cast<uint16_t>(((1U << run_len) - 1U) << idx);
-                    bits &= ~clear_mask;
+                    const uint16_t clear_mask = static_cast<uint16_t>(
+                        ((1U << run_len) - 1U) << idx);
+                    bits &= static_cast<uint16_t>(~clear_mask);
                 }
                 else
                 {
@@ -603,8 +600,44 @@ private:
 
     }
 
+    void divide_kmer_buffer_into_owner_contents(kmer<N>* kmer_data, const uint64_t kmer_count)
+    {
+        constexpr uint32_t max_kmers_per_block = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+
+        for (uint64_t i = 0; i < kmer_count; i++)
+        {
+            const uint64_t owner = get_classifier_owner(kmer_data[i]);
+            if (owner_contents[owner].length >= max_kmers_per_block) [[unlikely]]
+            {
+#ifdef TEST_MODE
+                uint64_t queue_wait_start = __rdtsc();
+#endif
+                enqueue_content_to_classifier(owner);
+#ifdef TEST_MODE
+                uint64_t queue_wait_end = __rdtsc();
+                queue_wait_cycles += queue_wait_end - queue_wait_start;
+#endif
+
+                owner_contents[owner].length = 0;
+
+#ifdef TEST_MODE
+                queue_wait_start = __rdtsc();
+#endif
+                dequeue_data_from_classifier(owner_contents[owner].data);
+#ifdef TEST_MODE
+                queue_wait_end = __rdtsc();
+                queue_wait_cycles += queue_wait_end - queue_wait_start;
+#endif
+            }
+            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * sizeof(kmer<N>),
+                kmer_data[i].data.data(), sizeof(kmer<N>));
+            ++owner_contents[owner].length;
+        }
+    }
+
     void flush_kmer_buffer()
     {
+        // divide_kmer_buffer_into_owner_contents(kmer_buffer.data(), kmer_buffer_count);
         calculate_block_owner_counts(kmer_buffer.data(), kmer_buffer_count);
         push_kmers_into_local_block_for_copy(kmer_buffer.data(), kmer_buffer_count);
         divide_kmers_into_owner_contents();
@@ -615,36 +648,73 @@ private:
     void enqueue_content_to_classifier(const uint32_t owner_id)
     {
 
-        if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+        bool reverse_enqueue = classifier_task_queues[owner_id]->size() >= CLASSIFIER_TASK_QUEUE_HALF_WATERMARK;
+        if (reverse_enqueue)
         {
-            enqueue_to_classifier_backoff.double_decay();
-            return;
+            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+            {
+                enqueue_to_classifier_backoff.double_decay();
+                return;
+            }
+            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+            {
+                enqueue_to_classifier_backoff.double_decay();
+                return;
+            }
         }
-
-        if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+        else
         {
-            enqueue_to_classifier_backoff.double_decay();
-            return;
+            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+            {
+                enqueue_to_classifier_backoff.double_decay();
+                return;
+            }
+
+            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+            {
+                enqueue_to_classifier_backoff.double_decay();
+                return;
+            }
         }
 
         enqueue_to_classifier_backoff.backoff();
 
+#ifdef TEST_MODE
+        producer_enqueue_spin_time++;
+#endif
+
         while (true)
         {
+
+            if (reverse_enqueue)
+            {
+                if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+                {
+                    break;
+                }
+                if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+                {
+                    break;
+                }
+
+            }
+            else
+            {
+                if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+                {
+                    break;
+                }
+                if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+                {
+                    break;
+                }
+            }
+
+            enqueue_to_classifier_backoff.backoff();
 
 #ifdef TEST_MODE
             producer_enqueue_spin_time++;
 #endif
-
-            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-            {
-                break;
-            }
-            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-            {
-                break;
-            }
-            enqueue_to_classifier_backoff.backoff();
 
         }
 
@@ -656,7 +726,7 @@ private:
 
         if (parser_classifier_ring_pool->producer_try_dequeue(data))
         {
-            dequeue_from_classifier_backoff.double_decay();
+            dequeue_from_classifier_backoff.reset();
             return;
         }
 

@@ -1,6 +1,7 @@
 #ifndef COUNTING_HASH_MAP_HEADER
 #define COUNTING_HASH_MAP_HEADER
 
+#include "definition.h"
 #include "kmer.h"
 #include "../include/rapidhash.h"
 
@@ -32,7 +33,6 @@
  */
 template <
     uint32_t N,
-    size_t MaxBytes = 128 * 1024,
     typename ValueType = uint16_t>
 class CountingHashMap
 {
@@ -47,7 +47,7 @@ public:
      * @param key The key to increment
      * @return true if successful, false if table is full
      */
-    bool increment(const KeyType& key);
+    void increment(const KeyType& key);
 
     /**
      * @brief Iterate over all entries
@@ -78,7 +78,7 @@ public:
         return static_cast<float>(size_) / CAPACITY;
     }
     [[nodiscard]] bool empty() const { return size_ == 0; }
-    [[nodiscard]] bool full() const { return size_ >= MAX_ENTRIES; }
+    [[nodiscard]] bool full() const { return size_ >= RAW_CAPACITY; }
 
 private:
 
@@ -93,14 +93,10 @@ private:
 
     // Compile-time constants
     static constexpr size_t ENTRY_SIZE = sizeof(KeyType) + sizeof(ValueType) + sizeof(uint8_t); // Key + Value + control byte
-    static constexpr size_t RAW_CAPACITY = MaxBytes / ENTRY_SIZE;
+    static constexpr size_t RAW_CAPACITY = MAX_KMER_BLOCK_NUM * KMER_BLOCK_SIZE / sizeof(KeyType); // Key + Value + control byte
     static_assert(RAW_CAPACITY >= GROUP_SIZE, "MaxBytes too small for CountingHashMap");
-    static constexpr size_t CAPACITY =
-        RAW_CAPACITY > 0 ? (1ULL << (63 - __builtin_clzll(RAW_CAPACITY))) : GROUP_SIZE;
+    static constexpr size_t CAPACITY = std::bit_ceil(RAW_CAPACITY * 8 / 7);
     static constexpr double MAX_LOAD_FACTOR = 0.875; // recommended load factor
-    static constexpr size_t MAX_ENTRIES = static_cast<size_t>(CAPACITY * MAX_LOAD_FACTOR);
-
-
 
     // Hash function
     static uint64_t hash_key(const KeyType& key)
@@ -153,6 +149,9 @@ private:
 #endif
     }
 
+    size_t size_ = 0;
+
+public:
     // Data members
     // Extra GROUP_SIZE-1 bytes for safe SIMD load at boundary (no branch needed)
     alignas(32) uint8_t controls_[CAPACITY + GROUP_SIZE - 1] = {};
@@ -160,50 +159,73 @@ private:
     KeyType keys_[CAPACITY];
     ValueType counts_[CAPACITY] = {};
 
-    size_t size_ = 0;
+
 };
 
 // Implementation
-template <uint32_t N, size_t MaxBytes, typename ValueType>
-bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
+template <uint32_t N, typename ValueType>
+void CountingHashMap<N, ValueType>::increment(const KeyType& key)
 {
 
-    if (size_ >= MAX_ENTRIES) [[unlikely]]
-    {
-        return false; // Table is full
-    }
-
-    constexpr uint64_t mod = CAPACITY - 1;
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
-    size_t idx = h & mod;
+    constexpr size_t MOD = CAPACITY - 1;
+    size_t base = h & MOD;
     size_t offset = 0;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = idx;
 
-        auto [match_mask, empty_mask] = match_and_empty(base, fp);
+        // auto [match_mask, empty_mask] = match_and_empty(base, fp);
+
+        uint32_t match_mask = 0;
+        uint32_t empty_mask = 0;
+
+#if defined(__SSE4_2__) || defined(__AVX2__)
+        __m128i ctrl = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(&controls_[base]));
+        __m128i fp_vec = _mm_set1_epi8(static_cast<char>(fp));
+
+        match_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl, fp_vec));
+#else
+        for (size_t i = 0; i < GROUP_SIZE; ++i)
+        {
+            uint8_t c = controls_[base + i];
+            if (c == fp)
+                match_mask |= (1u << i);
+        }
+#endif
 
         // Process matching candidates
         while (match_mask)
         {
             int bit = __builtin_ctz(match_mask);
-            size_t slot = (base + bit) & mod;
+            size_t slot = (base + bit) & MOD;
             if (keys_[slot] == key)
             {
                 counts_[slot]++;
-                return true;
+                return;
             }
             match_mask &= (match_mask - 1);
         }
+
+#if defined(__SSE4_2__) || defined(__AVX2__)
+        empty_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl, _mm_setzero_si128()));
+#else
+        for (size_t i = 0; i < GROUP_SIZE; ++i)
+        {
+            uint8_t c = controls_[base + i];
+            if (c == 0)
+                empty_mask |= (1u << i);
+        }
+#endif
 
         // 遇到空槽立即插入并返回
         if (empty_mask) [[likely]]
         {
             // 正常负载下，绝大多数情况在这里返回
             int bit = __builtin_ctz(empty_mask);
-            size_t slot = (base + bit) & mod;
+            size_t slot = (base + bit) & MOD;
 
             controls_[slot] = fp;
             if (slot < GROUP_SIZE - 1) {
@@ -212,21 +234,20 @@ bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
             keys_[slot] = key;
             counts_[slot] = 1;
             ++size_;
-            return true;
+            return;
         }
 
         offset += GROUP_SIZE;
-        offset &= mod;
-        idx += offset;
-        idx &= mod;
-    }
+        offset &= MOD;
 
-    return false;
+        base += GROUP_SIZE;
+        base &= MOD;
+    }
 }
 
-template <uint32_t N, size_t MaxBytes, typename ValueType>
+template <uint32_t N, typename ValueType>
 template <typename Func>
-void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func)
+void CountingHashMap<N, ValueType>::for_each(Func&& func)
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
@@ -237,9 +258,9 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func)
     }
 }
 
-template <uint32_t N, size_t MaxBytes, typename ValueType>
+template <uint32_t N, typename ValueType>
 template <typename Func>
-void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func) const
+void CountingHashMap<N, ValueType>::for_each(Func&& func) const
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
@@ -250,8 +271,8 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func) const
     }
 }
 
-template <uint32_t N, size_t MaxBytes, typename ValueType>
-void CountingHashMap<N, MaxBytes, ValueType>::clear()
+template <uint32_t N, typename ValueType>
+void CountingHashMap<N, ValueType>::clear()
 {
     std::memset(controls_, 0, CAPACITY + GROUP_SIZE - 1);
     size_ = 0;

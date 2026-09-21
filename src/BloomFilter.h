@@ -216,15 +216,15 @@ public:
     {
         const auto hash_res = XXH3_128bits(&k_mer, sizeof(k_mer));
         const uint64_t h1 = hash_res.low64;
-        const uint64_t h2 = (hash_res.high64 | 1ULL);
+        const uint64_t h2 = hash_res.high64;
 
-        return { h1 & mod, calculate_insert_num(h1, h2) };
+        return { h1 & mod, calculate_insert_num(h2) };
     }
 
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx * 2, 1, 0);
+        __builtin_prefetch(bins + probe.block_idx, 1, 0);
 #else
         (void)probe;
 #endif
@@ -232,8 +232,9 @@ public:
 
     Occurrence insert_prepared(const InsertProbe& probe) noexcept
     {
-        std::atomic<uint64_t>* cell = bins + probe.block_idx * 2;
-        const uint64_t bf1_word = cell[0].load(std::memory_order_relaxed);
+        std::atomic<uint64_t>& cell1 = bins[probe.block_idx];
+        std::atomic<uint64_t>& cell2 = bins[probe.block_idx + capacity_];
+        const uint64_t bf1_word = cell1.load(std::memory_order_relaxed);
         if ((bf1_word & probe.insert_num) == probe.insert_num)
         {
             // BF1命中：已出现2次，本次为第3次及以上出现
@@ -241,11 +242,11 @@ public:
         }
         else
         {
-            const uint64_t bf2_word = cell[1].load(std::memory_order_relaxed);
+            const uint64_t bf2_word = cell2.load(std::memory_order_relaxed);
             if ((bf2_word & probe.insert_num) == probe.insert_num)
             {
                 // BF1未命中，BF2命中：已出现1次，本次为第2次出现，置BF1对应位
-                const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
                 if ((bf1_word_before & probe.insert_num) == probe.insert_num)
                 {
                     // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
@@ -255,11 +256,11 @@ public:
             }
             else {
                 // BF1未命中、BF2未命中：首次出现，置BF2对应位
-                const uint64_t bf2_word_before = cell[1].fetch_or(probe.insert_num, std::memory_order_relaxed);
-                if((bf2_word_before & probe.insert_num) == probe.insert_num)
+                const uint64_t bf2_word_before = cell2.fetch_or(probe.insert_num, std::memory_order_relaxed);
+                if ((bf2_word_before & probe.insert_num) == probe.insert_num)
                 {
                     // 可能存在竞争，BF2命中，已出现1次，本次为第2次出现，置BF1对应位
-                    const uint64_t bf1_word_before = cell[0].fetch_or(probe.insert_num, std::memory_order_relaxed);
+                    const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
                     if ((bf1_word_before & probe.insert_num) == probe.insert_num)
                     {
                         // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
@@ -284,15 +285,16 @@ public:
     }
 
 private:
-    uint64_t calculate_insert_num(const uint64_t h1, const uint64_t h2)const noexcept
+    uint64_t calculate_insert_num(const uint64_t h)const noexcept
     {
         uint64_t insert_num = 0;
+        const uint64_t p0 = h & BITS_MOD;
+        insert_num |= (1ULL << p0);
+        const uint64_t p1 = (h >> 21) & BITS_MOD;
+        insert_num |= (1ULL << p1);
+        const uint64_t p2 = (h >> 42) & BITS_MOD;
+        insert_num |= (1ULL << p2);
 
-#pragma unroll
-        for (uint64_t i = 0; i < NUM_HASHES; i++)
-        {
-            insert_num |= (1ULL << ((h1 + i * h2) & BITS_MOD));
-        }
         return insert_num;
     }
 };

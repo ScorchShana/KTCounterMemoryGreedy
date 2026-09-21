@@ -56,6 +56,9 @@ class FastqPreReader
     gzFile gzfile_ = nullptr;
     uint64_t quality_sum_   = 0;
     uint64_t quality_count_ = 0;
+    uint64_t sampled_plain_bytes_ = 0;
+    uint64_t sampled_gz_decompressed_bytes_ = 0;
+    uint64_t sampled_gz_compressed_bytes_ = 0;
 
     std::vector<char*> pipeline_buffers_;
     SPSCRingQueue<::content_type, PIPELINE_QUEUE_CAPACITY> pipeline_data_queue_;
@@ -104,7 +107,10 @@ public:
         for (file_index_ = 0; file_index_ < filenames_.size(); ++file_index_)
         {
             open_current_file();
-            need_read_ = std::min(file_size_, per_file_limit);
+            if (is_gz_file)
+                need_read_ = per_file_limit;
+            else
+                need_read_ = std::min(file_size_, per_file_limit);
             have_read_.store(0, std::memory_order_relaxed);
 
             if (file_buffer) { delete[] file_buffer; file_buffer = nullptr; }
@@ -124,29 +130,14 @@ public:
             left_buffer_size_ = 0;
         }
 
-        if (quality_count_ > 0) avgQuality = static_cast<uint8_t>(quality_sum_ / quality_count_);
         ring_memory_pool_ptr_->producer_set_finished();
     }
 
-    uint64_t get_estimated_raw_fastq_file_size() const noexcept
-    {
-        uint64_t total = 0;
-        for (const auto& f : filenames_)
-        {
-            int fd = ::open(f.data(), O_RDONLY);
-            if (fd < 0) continue;
-            struct stat st;
-            if (::fstat(fd, &st) == 0)
-            {
-                unsigned char buf[2];
-                ssize_t n = ::read(fd, buf, 2);
-                total += (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B)
-                    ? static_cast<uint64_t>(st.st_size) * 4 : static_cast<uint64_t>(st.st_size);
-            }
-            ::close(fd);
-        }
-        return (total > 0) ? total : 1;
-    }
+    uint64_t get_quality_sum() const noexcept { return quality_sum_; }
+    uint64_t get_quality_count() const noexcept { return quality_count_; }
+    uint64_t get_sampled_plain_bytes() const noexcept { return sampled_plain_bytes_; }
+    uint64_t get_sampled_gz_decompressed_bytes() const noexcept { return sampled_gz_decompressed_bytes_; }
+    uint64_t get_sampled_gz_compressed_bytes() const noexcept { return sampled_gz_compressed_bytes_; }
 
 private:
     void open_current_file()
@@ -178,8 +169,24 @@ private:
 
     void close_current_file()
     {
-        if (gzfile_ != nullptr) { gzclose(gzfile_); gzfile_ = nullptr; }
-        if (fd_ != -1) { ::close(fd_); fd_ = -1; }
+        if (gzfile_ != nullptr)
+        {
+            // gzip 每次从文件开头读取, gztell 即累计解压后字节数,
+            // gzoffset 即实际读取的压缩字节数
+            const z_off_t decompressed = gztell(gzfile_);
+            const z_off_t compressed = gzoffset(gzfile_);
+            if (decompressed > 0) sampled_gz_decompressed_bytes_ += static_cast<uint64_t>(decompressed);
+            if (compressed > 0) sampled_gz_compressed_bytes_ += static_cast<uint64_t>(compressed);
+            gzclose(gzfile_);
+            gzfile_ = nullptr;
+        }
+        if (fd_ != -1)
+        {
+            if (!is_gz_file)
+                sampled_plain_bytes_ += have_read_.load(std::memory_order_relaxed);
+            ::close(fd_);
+            fd_ = -1;
+        }
         file_size_ = 0;
     }
 

@@ -1,9 +1,9 @@
 #ifndef TREE_DEFINITION_HEADER
 #define TREE_DEFINITION_HEADER
 
-#define TEST_MODE
+// #define TEST_MODE
 
-#include "SpinLock.h"
+// #include "SpinLock.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -23,6 +23,37 @@
 #define HAS_LIBNUMA 1
 #else
 #define HAS_LIBNUMA 0
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <emmintrin.h>
+static inline void cpu_relax() noexcept
+{
+    _mm_pause();
+}
+#elif defined(__arm__) || defined(__aarch64__) || defined(_M_ARM64)
+static inline void cpu_relax() noexcept
+{
+#if (defined(__ARM_ARCH_6K__) ||  \
+     defined(__ARM_ARCH_6Z__) ||  \
+     defined(__ARM_ARCH_6ZK__) || \
+     defined(__ARM_ARCH_6T2__) || \
+     defined(__ARM_ARCH_7__) ||   \
+     defined(__ARM_ARCH_7A__) ||  \
+     defined(__ARM_ARCH_7R__) ||  \
+     defined(__ARM_ARCH_7M__) ||  \
+     defined(__ARM_ARCH_7S__) ||  \
+     defined(__ARM_ARCH_8A__) ||  \
+     defined(__aarch64__))
+    asm volatile("yield" ::: "memory");
+
+#elif defined(_M_ARM64)
+    __yield();
+
+#else
+    asm volatile("nop" ::: "memory");
+#endif
+}
 #endif
 
 constexpr uint64_t PAGE_SIZE = 4096;
@@ -60,10 +91,11 @@ constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024;
 // Classifier 线程的任务队列配置常量
 constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 9; // 全局分类器任务队列容量
 constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 32;
+constexpr uint64_t CLASSIFIER_TASK_QUEUE_HALF_WATERMARK = CLASSIFIER_TASK_QUEUES_CAPACITY / 2;
 
 // 写入文件部分的RingMemoryPool配置常量
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 2ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL  * 1024; // 导出环形内存池块大小（字节）
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024; // 导出环形内存池块大小（字节）
 
 // RingMemoryPool 生产者队列的内容
 struct content_type
@@ -81,10 +113,8 @@ constexpr uint64_t KMER_BIN_SIZE = 2048;
 // constexpr uint32_t MAP_SIZE_FLUSH_INTERVAL = 1024; // 每线程累计新增 key 达到该阈值后批量 flush 到 map_size，降低原子争用
 
 // MPMP环状队列配置常量
-constexpr uint32_t TASK_QUEUE_CAPACITY = 16U * 1024;
+constexpr uint32_t TASK_QUEUE_CAPACITY = 32U * 1024;
 
-// task线程enqueue尝试次数
-constexpr uint32_t TASK_ENQUEUE_RETRY_LIMIT = 1ULL << 7;
 
 // Final drain 导出配置
 constexpr uint64_t DRAIN_EXPORT_BUFFER_SIZE = 2 * 1024 * 1024; // final drain 导出缓冲区大小（字节）
@@ -95,8 +125,9 @@ inline uint32_t filter_max = std::numeric_limits<uint32_t>::max();
 inline uint32_t count_max = 255;
 inline uint32_t count_max_bytes = 1;
 
-// KmerTree的哈希表大小
-inline uint32_t kmer_concurrent_hash_map_capacity = 1024;
+// KmerTree的哈希表最大大小
+inline uint64_t concurrent_hash_map_max_capacity = 1024;
+inline uint64_t concurrent_hash_map_min_capacity = 1024;
 
 // FastqReader配置常量
 constexpr uint64_t FASTQ_FILE_CHUNK_SIZE = 2 * 1024 * 1024; // FASTQ 文件块大小（字节）
@@ -105,10 +136,13 @@ constexpr uint64_t KMER_BATCH_PREFIX_BASES = ROOT_BASES;    // 根节点使用�
 // FastqParser配置常量
 constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节），包括计数和前缀
 
+// ExportWriter配置常量
+constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
+constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节点的导出缓冲区大小（字节）
 
 // FinalDrain 环形内存池配置
 constexpr uint64_t FINAL_DRAIN_RING_POOL_CAPACITY = 1ULL << 10;     // 1024 块
-constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 256KB/块
+constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 128KB/块
 
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
@@ -203,7 +237,10 @@ inline std::array<uint8_t, 1U << (2 * ROOT_BASES)> prefix_owners;
 inline std::array<void*, 1U << (2 * ROOT_BASES)> global_bloom_filter{};
 
 // prefix 对应的哈希表容量
-inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> concurrent_map_capacity;
+// inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> concurrent_map_capacity;
+
+// 哈希表 segment 加速递增的水位
+constexpr uint32_t SEGMENT_WATERMARK = 3;
 
 inline uint8_t avgQuality = 0;
 

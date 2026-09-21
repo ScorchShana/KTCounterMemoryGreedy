@@ -5,7 +5,6 @@
 #include "RingMemoryPool.h"
 #include "SPSCRingQueue.h"
 #include "SpinBackoff.h"
-#include "GzipStreamer.h"
 
 #include <cassert>
 #include <cstdio>
@@ -353,7 +352,7 @@ class ReaderThreadPool
     };
 
     static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
-    static constexpr uint64_t GZ_CHUNK_SIZE = 512 * 1024; // 512 KB
+    static constexpr uint64_t GZ_CHUNK_SIZE = 1 * 1024 * 1024;
 
     int k_;
     uint64_t base_chunk_size_;
@@ -371,12 +370,21 @@ class ReaderThreadPool
     inline static thread_local SpinBackoff<> dequeue_backoff;
 
 public:
+
+#ifdef TEST_MODE
+    std::atomic<uint64_t> total_dequeue_spin_time = 0;
+    std::atomic<uint64_t> total_enqueue_spin_time = 0;
+    inline thread_local static uint64_t dequeue_spin_time = 0;
+    inline thread_local static uint64_t enqueue_spin_time = 0;
+#endif
+
     explicit ReaderThreadPool(
         const std::vector<std::string>& filenames,
         int in_k,
         uint64_t chunk_size,
+        uint32_t reader_count,
         RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* pool_ptr)
-        : k_(in_k), base_chunk_size_(chunk_size), ring_pool_ptr_(pool_ptr)
+        : k_(in_k), base_chunk_size_(chunk_size), reader_count_(reader_count), ring_pool_ptr_(pool_ptr)
     {
         assert(ring_pool_ptr_ != nullptr);
         assert(k_ > 0 && k_ < 128);
@@ -386,8 +394,15 @@ public:
         classify_files(filenames);
         sort_files_by_size();
 
-        reader_count_ = (gz_files_.size() >= 2) ? 2 : 1;
         threads_.reserve(reader_count_);
+    }
+
+    ~ReaderThreadPool()
+    {
+#ifdef TEST_MODE
+        std::cout << "ReaderThreadPool: total dequeue spin time: " << total_dequeue_spin_time.load(std::memory_order_relaxed) << std::endl;
+        std::cout << "ReaderThreadPool: total enqueue spin time: " << total_enqueue_spin_time.load(std::memory_order_relaxed) << std::endl;
+#endif
     }
 
     void start()
@@ -475,15 +490,19 @@ private:
 
     }
 
-    static State advance_state(const State current)
+    static bool advance_past_line(const char* input_begin, uint64_t input_size, uint64_t& input_pos)
     {
-        switch (current) {
-        case State::ReadHeader: return State::ReadSequence;
-        case State::ReadSequence: return State::ReadPlus;
-        case State::ReadPlus: return State::ReadQuality;
-        case State::ReadQuality: return State::ReadHeader;
-        default: return State::ReadHeader;
+        const char* cur = input_begin + input_pos;
+        const uint64_t remain = input_size - input_pos;
+        const void* nl = std::memchr(cur, '\n', remain);
+        if (nl == nullptr)
+        {
+            input_pos = input_size;
+            return false;
         }
+
+        input_pos = static_cast<uint64_t>(static_cast<const char*>(nl) - input_begin) + 1;
+        return true;
     }
 
     inline void acquire_block(char*& block_ptr, uint64_t& write_size, uint64_t& last_newline_pos,
@@ -491,13 +510,16 @@ private:
     {
         if (ring_pool_ptr_->producer_try_dequeue(block_ptr))
         {
-            dequeue_backoff.double_decay();
+            dequeue_backoff.reset();
         }
         else
         {
             while (!ring_pool_ptr_->producer_try_dequeue(block_ptr))
             {
                 dequeue_backoff.backoff();
+#ifdef TEST_MODE
+                ++dequeue_spin_time;
+#endif
             }
             dequeue_backoff.decay();
         }
@@ -520,13 +542,16 @@ private:
         if (write_size > 0) {
             if (ring_pool_ptr_->producer_try_enqueue({ block_ptr, write_size }))
             {
-                enqueue_backoff.double_decay();
+                enqueue_backoff.reset();
             }
             else
             {
                 while (!ring_pool_ptr_->producer_try_enqueue({ block_ptr, write_size }))
                 {
                     enqueue_backoff.backoff();
+#ifdef TEST_MODE
+                    ++enqueue_spin_time;
+#endif
                 }
                 enqueue_backoff.decay();
             }
@@ -565,13 +590,13 @@ private:
         char left_buffer_[128];
         size_t left_buffer_size_ = 0;
         const uint64_t overlap = (k_ > 1) ? static_cast<uint64_t>(k_ - 1) : 0;
-
-        GzipStreamer gzip_streamer;
+        const uint64_t worker_buffer_size = std::max(base_chunk_size_, GZ_CHUNK_SIZE);
+        std::vector<char> read_buf(worker_buffer_size);
 
         uint64_t cur_file_index = file_index_.fetch_add(1, std::memory_order_relaxed);
         for (; cur_file_index < assignments.size(); cur_file_index = file_index_.fetch_add(1, std::memory_order_relaxed))
         {
-            std::string file = assignments[cur_file_index];
+            const std::string& file = assignments[cur_file_index];
             const bool is_gz = (file.size() >= 3 && file.compare(file.size() - 3, 3, ".gz") == 0);
             const uint64_t effective_chunk_size = is_gz ? GZ_CHUNK_SIZE : base_chunk_size_;
 
@@ -580,10 +605,9 @@ private:
 
             if (is_gz)
             {
-                // gzip_streamer.open(file);
                 gzfile = gzopen(file.c_str(), "rb");
                 if (gzfile == nullptr) { std::cerr << "Failed to open gzip: " << file << std::endl; std::exit(-1); }
-                gzbuffer(gzfile, GZ_CHUNK_SIZE / 2);
+                gzbuffer(gzfile, GZ_CHUNK_SIZE / 4);
             }
             else
             {
@@ -591,8 +615,6 @@ private:
                 if (fd == -1) { std::cerr << "Failed to open: " << file << std::endl; std::exit(-1); }
                 posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
             }
-
-            std::vector<char> read_buf(effective_chunk_size);
 
             state_ = State::ReadHeader;
             left_buffer_size_ = 0;
@@ -602,12 +624,13 @@ private:
             uint64_t last_newline_pos = kNoNewlineInBlock;
 
             uint64_t input_pos = 0, input_size = 0;
+            uint64_t sequence_line_bytes = 0;
+            uint64_t quality_bytes_remaining = 0;
             bool eof = false;
             char* input_begin = read_buf.data();
 
             while (true)
             {
-                // char* input_begin = read_buf.data();
                 if (input_pos >= input_size && !eof)
                 {
                     ssize_t bytes_read;
@@ -615,11 +638,6 @@ private:
                     {
                         bytes_read = gzread(gzfile, read_buf.data(), static_cast<unsigned int>(effective_chunk_size));
                         input_begin = read_buf.data();
-                        // uint8_t* gzip_input_data = nullptr;
-                        // size_t gizp_bytes_read = 0;
-                        // gzip_streamer.next(gzip_input_data, gizp_bytes_read);
-                        // input_begin = reinterpret_cast<char*>(gzip_input_data);
-                        // bytes_read = static_cast<ssize_t>(gizp_bytes_read);
                     }
                     else
                     {
@@ -653,48 +671,79 @@ private:
                     continue;
                 }
 
-                // const char* input_begin = read_buf.data();
-                if (state_ != State::ReadSequence)
+                switch (state_)
                 {
-                    const char* cur = input_begin + input_pos;
-                    const uint64_t remain = input_size - input_pos;
-                    const void* nl = std::memchr(cur, '\n', remain);
-                    if (nl == nullptr) { input_pos = input_size; continue; }
-                    input_pos = static_cast<uint64_t>(static_cast<const char*>(nl) - input_begin) + 1;
-                    state_ = advance_state(state_);
+                case State::ReadHeader:
+                    if (!advance_past_line(input_begin, input_size, input_pos)) continue;
+                    state_ = State::ReadSequence;
+                    continue;
+
+                case State::ReadSequence:
+                {
+                    const char* seq_cur = input_begin + input_pos;
+                    const uint64_t seq_remain = input_size - input_pos;
+                    const void* nl = std::memchr(seq_cur, '\n', seq_remain);
+                    const uint64_t seq_len = (nl == nullptr) ? seq_remain
+                        : static_cast<uint64_t>(static_cast<const char*>(nl) - seq_cur);
+
+                    uint64_t copied = 0;
+                    while (copied < seq_len)
+                    {
+                        if (write_size == block_size) { store_overlap_from_block_end(block_ptr, write_size, last_newline_pos, overlap, left_buffer_size_, left_buffer_); publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
+                        const uint64_t rem = block_size - write_size;
+                        const uint64_t tc = (seq_len - copied < rem) ? (seq_len - copied) : rem;
+                        std::memcpy(block_ptr + write_size, seq_cur + copied, tc);
+                        write_size += tc; copied += tc; input_pos += tc;
+                        sequence_line_bytes += tc;
+                    }
+                    if (nl == nullptr) continue;
+                    if (write_size == block_size) { left_buffer_size_ = 0; publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
+                    last_newline_pos = write_size;
+                    block_ptr[write_size++] = '\n'; ++input_pos;
+                    state_ = State::ReadPlus;
                     continue;
                 }
 
-                const char* seq_cur = input_begin + input_pos;
-                const uint64_t seq_remain = input_size - input_pos;
-                const void* nl = std::memchr(seq_cur, '\n', seq_remain);
-                const uint64_t seq_len = (nl == nullptr) ? seq_remain
-                    : static_cast<uint64_t>(static_cast<const char*>(nl) - seq_cur);
+                case State::ReadPlus:
+                    if (!advance_past_line(input_begin, input_size, input_pos)) continue;
+                    quality_bytes_remaining = sequence_line_bytes + 1;
+                    sequence_line_bytes = 0;
+                    state_ = State::ReadQuality;
+                    continue;
 
-                uint64_t copied = 0;
-                while (copied < seq_len)
+                case State::ReadQuality:
                 {
-                    if (write_size == block_size) { store_overlap_from_block_end(block_ptr, write_size, last_newline_pos, overlap, left_buffer_size_, left_buffer_); publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
-                    const uint64_t rem = block_size - write_size;
-                    const uint64_t tc = (seq_len - copied < rem) ? (seq_len - copied) : rem;
-                    std::memcpy(block_ptr + write_size, seq_cur + copied, tc);
-                    write_size += tc; copied += tc; input_pos += tc;
+                    const uint64_t available = input_size - input_pos;
+                    const uint64_t skip_bytes = std::min(available, quality_bytes_remaining);
+                    input_pos += skip_bytes;
+                    quality_bytes_remaining -= skip_bytes;
+
+                    if (quality_bytes_remaining == 0)
+                    {
+                        if (input_begin[input_pos - 1] != '\n') [[unlikely]]
+                        {
+                            std::cerr << "FASTQ sequence and quality lengths differ: " << file << std::endl;
+                            std::exit(-1);
+                        }
+                        state_ = State::ReadHeader;
+                    }
+                    continue;
                 }
-                if (nl == nullptr) continue;
-                if (write_size == block_size) { left_buffer_size_ = 0; publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
-                last_newline_pos = write_size;
-                block_ptr[write_size++] = '\n'; ++input_pos;
-                state_ = advance_state(state_);
+                }
             }
 
-            // if (is_gz) gzip_streamer.close();
-            if(is_gz) gzclose(gzfile);
+            if (is_gz) gzclose(gzfile);
             else ::close(fd);
 
             std::cout << "FastqReader: completed " << file << std::endl;
         }
 
         ring_pool_ptr_->producer_set_finished();
+
+#ifdef TEST_MODE
+        total_dequeue_spin_time.fetch_add(dequeue_spin_time, std::memory_order_relaxed);
+        total_enqueue_spin_time.fetch_add(enqueue_spin_time, std::memory_order_relaxed);
+#endif
     }
 };
 
