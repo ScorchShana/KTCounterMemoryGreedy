@@ -13,16 +13,21 @@
 template <uint32_t N>
 class LayerQueues
 {
-    std::atomic<long long> size_{ 0 };
+    struct alignas(CACHE_LINE_SIZE) PaddedAtomicSize
+    {
+        std::atomic<int64_t> size{ 0 };
+    };
+
+    std::array<PaddedAtomicSize, MAX_DEPTH> depth_sizes_{ 0 };
     std::array<std::shared_ptr<MPMCRingQueue<Task<N>, TASK_QUEUE_CAPACITY>>, MAX_DEPTH> queues_;
     std::shared_ptr<MPMCRingQueue<Task<N>, 1ULL << (2 * ROOT_BASES)>> final_drain_queue_;
 
 public:
     explicit LayerQueues()
     {
-        size_.store(0, std::memory_order_relaxed);
         for (uint32_t i = 0; i < MAX_DEPTH; ++i)
         {
+            depth_sizes_[i].size.store(0, std::memory_order_relaxed);
             queues_[i] = std::make_shared<MPMCRingQueue<Task<N>, TASK_QUEUE_CAPACITY>>();
         }
         final_drain_queue_ = std::make_shared<MPMCRingQueue<Task<N>, 1ULL << (2 * ROOT_BASES)>>();
@@ -63,19 +68,19 @@ public:
         return final_drain_queue_.get();
     }
 
-    void increase_size()
+    void increase_size(const uint32_t depth, const uint32_t count = 1)
     {
-        size_.fetch_add(1, std::memory_order_release);
+        depth_sizes_[depth].size.fetch_add(count, std::memory_order_release);
     }
 
-    void decrease_size()
+    void decrease_size(const uint32_t depth, const uint32_t count = 1)
     {
-        size_.fetch_sub(1, std::memory_order_release);
+        depth_sizes_[depth].size.fetch_sub(count, std::memory_order_release);
     }
 
-    long long size() const
+    long long size(const uint32_t depth) const
     {
-        return size_.load(std::memory_order_acquire);
+        return depth_sizes_[depth].size.load(std::memory_order_acquire);
     }
 };
 

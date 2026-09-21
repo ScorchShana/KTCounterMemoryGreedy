@@ -13,15 +13,21 @@
 
 class GzipStreamer {
 public:
-    static constexpr size_t COMPRESSED_CHUNK_SIZE = 1ULL * 1024 * 1024;
-    static constexpr size_t DECOMPRESSED_BUF_SIZE = 256ULL * 1024;
-    static constexpr size_t PAGE_ALIGN = 4096;
+    // 压缩数据每次从磁盘读取的块大小（建议 16~64 MiB）
+    static constexpr size_t COMPRESSED_CHUNK_SIZE = 4ULL * 1024 * 1024;  // 4 MB
+
+    // 解压后输出缓冲区大小
+    static constexpr size_t DECOMPRESSED_BUF_SIZE = 256ULL * 1024;   // 256 KB
+
+    // 缓存行大小（现代 x86_64 / ARM64 几乎都是 64）
+    static constexpr size_t CACHE_LINE_SIZE = 64;
 
     GzipStreamer()
     {
         allocate_buffers();
     }
 
+    // 禁止拷贝
     GzipStreamer(const GzipStreamer&) = delete;
     GzipStreamer& operator=(const GzipStreamer&) = delete;
 
@@ -31,9 +37,11 @@ public:
         free_buffers();
     }
 
-    void open(const char* filename)
-    {
-        close();
+    /**
+     * 打开文件并做顺序读取优化
+     */
+    void open(const char* filename) {
+        close();  // 先关闭已打开的
 
         fd_ = ::open(filename, O_RDONLY | O_CLOEXEC);
         if (fd_ < 0)
@@ -42,15 +50,18 @@ public:
             std::exit(-1);
         }
 
+        // 告诉内核我们会顺序访问整个文件（增大 readahead 窗口）
         if (::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL) != 0)
         {
+            // 非致命，仅警告
             std::cerr << "GzipStreamer: posix_fadvise(POSIX_FADV_SEQUENTIAL) failed: "
                 << ::strerror(errno) << std::endl;
         }
 
+        // 初始化 z_stream
         std::memset(&stream_, 0, sizeof(stream_));
         if (inflateInit2(&stream_, 31) != Z_OK)
-        {
+        {  // 31 = 支持 gzip header
             std::cerr << "GzipStreamer: inflateInit2 failed" << std::endl;
             ::close(fd_);
             fd_ = -1;
@@ -59,9 +70,6 @@ public:
 
         stream_initialized_ = true;
         eof_ = false;
-        file_off_ = 0;
-        got_output_ = false;
-        ::readahead(fd_, 0, COMPRESSED_CHUNK_SIZE);
     }
 
     void open(const std::string& filename)
@@ -81,11 +89,7 @@ public:
             ::close(fd_);
             fd_ = -1;
         }
-        stream_.next_in = nullptr;
-        stream_.avail_in = 0;
         eof_ = false;
-        file_off_ = 0;
-        got_output_ = false;
     }
 
     /**
@@ -94,12 +98,11 @@ public:
      * @param out_size  输出数据长度
      * @return true 还有数据，false 文件结束
      */
-    bool next(uint8_t*& out_data, size_t& out_size)
-    {
+    bool next(uint8_t*& out_data, size_t& out_size) {
         out_data = nullptr;
         out_size = 0;
 
-        if (fd_ < 0 || !stream_initialized_)
+        if (fd_ < 0 || !stream_initialized_ || eof_)
         {
             return false;
         }
@@ -109,29 +112,33 @@ public:
 
         while (true)
         {
+            // 输入耗尽时，从磁盘再读一大块压缩数据
             if (stream_.avail_in == 0 && !eof_)
             {
-                feed_input();
-            }
-
-            if (stream_.avail_in == 0 && eof_)
-            {
-                break;
+                ssize_t n = ::read(fd_, compressed_buf_, COMPRESSED_CHUNK_SIZE);
+                if (n < 0)
+                {
+                    if (errno == EINTR) continue;  // 被信号打断，重试
+                    std::cerr << "GzipStreamer: read failed: " << strerror(errno) << std::endl;
+                    std::exit(-1);
+                }
+                if (n == 0)
+                {
+                    eof_ = true;
+                }
+                else
+                {
+                    stream_.next_in = compressed_buf_;
+                    stream_.avail_in = static_cast<uInt>(n);
+                }
             }
 
             int ret = inflate(&stream_, Z_NO_FLUSH);
 
             if (ret == Z_STREAM_END)
             {
-                if (stream_.avail_out == 0)
-                {
-                    break;
-                }
-                if (stream_.avail_in == 0 && !eof_)
-                {
-                    feed_input();
-                }
-                if (stream_.avail_in > 0)
+                // 一个 gzip member 结束，尝试支持多流 gzip
+                if (stream_.avail_in > 0 || !eof_)
                 {
                     if (inflateReset(&stream_) != Z_OK)
                     {
@@ -140,11 +147,7 @@ public:
                     }
                     continue;
                 }
-                break;
-            }
-
-            if (ret == Z_DATA_ERROR && got_output_)
-            {
+                // 真正结束
                 break;
             }
 
@@ -154,11 +157,13 @@ public:
                 std::exit(-1);
             }
 
+            // 输出缓冲区满了，返回给调用者
             if (stream_.avail_out == 0)
             {
                 break;
             }
 
+            // 既没有输入也没有输出 → 结束
             if (eof_ && stream_.avail_in == 0)
             {
                 break;
@@ -171,7 +176,6 @@ public:
             return false;
         }
 
-        got_output_ = true;
         out_data = decompressed_buf_;
         return true;
     }
@@ -179,43 +183,14 @@ public:
     bool is_open() const { return fd_ >= 0; }
 
 private:
-    bool feed_input()
-    {
-        ssize_t n;
-        do
-        {
-            n = ::read(fd_, compressed_buf_, COMPRESSED_CHUNK_SIZE);
-        } while (n < 0 && errno == EINTR);
-
-        if (n < 0)
-        {
-            std::cerr << "GzipStreamer: read failed: " << ::strerror(errno) << std::endl;
-            std::exit(-1);
-        }
-        if (n == 0)
-        {
-            eof_ = true;
-            return false;
-        }
-
-        file_off_ += n;
-        // ::readahead(fd_, file_off_, COMPRESSED_CHUNK_SIZE);
-        stream_.next_in = compressed_buf_;
-        stream_.avail_in = static_cast<uInt>(n);
-        return true;
-    }
-
-    void allocate_buffers()
-    {
+    void allocate_buffers() {
         if (posix_memalign(reinterpret_cast<void**>(&compressed_buf_),
-            PAGE_ALIGN, COMPRESSED_CHUNK_SIZE) != 0)
-        {
+            CACHE_LINE_SIZE, COMPRESSED_CHUNK_SIZE) != 0) {
             std::cerr << "GzipStreamer: posix_memalign(compressed_buf) failed" << std::endl;
             std::exit(-1);
         }
         if (posix_memalign(reinterpret_cast<void**>(&decompressed_buf_),
-            PAGE_ALIGN, DECOMPRESSED_BUF_SIZE) != 0)
-        {
+            CACHE_LINE_SIZE, DECOMPRESSED_BUF_SIZE) != 0) {
             free(compressed_buf_);
             compressed_buf_ = nullptr;
             std::cerr << "GzipStreamer: posix_memalign(decompressed_buf) failed" << std::endl;
@@ -223,15 +198,12 @@ private:
         }
     }
 
-    void free_buffers()
-    {
-        if (compressed_buf_)
-        {
+    void free_buffers() {
+        if (compressed_buf_) {
             free(compressed_buf_);
             compressed_buf_ = nullptr;
         }
-        if (decompressed_buf_)
-        {
+        if (decompressed_buf_) {
             free(decompressed_buf_);
             decompressed_buf_ = nullptr;
         }
@@ -241,8 +213,6 @@ private:
     z_stream     stream_{};
     bool         stream_initialized_ = false;
     bool         eof_ = false;
-    bool         got_output_ = false;
-    off_t        file_off_ = 0;
 
     uint8_t* compressed_buf_ = nullptr;
     uint8_t* decompressed_buf_ = nullptr;

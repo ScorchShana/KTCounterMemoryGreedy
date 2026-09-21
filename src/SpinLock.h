@@ -1,40 +1,11 @@
 #ifndef SPIN_LOCK_HEADER
 #define SPIN_LOCK_HEADER
 
+#include "SpinBackoff.h"
+
 #include <atomic>
 #include <cstdint>
 #include <thread>
-
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <emmintrin.h>
-static inline void cpu_relax() noexcept
-{
-    _mm_pause();
-}
-#elif defined(__arm__) || defined(__aarch64__) || defined(_M_ARM64)
-static inline void cpu_relax() noexcept
-{
-#if (defined(__ARM_ARCH_6K__) ||  \
-     defined(__ARM_ARCH_6Z__) ||  \
-     defined(__ARM_ARCH_6ZK__) || \
-     defined(__ARM_ARCH_6T2__) || \
-     defined(__ARM_ARCH_7__) ||   \
-     defined(__ARM_ARCH_7A__) ||  \
-     defined(__ARM_ARCH_7R__) ||  \
-     defined(__ARM_ARCH_7M__) ||  \
-     defined(__ARM_ARCH_7S__) ||  \
-     defined(__ARM_ARCH_8A__) ||  \
-     defined(__aarch64__))
-    asm volatile("yield" ::: "memory");
-
-#elif defined(_M_ARM64)
-    __yield();
-
-#else
-    asm volatile("nop" ::: "memory");
-#endif
-}
-#endif
 
 class SpinLock
 {
@@ -91,10 +62,7 @@ public:
 
     void lock()
     {
-        int backoff_iterations = 2;
-        constexpr int MAX_BACKOFF = 64;
-        int spin_count = 0;
-        constexpr int YIELD_THRESHOLD = 256;
+        SpinBackoff<> backoff;
 
 #ifdef TEST_MODE
         uint64_t local_spin_loops = 0;
@@ -108,26 +76,7 @@ public:
 #ifdef TEST_MODE
                 ++local_spin_loops;
 #endif
-                if (spin_count < YIELD_THRESHOLD)
-                {
-                    // 执行 'backoff_iterations' 次暂停指令
-                    for (int i = 0; i < backoff_iterations; ++i)
-                    {
-                        cpu_relax();
-                    }
-                    // 指数增加退避时间，直到上限
-                    if (backoff_iterations < MAX_BACKOFF)
-                    {
-                        backoff_iterations *= 2;
-                    }
-                    spin_count++;
-                }
-                else
-                {
-                    // 3. 向操作系统让出：如果我们自旋太久，持锁线程
-                    // 可能已被抢占。让操作系统调度其他线程。
-                    std::this_thread::yield();
-                }
+                backoff.backoff();
             }
 
             // 2. 测试并设置（原子写）：尝试获取锁
@@ -139,12 +88,6 @@ public:
                 return; // 获取成功
             }
 
-            // 如果执行到这里，说明另一个线程刚好在我们之前抢到了锁。
-            // 这意味着竞争激烈。增加退避时间。
-            if (backoff_iterations < MAX_BACKOFF)
-            {
-                backoff_iterations *= 2;
-            }
         }
     }
 

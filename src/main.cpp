@@ -47,13 +47,8 @@ void get_MAX_BLOOM_FILTER_CAPACITY()
     const uint64_t quarter_memory_average_capacity = memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 / sizeof(uint64_t) / (1ULL << (2 * ROOT_BASES));
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
     const double error_factor = 0.5 + singleton_rate_cause_by_error;
-    const auto corrected_memory_average_capacity = std::bit_ceil(static_cast<uint64_t>(static_cast<double>(quarter_memory_average_capacity) * error_factor));
+    const auto corrected_memory_average_capacity = std::bit_floor(static_cast<uint64_t>(static_cast<double>(quarter_memory_average_capacity) * error_factor));
     MAX_BLOOM_FILTER_CAPACITY = std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, corrected_memory_average_capacity);
-}
-
-uint64_t get_estimated_total_kmer(const uint64_t estimated_file_size)
-{
-    return estimated_file_size * 30 / 3 / std::max(k_len, 31U);
 }
 
 void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_num)
@@ -108,15 +103,17 @@ void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_
     }
 }
 
-void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_counts, uint64_t estimated_file_size)
+void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_counts, uint64_t estimated_total_kmers)
 {
 
     const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
     const uint64_t quarter_memory_average_capacity = memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 / sizeof(uint64_t) / (1ULL << (2 * ROOT_BASES));
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
-    const double capacity_error_factor = std::min(0.5 + singleton_rate_cause_by_error, 1.0);
+    const double capacity_error_factor = 0.5 + singleton_rate_cause_by_error;
+    uint64_t bloom_filter_memroy_budget = static_cast<uint64_t>(memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 * capacity_error_factor);
 
-    const uint64_t estimated_total_kmers = get_estimated_total_kmer(estimated_file_size);
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> expected_bloom_filter_capacity;
+    std::array<double, 1ULL << (2 * ROOT_BASES)> prefix_ratios;
 
 #ifdef TEST_MODE
     std::cout << "Estimated total k-mers: " << estimated_total_kmers << std::endl;
@@ -138,11 +135,72 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     for (uint64_t i = 0; i < bloom_filter_capacity.size(); i++)
     {
         double prefix_ratio = static_cast<double>(prefix_counts[i].load(std::memory_order_relaxed)) / total_prefix_count;
-        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 * capacity_error_factor / 64);
+        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 * (sizeof(std::atomic<uint64_t>)) / 8 * capacity_error_factor / 64);
+        prefix_ratios[i] = prefix_ratio;
+        expected_bloom_filter_capacity[i] = estimated_capacity;
         bloom_filter_capacity[i] = std::max(std::bit_ceil(estimated_capacity), MIN_BLOOM_FILTER_CAPACITY);
         bloom_filter_capacity[i] = std::min(bloom_filter_capacity[i], MAX_BLOOM_FILTER_CAPACITY);
+        bloom_filter_memroy_budget -= sizeof(std::atomic<uint64_t>) * bloom_filter_capacity[i];
+    }
+
+    // 贪心增大布隆过滤器
+    auto cmp = [&](const uint32_t& a, const uint32_t& b) {
+        uint64_t val_a = 0;
+        if (bloom_filter_capacity[a] < expected_bloom_filter_capacity[a])
+        {
+            val_a = std::min(expected_bloom_filter_capacity[a] - bloom_filter_capacity[a],
+                bloom_filter_capacity[a]);
+        }
+        uint64_t val_b = 0;
+        if (bloom_filter_capacity[b] < expected_bloom_filter_capacity[b])
+        {
+            val_b = std::min(expected_bloom_filter_capacity[b] - bloom_filter_capacity[b],
+                bloom_filter_capacity[b]);
+        };
+
+        __uint128_t val_a_per_byte = val_a * static_cast<__uint128_t>(bloom_filter_capacity[b]);
+        __uint128_t val_b_per_byte = val_b * static_cast<__uint128_t>(bloom_filter_capacity[a]);
+
+        if (val_a_per_byte == val_b_per_byte)
+        {
+            return prefix_ratios[a] < prefix_ratios[b];
+        }
+        else
+        {
+            return val_a_per_byte < val_b_per_byte;
+        }
+        };
+
+    std::priority_queue<uint32_t, std::vector<uint32_t>, decltype(cmp)>q(cmp);
+
+    for (uint32_t i = 0; i < bloom_filter_capacity.size(); i++)
+    {
+        q.push(i);
+    }
+
+    const uint64_t final_max_bloom_filter_capacity = MAX_BLOOM_FILTER_CAPACITY * 4;
+    while (!q.empty()) {
+        uint32_t i = q.top();
+        q.pop();
+        if (bloom_filter_capacity[i] < expected_bloom_filter_capacity[i])
+        {
+            uint64_t increase_size = bloom_filter_capacity[i];
+            uint64_t increase_memory = sizeof(std::atomic<uint64_t>) * increase_size;
+            if (bloom_filter_memroy_budget >= increase_memory && bloom_filter_capacity[i] * 2 <= final_max_bloom_filter_capacity)
+            {
+                bloom_filter_capacity[i] *= 2;
+                bloom_filter_memroy_budget -= increase_memory;
+                q.push(i);
+            }
+        }
+    }
+
+
+    for (uint64_t i = 0; i < bloom_filter_capacity.size(); i++)
+    {
         max_bloom_filter_capacity = std::max(max_bloom_filter_capacity, bloom_filter_capacity[i]);
 #ifdef TEST_MODE
+        std::cout << "Bloom filter " << i << " capacity: " << bloom_filter_capacity[i] << std::endl;
         total_bloom_filter_size += bloom_filter_capacity[i];
 #endif
     }
@@ -152,69 +210,69 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
 #endif
 }
 
-void calculate_concurrent_map_capacity(
-    const std::vector<std::atomic<uint32_t>>& prefix_counts)
-{
-    const uint64_t max_cap = kmer_concurrent_hash_map_capacity;
-    const uint64_t min_cap = 4096ULL;
-    const uint64_t mid_cap = std::max<uint64_t>(min_cap, max_cap / 2ULL);
+// void calculate_concurrent_map_capacity(
+//     const std::vector<std::atomic<uint32_t>>& prefix_counts)
+// {
+//     const uint64_t max_cap = kmer_concurrent_hash_map_capacity;
+//     const uint64_t min_cap = 4096ULL;
+//     const uint64_t mid_cap = std::max<uint64_t>(min_cap, max_cap / 2ULL);
 
-    std::array<uint64_t, 256> sorted;
-    for (size_t i = 0; i < prefix_counts.size(); ++i) {
-        sorted[i] = prefix_counts[i].load(std::memory_order_relaxed);
-    }
-    std::sort(sorted.begin(), sorted.end());
+//     std::array<uint64_t, 256> sorted;
+//     for (size_t i = 0; i < prefix_counts.size(); ++i) {
+//         sorted[i] = prefix_counts[i].load(std::memory_order_relaxed);
+//     }
+//     std::sort(sorted.begin(), sorted.end());
 
-    const uint64_t p30 = sorted[77];
-    const uint64_t p85 = sorted[218];
+//     const uint64_t p30 = sorted[77];
+//     const uint64_t p85 = sorted[218];
 
-    const double warm_low = static_cast<double>(p30);
-    const double warm_high = static_cast<double>(p85);
-    const double warm_range = warm_high - warm_low;
+//     const double warm_low = static_cast<double>(p30);
+//     const double warm_high = static_cast<double>(p85);
+//     const double warm_range = warm_high - warm_low;
 
-#ifdef TEST_MODE
-    uint64_t cold_cnt = 0, warm_cnt = 0, hot_cnt = 0;
-#endif
+// #ifdef TEST_MODE
+//     uint64_t cold_cnt = 0, warm_cnt = 0, hot_cnt = 0;
+// #endif
 
-    for (size_t i = 0; i < concurrent_map_capacity.size(); ++i) {
-        const uint64_t count = prefix_counts[i].load(std::memory_order_relaxed);
-        uint64_t cap;
+//     for (size_t i = 0; i < concurrent_map_capacity.size(); ++i) {
+//         const uint64_t count = prefix_counts[i].load(std::memory_order_relaxed);
+//         uint64_t cap;
 
-        if (count < p30) {
-            cap = min_cap;
-#ifdef TEST_MODE
-            cold_cnt++;
-#endif
-        }
-        else if (count < p85) {
-            double t = (warm_range > 0.0)
-                ? (static_cast<double>(count) - warm_low) / warm_range
-                : 0.0;
-            cap = min_cap + static_cast<uint64_t>((mid_cap - min_cap) * t);
-#ifdef TEST_MODE
-            warm_cnt++;
-#endif
-        }
-        else {
-            cap = max_cap;
-#ifdef TEST_MODE
-            hot_cnt++;
-#endif
-        }
+//         if (count < p30) {
+//             cap = min_cap;
+// #ifdef TEST_MODE
+//             cold_cnt++;
+// #endif
+//         }
+//         else if (count < p85) {
+//             double t = (warm_range > 0.0)
+//                 ? (static_cast<double>(count) - warm_low) / warm_range
+//                 : 0.0;
+//             cap = min_cap + static_cast<uint64_t>((mid_cap - min_cap) * t);
+// #ifdef TEST_MODE
+//             warm_cnt++;
+// #endif
+//         }
+//         else {
+//             cap = max_cap;
+// #ifdef TEST_MODE
+//             hot_cnt++;
+// #endif
+//         }
 
-        cap = std::max(min_cap, std::bit_ceil(cap));
-        concurrent_map_capacity[i] = cap;
-    }
+//         cap = std::max(min_cap, std::bit_ceil(cap));
+//         concurrent_map_capacity[i] = cap;
+//     }
 
-#ifdef TEST_MODE
-    std::cout << "--- Hash Map Capacity Allocation ---" << std::endl;
-    std::cout << "  P30 (cold/warm): " << p30 << std::endl;
-    std::cout << "  P85 (warm/hot):  " << p85 << std::endl;
-    std::cout << "  COLD: " << cold_cnt << " -> cap=" << min_cap << std::endl;
-    std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << mid_cap << std::endl;
-    std::cout << "  HOT:  " << hot_cnt << " -> cap=" << max_cap << std::endl;
-#endif
-}
+// #ifdef TEST_MODE
+//     std::cout << "--- Hash Map Capacity Allocation ---" << std::endl;
+//     std::cout << "  P30 (cold/warm): " << p30 << std::endl;
+//     std::cout << "  P85 (warm/hot):  " << p85 << std::endl;
+//     std::cout << "  COLD: " << cold_cnt << " -> cap=" << min_cap << std::endl;
+//     std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << mid_cap << std::endl;
+//     std::cout << "  HOT:  " << hot_cnt << " -> cap=" << max_cap << std::endl;
+// #endif
+// }
 
 void get_numa_nodes()
 {
@@ -249,10 +307,15 @@ int process_main()
     for (const auto& f : filenames) {
         if (f.size() >= 3 && f.compare(f.size() - 3, 3, ".gz") == 0) gz_count++;
     }
-    const uint32_t reader_num = (gz_count >= 2) ? 2 : 1;
+    const uint32_t reader_num = (gz_count >= 2) ? std::max(std::min(gz_count, n_thread / 20), 2U) : 1;
+
+    const uint32_t preReadThreadsNum = std::max(1U, n_thread / 8);
+    const uint32_t pre_reader_num = std::min<uint32_t>(filenames.size(), preReadThreadsNum);
+    const uint32_t pre_parser_num = pre_reader_num * 4;
+    const uint32_t pre_counter_num = pre_reader_num * 3;
 
     const uint32_t remaining = n_thread - reader_num - 1;  // -1: export writer
-    const uint32_t parser_num = std::max(1U, remaining / 8);
+    const uint32_t parser_num = std::max(1U, remaining / 10);
     const uint32_t worker_budget = remaining - parser_num;
 
     const auto init_start = std::chrono::steady_clock::now();
@@ -260,9 +323,9 @@ int process_main()
     // 初始化层级队列，用于在树的不同深度间传递任务
     auto layer_queues = std::make_shared<LayerQueues<N>>();
     // 初始化解析器环形内存池，管理 Reader 读取后的碱基字符串数据块
-    auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1);
+    auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, pre_reader_num);
     // 初始化分类器环形内存池，管理 Parser 线程处理后的 k-mer 数据块
-    auto parser_classifier_ring_pool = std::make_shared<RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>>(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, 1);
+    auto parser_classifier_ring_pool = std::make_shared<RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>>(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, pre_parser_num);
     // 初始化导出用的环形内存池，管理低频 k-mer 的导出数据块
     auto export_ring_pool = std::make_shared<RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>>(EXPORT_RING_MEMORY_POOL_BLOCK_SIZE, 1);
     // 初始化全局并发内存池，用于节点分配、哈希表等
@@ -270,14 +333,31 @@ int process_main()
     //
     auto global_classifier_task_queue = std::make_shared<MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>>();
 
-    // PreRead阶段
-    FastqPreReader<N> pre_reader(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
-    estimated_file_size = pre_reader.get_estimated_raw_fastq_file_size();
-    auto pre_parser_thread = std::thread([&]
-        {
-            FastqPreParser<N> parser(k_len, reader_parser_ring_pool.get(), parser_classifier_ring_pool.get());
-            parser.parse_and_push();
-            parser_classifier_ring_pool->producer_set_finished(); });
+    // PreRead阶段：多个 reader 按文件分组并行读取
+    std::vector<std::vector<std::string>> pre_reader_files(pre_reader_num);
+    for (size_t i = 0; i < filenames.size(); ++i)
+        pre_reader_files[i % pre_reader_num].push_back(filenames[i]);
+
+    std::vector<std::unique_ptr<FastqPreReader<N>>> pre_readers;
+    pre_readers.reserve(pre_reader_num);
+    for (uint32_t i = 0; i < pre_reader_num; ++i)
+        pre_readers.emplace_back(std::make_unique<FastqPreReader<N>>(pre_reader_files[i], k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get()));
+
+    std::vector<std::thread> pre_reader_threads;
+    pre_reader_threads.reserve(pre_reader_num);
+    for (auto& pr : pre_readers)
+        pre_reader_threads.emplace_back([&pr] { pr->pre_read(); });
+
+    std::vector<std::thread> pre_parser_threads;
+    pre_parser_threads.reserve(pre_parser_num);
+    for (uint32_t i = 0; i < pre_parser_num; ++i)
+    {
+        pre_parser_threads.emplace_back([&]
+            {
+                FastqPreParser<N> parser(k_len, reader_parser_ring_pool.get(), parser_classifier_ring_pool.get());
+                parser.parse_and_push();
+                parser_classifier_ring_pool->producer_set_finished(); });
+    }
 
     std::vector<std::atomic<uint32_t>> prefix_counts(1U << (2 * ROOT_BASES)); // 256 个前缀的计数器
     for (auto& v : prefix_counts)
@@ -285,8 +365,8 @@ int process_main()
         v.store(0); // 或 v.store(init_value);
     }
     std::vector<std::thread> prefix_counter_threads;
-    uint32_t prefix_counter_thread_num = std::min(std::max(1u, n_thread - 2), 8u); // 预留至少 1 个线程给前缀计数器
-    for (uint32_t i = 0; i < prefix_counter_thread_num; ++i)
+    prefix_counter_threads.reserve(pre_counter_num);
+    for (uint32_t i = 0; i < pre_counter_num; ++i)
     {
         prefix_counter_threads.emplace_back([&]
             {
@@ -297,12 +377,78 @@ int process_main()
                     prefix_counts[j].fetch_add(prefix_counter.prefix_counts[j], std::memory_order_relaxed);
                 } });
     }
-    pre_reader.pre_read();
-    pre_parser_thread.join();
+
+    for (auto& t : pre_reader_threads)
+    {
+        t.join();
+    }
+
+    // 聚合各 reader 的质量值，得到全局 avgQuality
+    uint64_t quality_sum = 0, quality_count = 0;
+    for (auto& pr : pre_readers)
+    {
+        quality_sum += pr->get_quality_sum();
+        quality_count += pr->get_quality_count();
+    }
+    if (quality_count > 0)
+        avgQuality = static_cast<uint8_t>(quality_sum / quality_count);
+
+    for (auto& t : pre_parser_threads)
+    {
+        t.join();
+    }
     for (auto& t : prefix_counter_threads)
     {
         t.join();
     }
+
+    // 聚合各 reader 预读采样的字节数
+    uint64_t sampled_plain_bytes = 0;
+    uint64_t sampled_gz_decompressed_bytes = 0;
+    uint64_t sampled_gz_compressed_bytes = 0;
+    for (auto& pr : pre_readers)
+    {
+        sampled_plain_bytes += pr->get_sampled_plain_bytes();
+        sampled_gz_decompressed_bytes += pr->get_sampled_gz_decompressed_bytes();
+        sampled_gz_compressed_bytes += pr->get_sampled_gz_compressed_bytes();
+    }
+
+    // 根据采样得到的实际解压比重新估计完整 FASTQ 大小(替代原来的 *4)
+    uint64_t total_plain_file_size = 0;
+    uint64_t total_gz_compressed_file_size = 0;
+    for (const auto& f : filenames)
+    {
+        int fd = ::open(f.data(), O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st;
+        if (::fstat(fd, &st) == 0)
+        {
+            unsigned char buf[2];
+            ssize_t n = ::read(fd, buf, 2);
+            if (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B)
+                total_gz_compressed_file_size += static_cast<uint64_t>(st.st_size);
+            else
+                total_plain_file_size += static_cast<uint64_t>(st.st_size);
+        }
+        ::close(fd);
+    }
+    double gz_ratio = 1.0;
+    if (sampled_gz_compressed_bytes > 0)
+        gz_ratio = static_cast<double>(sampled_gz_decompressed_bytes) / static_cast<double>(sampled_gz_compressed_bytes);
+    estimated_file_size = total_plain_file_size
+        + static_cast<uint64_t>(static_cast<double>(total_gz_compressed_file_size) * gz_ratio);
+    if (estimated_file_size == 0) estimated_file_size = 1;
+
+    // 保存预读得到的原始 prefix 计数(在 clamp 之前), 用于估计总 k-mer 数
+    uint64_t sampled_kmer_count = 0;
+    for (const auto& v : prefix_counts)
+        sampled_kmer_count += v.load(std::memory_order_relaxed);
+
+    const uint64_t sampled_raw_bytes = sampled_plain_bytes + sampled_gz_decompressed_bytes;
+    uint64_t estimated_total_kmers = 1;
+    if (sampled_raw_bytes > 0)
+        estimated_total_kmers = static_cast<uint64_t>(
+            (static_cast<__uint128_t>(sampled_kmer_count) * estimated_file_size) / sampled_raw_bytes);
 
     uint64_t average_count = 0;
 
@@ -321,7 +467,7 @@ int process_main()
     std::cout << "Average prefix count: " << average_count << std::endl;
 #endif
 
-    const uint32_t fewer_worker_num = std::max<uint32_t>(1U, worker_budget / (1.0 + TASK_CLASSIFIER_RATIO + 0.1));
+    const uint32_t fewer_worker_num = std::max<uint32_t>(1U, worker_budget / (1.0 + TASK_CLASSIFIER_RATIO + 0.8));
     const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
     const bool high_quailty = (avgQuality >= 33 + 30);
     const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
@@ -329,22 +475,22 @@ int process_main()
     const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
 
     std::cout << "Thread split:" << std::endl;
+    std::cout << "  reader threads: " << reader_num << std::endl;
     std::cout << "  parser threads: " << parser_num << std::endl;
     std::cout << "  classifier threads: " << classifier_num << std::endl;
     std::cout << "  task threads: " << tasker_num << std::endl;
 
     get_MAX_BLOOM_FILTER_CAPACITY();
     lpt(prefix_counts, classifier_num);
-    calculate_bloom_filter_capacity(prefix_counts, estimated_file_size);
-    calculate_concurrent_map_capacity(prefix_counts);
+    calculate_bloom_filter_capacity(prefix_counts, estimated_total_kmers);
+    // calculate_concurrent_map_capacity(prefix_counts);
 
     get_numa_nodes();
 
     // 确保 Arena 已初始化，才能安全分配内存
     pool->init_arenas();
     // pool->perform_first_touch(n_thread);
-    ConcurrentMap<N>::set_thread_num(std::max(1U, tasker_num - 1U) + n_thread);
-    ConcurrentMap<N>::set_k_length(k_len);
+
     // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
     auto tree = std::make_shared<KmerTree<N>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
     // 初始化布隆过滤器的MPSC队列
@@ -369,7 +515,7 @@ int process_main()
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
-    ReaderThreadPool<N> reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
+    ReaderThreadPool<N> reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_num, reader_parser_ring_pool.get());
     // FastqClassifier<N> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
 
     const auto init_end = std::chrono::steady_clock::now();
@@ -459,6 +605,10 @@ int process_main()
     std::cout << "Classifier consumer enqueue total spin time: " << classifier_thread_pool->consumer_enqueue_spin_time.load() << std::endl;
     std::cout << "Classifier producer enqueue total spin time: " << classifier_thread_pool->producer_enqueue_spin_time.load() << std::endl;
     std::cout << "Classifier producer dequeue total spin time: " << classifier_thread_pool->producer_dequeue_spin_time.load() << std::endl;
+    std::cout << "Classifier enqueue to tree wait cycles: " << classifier_thread_pool->total_classifier_wait_cycles.load() << std::endl;
+    std::cout << "Classifier total local tasks :" << classifier_thread_pool->total_local_tasks.load() << std::endl;
+    std::cout << "Classifier total global tasks :" << classifier_thread_pool->total_global_tasks.load() << std::endl;
+    std::cout << "Classifier total owner tasks :" << classifier_thread_pool->total_owner_tasks.load() << std::endl;
 
     std::cout << "KmerTree total kmers added: " << tree->total_kmers_added.load() << std::endl;
     std::cout << "Kmer total kmers exported: " << classifier_thread_pool->total_kmers_exported.load() << std::endl;
@@ -481,10 +631,10 @@ int process_main()
 int main(int argc, char* argv[])
 {
 
-    if (argc < 6 || argc > 10)
+    if (argc < 6 || argc > 9)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [count_max=255]" << std::endl;
         return 1;
     }
 
@@ -538,7 +688,7 @@ int main(int argc, char* argv[])
 
         if (argc >= 7)
         {
-            kmer_concurrent_hash_map_capacity = std::max<uint32_t>(1024, std::bit_ceil(std::stoul(argv[6])));
+            concurrent_hash_map_max_capacity = std::max<uint64_t>(concurrent_hash_map_min_capacity, std::bit_ceil(std::stoul(argv[6])));
         }
         if (argc >= 8)
         {
@@ -546,11 +696,7 @@ int main(int argc, char* argv[])
         }
         if (argc >= 9)
         {
-            filter_max = std::stoul(argv[8]);
-        }
-        if (argc >= 10)
-        {
-            count_max = std::stoul(argv[9]);
+            count_max = std::stoul(argv[8]);
         }
 
         if (n_thread < 6)
@@ -566,22 +712,21 @@ int main(int argc, char* argv[])
         std::cout << "  k-mer length: " << k_len << std::endl;
         std::cout << "  Thread count: " << n_thread << std::endl;
         std::cout << "  Memory limit (GB): " << memory_limit << std::endl;
-        std::cout << "  Map capacity: " << kmer_concurrent_hash_map_capacity << std::endl;
+        std::cout << "  Map capacity: " << concurrent_hash_map_max_capacity << std::endl;
         std::cout << "  Filter min: " << filter_min << std::endl;
-        std::cout << "  Filter max: " << filter_max << std::endl;
         std::cout << "  Count max: " << count_max << std::endl;
     }
     catch (const std::exception&)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [filter_max] [count_max]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [count_max]" << std::endl;
         return 1;
     }
 
-    if (kmer_concurrent_hash_map_capacity <= 1 || kmer_concurrent_hash_map_capacity >= 16ULL * 1024 * 1024 || filter_max < filter_min || count_max == 0)
+    if (concurrent_hash_map_max_capacity <= 1 || concurrent_hash_map_min_capacity > concurrent_hash_map_max_capacity || count_max == 0)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [filter_max] [count_max]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [count_max]" << std::endl;
         return 1;
     }
 

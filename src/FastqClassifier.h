@@ -27,15 +27,6 @@ template <uint32_t N>
 class FastqClassifier
 {
 
-    // 自旋参数
-    static constexpr int SLEEP_THRESHOLD = 128;
-    static constexpr int YIELD_THRESHOLD = 64;
-    static constexpr int MAX_BACKOFF = 64;
-
-    static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 4; // 预取 Bloom Filter 的距离（单位：k-mer数量）
-    static constexpr size_t OCC_HASHSET_PREFETCH_DISTANCE = 32; // flush buf1 contains 预取流水线深度
-
     // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
     // per_thread ≈ (B1+B2)*sizeof(kmer) + sizeof(HashSet) + 2*TREE_CHUNK*sizeof(kmer)
     // static constexpr size_t OCC_BUF1_CAPACITY =
@@ -55,6 +46,17 @@ class FastqClassifier
     static_assert(OCC_BUF1_CAPACITY >= OCC_BUF2_CAPACITY && OCC_BUF2_CAPACITY >= 1,
         "OCC_BUF capacities invalid");
 
+    // 自旋参数
+    static constexpr int SLEEP_THRESHOLD = 128 + 16;
+    static constexpr int YIELD_THRESHOLD = 128;
+    static constexpr int MAX_BACKOFF = 32;
+
+    static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 16; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+
+    static constexpr uint32_t MAX_CHECK_LOCAL_ROUND = 128;
+    static constexpr uint32_t MIN_CHECK_LOCAL_ROUND = 16;
+
     int k_len;
     uint32_t classifier_index;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
@@ -70,6 +72,8 @@ class FastqClassifier
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_sums{};
     std::array<ConcurrentBloomFilter<N>*, 1ULL << (2 * ROOT_BASES)> local_global_bloom_filter{};
 
+    std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> prefix_ordered_by_owner{};
+
     std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_for_copy{};
 
     ExportBlock<N>* export_block_ptr = nullptr;
@@ -79,6 +83,13 @@ class FastqClassifier
     SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_from_export_writer_backoff;
 
     std::vector<ConcurrentBloomFilter<N>> local_bloom_filters;
+    std::vector<uint32_t> local_owned_preifx{};
+
+    uint32_t check_local_first_round = 16;
+    uint32_t local_first_round = 0;
+
+
+    SplitMix64 rng;
 
     // Owned FIRST/SECOND 缓冲与 HashSet：allocate_large（仅 owned 路径写入）
     kmer<N>* occ_buf1_ = nullptr;
@@ -92,8 +103,6 @@ class FastqClassifier
     std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_sorted_{};
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_chunk_prefix_counts_{};
 
-    SplitMix64 rng;
-
 public:
     uint64_t total_deal_kmer_count = 0;
 #ifdef TEST_MODE
@@ -104,6 +113,10 @@ public:
     bool not_first_flag = false;
     uint64_t total_kmers_exported = 0;
     uint64_t total_kmers_send_to_tree = 0;
+    uint64_t classifier_wait_cycles = 0;
+    uint64_t global_tasks = 0;
+    uint64_t local_tasks = 0;
+    uint64_t owner_tasks = 0;
 #endif
 
     explicit FastqClassifier(uint32_t in_k_len,
@@ -147,6 +160,7 @@ public:
         {
             if (local_prefix_owners[i] == classifier_index) {
                 global_bloom_filter[i] = &local_bloom_filters[local_bloom_filters_index++];
+                local_owned_preifx.push_back(i);
             }
 
         }
@@ -161,19 +175,14 @@ public:
 
     ~FastqClassifier()
     {
-        if (occ_hash_set_ != nullptr)
-        {
-            occ_hash_set_->~HashSet();
-            occ_hash_set_ = nullptr;
-        }
-        occ_buf1_ = nullptr;
-        occ_buf2_ = nullptr;
     }
 
     void classify_and_push()
     {
         content_type content;
         //bool not_empty = true;
+        local_first_round = 0;
+        check_local_first_round = MIN_CHECK_LOCAL_ROUND * 2;
 
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
@@ -182,11 +191,52 @@ public:
         {
             if (!parser_classifier_ring_pool->producer_finished()) [[likely]]
             {
-                bool not_empty = classify_task_queue->try_dequeue(content);
-                if (!not_empty)
+                bool not_empty = false;
+                if (local_first_round < check_local_first_round) [[likely]]
                 {
-                    not_empty = global_classifier_task_queue->try_dequeue(content);
+                    local_first_round++;
+                    not_empty = classify_task_queue->try_dequeue(content);
+#ifdef TEST_MODE
+                    if (not_empty)
+                        local_tasks++;
+#endif
+                    if (!not_empty)
+                    {
+                        not_empty = global_classifier_task_queue->try_dequeue(content);
+
+#ifdef TEST_MODE
+                        if (not_empty)
+                            global_tasks++;
+#endif
+                    }
                 }
+                else
+                {
+                    const uint64_t global_queue_size = global_classifier_task_queue->size();
+                    if (global_queue_size > PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY / 2) {
+                        check_local_first_round = std::max(check_local_first_round / 2, MIN_CHECK_LOCAL_ROUND);
+                    }
+                    else if (global_queue_size < PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY / 4) {
+                        check_local_first_round = std::min(check_local_first_round * 2, MAX_CHECK_LOCAL_ROUND);
+                    }
+
+                    local_first_round = 0;
+                    not_empty = global_classifier_task_queue->try_dequeue(content);
+#ifdef TEST_MODE
+                    if (not_empty)
+                        global_tasks++;
+#endif
+                    if (!not_empty)
+                    {
+                        not_empty = classify_task_queue->try_dequeue(content);
+
+#ifdef TEST_MODE
+                        if (not_empty)
+                            local_tasks++;
+#endif
+                    }
+                }
+
 
                 if (not_empty)
                 {
@@ -195,14 +245,18 @@ public:
                     not_first_flag = true;
 #endif
 
-                    dequeue_backoff.double_decay();
+                    dequeue_backoff.reset();
 
 
                     kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
                     const uint64_t kmer_count = content.length; // length 就是 k-mer数量
-                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likely]]
+                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
                     {
                         process_owned_block(kmer_data, kmer_count);
+
+#ifdef TEST_MODE
+                        owner_tasks++;
+#endif
                     }
                     else
                     {
@@ -262,77 +316,17 @@ public:
                 break;
             }
         }
-
-        //above is new
-
-        /*while (not_empty || !parser_classifier_ring_pool->producer_finished())
-        {
-
-            not_empty = classify_task_queue->try_dequeue(content);
-            if (!not_empty)
-            {
-                not_empty = global_classifier_task_queue->try_dequeue(content);
-            }
-            if (not_empty)
-            {
-
-#ifdef TEST_MODE
-                not_first_flag = true;
-#endif
-
-                dequeue_backoff.decay();
-
-
-                kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
-                const uint64_t kmer_count = content.length; // length 就是 k-mer数量
-                if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
-                {
-                    process_owned_block(kmer_data, kmer_count);
-                }
-                else {
-                    process_other_block(kmer_data, kmer_count);
-                }
-
-
-
-                if (parser_classifier_ring_pool->consumer_try_enqueue(content.data))
-                {
-                    // 无等待
-                    enqueue_backoff.decay();
-                }
-                else
-                {
-                    // 自旋等待
-                    enqueue_backoff.decay();
-
-                    while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
-                    {
-#ifdef TEST_MODE
-                        consumer_enqueue_spin_time++;
-#endif
-                        enqueue_backoff.backoff();
-                    }
-                }
-
-            }
-            else
-            {
-#ifdef TEST_MODE
-                if (not_first_flag)
-                    consumer_dequeue_spin_time++;
-#endif
-
-                dequeue_backoff.backoff();
-            }
-        }*/
-
         flush_occurrence_buffers();
-
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
 
         tree->flush_local_root_nodes(local_root_nodes.data(), rng());
+
+#ifdef TEST_MODE
+        classifier_wait_cycles = tree->classifier_wait_cycles;
+#endif
     }
+
 
 private:
     void process_owned_block(kmer<N>* kmer_data, const uint64_t kmer_count)
@@ -449,8 +443,17 @@ private:
             occ_tree_chunk_prefix_counts_[p] = cnt[p];
         }
 
+        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_prefix{};
+        uint32_t occ_tree_prefix_cnt = 0;
+        for (uint32_t i = 0;i < (1ULL << (2 * ROOT_BASES));i++)
+        {
+            occ_tree_prefix[occ_tree_prefix_cnt] = i;
+            occ_tree_prefix_cnt += (occ_tree_chunk_prefix_counts_[i] > 0) ? 1 : 0;
+        }
+
         tree->main_add_kmer_block_with_local_root_nodes(
-            occ_tree_chunk_sorted_, occ_tree_chunk_prefix_counts_, local_root_nodes.data());
+            occ_tree_chunk_sorted_, occ_tree_chunk_prefix_counts_, occ_tree_prefix,
+            occ_tree_prefix_cnt, local_root_nodes.data());
 
 #ifdef TEST_MODE
         total_kmers_send_to_tree += chunk_n;
@@ -612,7 +615,13 @@ private:
 
         if (local_block_count > 0) [[likely]]
         {
-            tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
+            uint32_t cnt = 0;
+            for (uint64_t i = 0; i < local_owned_preifx.size(); i++)
+            {
+                prefix_ordered_by_owner[cnt] = local_owned_preifx[i];
+                cnt = (local_block_prefix_counts[local_owned_preifx[i]] > 0) ? cnt + 1 : cnt;
+            }
+            tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, prefix_ordered_by_owner, cnt, local_root_nodes.data());
         }
     }
 
@@ -685,7 +694,13 @@ private:
 
         if (local_block_count > 0) [[likely]]
         {
-            tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
+            uint32_t cnt = 0;
+            for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); i++)
+            {
+                prefix_ordered_by_owner[cnt] = i;
+                cnt = (local_block_prefix_counts[i] > 0) ? cnt + 1 : cnt;
+            }
+            tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, prefix_ordered_by_owner, cnt, local_root_nodes.data());
         }
     }
 

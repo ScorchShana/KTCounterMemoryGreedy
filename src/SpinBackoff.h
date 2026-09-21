@@ -4,12 +4,11 @@
 #include "definition.h"
 
 #include <chrono>
+#include <thread>
 
-
-template <int MAX_BACKOFF = 64, int YIELD_THRESHOLD = 64, int SLEEP_THRESHOLD = 64 + 16>
+template <int MAX_BACKOFF = 64, int YIELD_THRESHOLD = 64, int SLEEP_THRESHOLD = 64 + 16, int MAX_SLEEP_TIME_US = 32>
 class SpinBackoff {
-    static constexpr int BACKOFF_START = 1; // 初始 backoff 次数为 1
-    static constexpr int MAX_SLEEP_TIME_US = 500; // 最大睡眠时间为 500 微秒
+    static constexpr int BACKOFF_START = 4; // 初始 backoff 次数为 1
 public:
     void backoff()
     {
@@ -31,22 +30,25 @@ public:
         {
             std::this_thread::sleep_for(std::chrono::microseconds(sleep_time_us_));
             sleep_time_us_ = std::min(sleep_time_us_ * 2, MAX_SLEEP_TIME_US);
+#ifdef TEST_MODE
+            request_sleep_time++;
+#endif
         }
-        ++count_;
+        count_ = std::min(count_ + 1, SLEEP_THRESHOLD);
     }
 
     void decay()
     {
         count_ >>= 1;          // 阶段计数器指数衰减
         backoff_ = (backoff_ > 1) ? backoff_ / 2 : 1; // backoff 也指数衰减
-        sleep_time_us_ = (sleep_time_us_ > 1) ? sleep_time_us_ / 2 : 1; // sleep_time 也指数衰减
+        sleep_time_us_ = 1; // sleep_time 也指数衰减
     }
 
     void double_decay()
     {
         count_ >>= 2;          // 阶段计数器双倍指数衰减
         backoff_ = (backoff_ > 3) ? backoff_ / 4 : 1; // backoff 也双倍指数衰减
-        sleep_time_us_ = (sleep_time_us_ > 3) ? sleep_time_us_ / 4 : 1; // sleep_time 也双倍指数衰减
+        sleep_time_us_ = 1; // sleep_time 也双倍指数衰减
     }
 
     void reset()
@@ -56,10 +58,21 @@ public:
         sleep_time_us_ = 1;
     }
 
+#ifdef TEST_MODE
+    uint64_t get_request_sleep_time() const
+    {
+        return request_sleep_time;
+    }
+#endif
+
 private:
     int count_ = 0;
     int backoff_ = BACKOFF_START;          // pause 初始值
     int sleep_time_us_ = 1;    // 初始睡眠时间为 1 微秒
+
+#ifdef TEST_MODE
+    uint64_t request_sleep_time = 0; // 用于测试，记录请求睡眠的次数
+#endif
 };
 
 #endif
