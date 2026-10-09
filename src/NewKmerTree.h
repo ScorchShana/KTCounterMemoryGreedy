@@ -328,8 +328,8 @@ public:
         release_spare_block();
     }
 
-    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>,
-        PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)>& kmer_block_for_copy,
+    template <size_t BlockCapacity>
+    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>, BlockCapacity>& kmer_block_for_copy,
         std::array<uint32_t, 1ULL << (2 * ROOT_BASES)>& kmer_prefix_counts,
         const std::array<uint32_t, 1ULL << (2 * ROOT_BASES)>& prefix_ordered_by_owner,
         const uint32_t cnt,
@@ -512,18 +512,19 @@ private:
 
         uint64_t local_size_count = 0;
 
-        thread_local_counting_hash_map.clear();
+        auto& local_map = thread_local_counting_hash_map;
+        local_map.clear();
         for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
         {
             kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
-
-            for (uint64_t i = 0; i < input_kmer_block->count; ++i)
+            uint64_t kmer_count = input_kmer_block->count;
+            for (uint64_t i = 0; i < kmer_count; ++i)
             {
-                thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i]);
+                local_map.increment(input_kmer_block->k_mers[i]);
             }
         }
 
-        uint64_t hash_map_capacity = std::bit_ceil(thread_local_counting_hash_map.size() * 5 / 4);
+        uint64_t hash_map_capacity = std::bit_ceil(local_map.size() * 5 / 4);
         hash_map_capacity = std::max<uint64_t>(hash_map_capacity, concurrent_hash_map_min_capacity);
         hash_map_capacity = std::min<uint64_t>(hash_map_capacity, concurrent_hash_map_max_capacity);
         ConcurrentOpenAddressHashMap<N>* hash_map = ensure_hash_map(parent, hash_map_capacity);
@@ -586,7 +587,8 @@ private:
             for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
             {
                 kmer_block<N>* block_ptr = current_task.kmer_blocks[block_index];
-                for (uint64_t index = 0; index < block_ptr->count; index++)
+                const uint64_t kmer_count = block_ptr->count;
+                for (uint64_t index = 0; index < kmer_count; index++)
                 {
                     const uint64_t prefix = get_node_prefix(block_ptr->k_mers[index], depth);
                     thread_local_block_prefix_counts[prefix]++;
@@ -602,7 +604,8 @@ private:
             for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
             {
                 kmer_block<N>* block_ptr = current_task.kmer_blocks[block_index];
-                for (uint64_t index = 0; index < block_ptr->count; index++)
+                const uint64_t kmer_count = block_ptr->count;
+                for (uint64_t index = 0; index < kmer_count; index++)
                 {
                     const uint64_t prefix = get_node_prefix(block_ptr->k_mers[index], depth);
                     const uint64_t pos = thread_local_block_prefix_sums[prefix];

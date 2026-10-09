@@ -10,7 +10,7 @@
 #include "MPSCRingQueue.h"
 #include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
-#include "HashSet.h"
+#include "ReplacingHashMap.h"
 
 #include <array>
 #include <algorithm>
@@ -27,24 +27,18 @@ template <uint32_t N>
 class FastqClassifier
 {
 
-    // Owned 双缓冲 + HashSet：编译期常量；Buf2 = Buf1/4；CAP = bit_ceil(Buf2/0.875)
-    // per_thread ≈ (B1+B2)*sizeof(kmer) + sizeof(HashSet) + 2*TREE_CHUNK*sizeof(kmer)
-    // static constexpr size_t OCC_BUF1_CAPACITY =
-    //     std::max<size_t>(8 * EXPORT_KMER_BLOCK_CAPACITY,
-    //         std::bit_ceil(static_cast<size_t>(
-    //             4 * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>) * 1.15)) * 4);
-    static constexpr size_t OCC_BUF1_CAPACITY = 128 * 1024 * 1024 / sizeof(kmer<N>); // 128 M
-    static constexpr size_t OCC_HASHSET_CAPACITY = std::bit_ceil(std::max<size_t>(size_t{ 32 }, OCC_BUF1_CAPACITY / 4));
-    static constexpr size_t OCC_BUF2_CAPACITY = OCC_HASHSET_CAPACITY * 7 / 8;
-    static constexpr size_t TREE_CHUNK_KMER_CAP =
-        PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+    // 每线程 FIRST 缓存：key 数组不超过 512 MiB，控制字节和位图另计。
+    static constexpr size_t FIRST_MAP_KEY_BYTES = 512ULL * 1024 * 1024;
+    static constexpr size_t FIRST_MAP_CAPACITY =
+        std::bit_floor(FIRST_MAP_KEY_BYTES / sizeof(kmer<N>));
+    using FirstOccurrenceMap = ReplacingHashMap<N, FIRST_MAP_CAPACITY>;
 
-    static_assert(OCC_HASHSET_CAPACITY >= 32 && (OCC_HASHSET_CAPACITY & (OCC_HASHSET_CAPACITY - 1)) == 0,
-        "OCC_HASHSET_CAPACITY must be a power of two and >= 32");
-    static_assert(OCC_BUF2_CAPACITY <= OCC_HASHSET_CAPACITY * 7 / 8,
-        "OCC_BUF2_CAPACITY must fit HashSet load factor");
-    static_assert(OCC_BUF1_CAPACITY >= OCC_BUF2_CAPACITY && OCC_BUF2_CAPACITY >= 1,
-        "OCC_BUF capacities invalid");
+    static_assert(FIRST_MAP_CAPACITY >= 16,
+        "FIRST map must hold at least one probe group");
+    static_assert(FirstOccurrenceMap::capacity() == FIRST_MAP_CAPACITY,
+        "FIRST map slot count must match the key memory budget");
+    static_assert(FirstOccurrenceMap::capacity() * sizeof(kmer<N>) <= FIRST_MAP_KEY_BYTES,
+        "FIRST map keys must fit within 512 MiB");
 
     // 自旋参数
     static constexpr int SLEEP_THRESHOLD = 128 + 16;
@@ -52,6 +46,7 @@ class FastqClassifier
     static constexpr int MAX_BACKOFF = 32;
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+    static constexpr size_t INPUT_BLOCK_CAPACITY = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 16; // 预取 Bloom Filter 的距离（单位：k-mer数量）
 
     static constexpr uint32_t MAX_CHECK_LOCAL_ROUND = 128;
@@ -74,7 +69,9 @@ class FastqClassifier
 
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> prefix_ordered_by_owner{};
 
-    std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_for_copy{};
+    // Input starts at B; output starts at 0 and may expand to 2B entries.
+    // At most two outputs per input keep writes behind unread input.
+    std::array<kmer<N>, 2 * INPUT_BLOCK_CAPACITY> local_block_for_copy{};
 
     ExportBlock<N>* export_block_ptr = nullptr;
     uint64_t export_kmer_block_count = 0;
@@ -91,17 +88,8 @@ class FastqClassifier
 
     SplitMix64 rng;
 
-    // Owned FIRST/SECOND 缓冲与 HashSet：allocate_large（仅 owned 路径写入）
-    kmer<N>* occ_buf1_ = nullptr;
-    kmer<N>* occ_buf2_ = nullptr;
-    size_t occ_buf1_size_ = 0;
-    size_t occ_buf2_size_ = 0;
-    HashSet<N, OCC_HASHSET_CAPACITY>* occ_hash_set_ = nullptr;
-
-    // F-batch flush：无序累积 → counting sort → main_add（不得复用 local_block_for_copy）
-    std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_{};
-    std::array<kmer<N>, TREE_CHUNK_KMER_CAP> occ_tree_chunk_sorted_{};
-    std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_chunk_prefix_counts_{};
+    // owned/other 路径共用，只有本 classifier 线程访问。
+    FirstOccurrenceMap* first_occurrence_map_ = nullptr;
 
 public:
     uint64_t total_deal_kmer_count = 0;
@@ -134,15 +122,9 @@ public:
         dequeue_data_to_export_writer(raw_block_ptr);
         export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
 
-        // Buf1/Buf2/HashSet：pool large 分配（须 init_arenas 之后；本线程 Arena）
-        occ_buf1_ = static_cast<kmer<N>*>(
-            in_memory_pool->allocate_large(OCC_BUF1_CAPACITY * sizeof(kmer<N>)));
-        occ_buf2_ = static_cast<kmer<N>*>(
-            in_memory_pool->allocate_large(OCC_BUF2_CAPACITY * sizeof(kmer<N>)));
-        void* hash_set_mem = in_memory_pool->allocate_large(sizeof(HashSet<N, OCC_HASHSET_CAPACITY>));
-        occ_hash_set_ = new (hash_set_mem) HashSet<N, OCC_HASHSET_CAPACITY>();
-        occ_buf1_size_ = 0;
-        occ_buf2_size_ = 0;
+        // pool large 分配（须 init_arenas 之后）；空槽的 key 无须初始化。
+        void* map_mem = in_memory_pool->allocate_large(sizeof(FirstOccurrenceMap));
+        first_occurrence_map_ = new (map_mem) FirstOccurrenceMap;
 
         local_prefix_owners = prefix_owners;
 
@@ -316,7 +298,7 @@ public:
                 break;
             }
         }
-        flush_occurrence_buffers();
+        export_first_occurrences_on_finish();
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
 
@@ -370,7 +352,7 @@ private:
         {
             const uint64_t prefix = get_root_prefix(kmer_data[index]);
             const uint64_t pos = local_block_prefix_sums[prefix];
-            local_block_for_copy[pos] = kmer_data[index];
+            local_block_for_copy[INPUT_BLOCK_CAPACITY + pos] = kmer_data[index];
             local_block_prefix_sums[prefix]++;
         }
     }
@@ -393,119 +375,41 @@ private:
 
     void push_occurrence_first(const kmer<N>& val) noexcept
     {
-        occ_buf1_[occ_buf1_size_++] = val;
-        if (occ_buf1_size_ == OCC_BUF1_CAPACITY)
+        kmer<N> evicted_key;
+        if (first_occurrence_map_->insert(val, evicted_key)) [[unlikely]]
         {
-            flush_occurrence_buffers();
+            export_one_kmer(evicted_key);
         }
     }
 
-    void push_occurrence_second(const kmer<N>& val) noexcept
+    uint32_t route_occurrence(const kmer<N>& val, Occurrence occ,
+        uint64_t& output_count) noexcept
     {
-        occ_buf2_[occ_buf2_size_++] = val;
-        if (occ_buf2_size_ == OCC_BUF2_CAPACITY) [[unlikely]]
+        if (occ == Occurrence::FIRST)
         {
-            flush_occurrence_buffers();
+            push_occurrence_first(val);
+            return 0;
         }
+
+        const bool recovered_first = occ == Occurrence::SECOND
+            && first_occurrence_map_->erase(val);
+        local_block_for_copy[output_count++] = val;
+        if (recovered_first)
+        {
+            local_block_for_copy[output_count++] = val;
+            return 2;
+        }
+        return 1;
     }
 
-    // F-batch：对 occ_tree_chunk_[0..chunk_n) counting sort → occ_tree_chunk_sorted_ → main_add
-    void commit_tree_chunk(const size_t chunk_n) noexcept
+    // One-shot terminal export; the FIRST map is not accessed afterward.
+    void export_first_occurrences_on_finish() noexcept
     {
-        if (chunk_n == 0)
-        {
-            return;
-        }
-
-        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> cnt{};
-        for (size_t i = 0; i < chunk_n; ++i)
-        {
-            cnt[get_root_prefix(occ_tree_chunk_[i])]++;
-        }
-
-        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> scatter_pos{};
-        scatter_pos[0] = 0;
-        for (uint64_t p = 1; p < scatter_pos.size(); ++p)
-        {
-            scatter_pos[p] = scatter_pos[p - 1] + cnt[p - 1];
-        }
-
-        for (size_t i = 0; i < chunk_n; ++i)
-        {
-            const uint64_t p = get_root_prefix(occ_tree_chunk_[i]);
-            occ_tree_chunk_sorted_[scatter_pos[p]++] = occ_tree_chunk_[i];
-        }
-
-        std::memset(occ_tree_chunk_prefix_counts_.data(), 0,
-            occ_tree_chunk_prefix_counts_.size() * sizeof(uint32_t));
-        for (uint64_t p = 0; p < cnt.size(); ++p)
-        {
-            occ_tree_chunk_prefix_counts_[p] = cnt[p];
-        }
-
-        std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> occ_tree_prefix{};
-        uint32_t occ_tree_prefix_cnt = 0;
-        for (uint32_t i = 0;i < (1ULL << (2 * ROOT_BASES));i++)
-        {
-            occ_tree_prefix[occ_tree_prefix_cnt] = i;
-            occ_tree_prefix_cnt += (occ_tree_chunk_prefix_counts_[i] > 0) ? 1 : 0;
-        }
-
-        tree->main_add_kmer_block_with_local_root_nodes(
-            occ_tree_chunk_sorted_, occ_tree_chunk_prefix_counts_, occ_tree_prefix,
-            occ_tree_prefix_cnt, local_root_nodes.data());
-
-#ifdef TEST_MODE
-        total_kmers_send_to_tree += chunk_n;
-#endif
-    }
-
-    void flush_occurrence_buffers() noexcept
-    {
-        if (occ_buf1_size_ == 0 && occ_buf2_size_ == 0)
-        {
-            return;
-        }
-
-        occ_hash_set_->clear();
-
-        size_t chunk_n = 0;
-
-        auto append_tree_kmer = [&](const kmer<N>& k) noexcept
+        first_occurrence_map_->for_each(
+            [&](const kmer<N>& val) noexcept
             {
-                occ_tree_chunk_[chunk_n++] = k;
-                if (chunk_n == TREE_CHUNK_KMER_CAP) [[unlikely]]
-                {
-                    commit_tree_chunk(chunk_n);
-                    chunk_n = 0;
-                }
-            };
-
-        for (size_t i = 0; i < occ_buf2_size_; ++i)
-        {
-            occ_hash_set_->insert(occ_buf2_[i]);
-        }
-
-        for (size_t i = 0; i < occ_buf1_size_; ++i)
-        {
-            const kmer<N>& x = occ_buf1_[i];
-            if (occ_hash_set_->contains(x))
-            {
-                append_tree_kmer(x);
-            }
-            else
-            {
-                export_one_kmer(x);
-            }
-        }
-
-        if (chunk_n > 0)
-        {
-            commit_tree_chunk(chunk_n);
-        }
-
-        occ_buf1_size_ = 0;
-        occ_buf2_size_ = 0;
+                export_one_kmer(val);
+            });
     }
 
     void classify_owned_local_block() noexcept
@@ -513,7 +417,7 @@ private:
 
         uint64_t local_block_count = 0;
 
-        uint64_t read_offset = 0;
+        uint64_t read_offset = INPUT_BLOCK_CAPACITY;
         for (uint64_t prefix = 0; prefix < local_block_prefix_counts.size(); prefix++)
         {
             const uint32_t prefix_count = local_block_prefix_counts[prefix];
@@ -532,24 +436,10 @@ private:
             {
                 for (uint32_t i = 0; i < prefix_count; ++i)
                 {
-                    const kmer<N>& val = local_block_for_copy[read_offset];
+                    const kmer<N> val = local_block_for_copy[read_offset];
 
                     const Occurrence occ = bloom_filter.insert(val);
-                    if (occ == Occurrence::FIRST)
-                    {
-                        push_occurrence_first(val);
-                    }
-                    else if (occ == Occurrence::SECOND)
-                    {
-                        push_occurrence_second(val);
-                        local_block_for_copy[local_block_count++] = val;
-                        to_tree_count++;
-                    }
-                    else
-                    {
-                        local_block_for_copy[local_block_count++] = val;
-                        to_tree_count++;
-                    }
+                    to_tree_count += route_occurrence(val, occ, local_block_count);
 
                     read_offset++;
                 }
@@ -577,7 +467,7 @@ private:
             {
                 const uint32_t slot = i % BLOOM_PREFETCH_DISTANCE;
                 const uint64_t idx = prefix_begin + i;
-                const kmer<N>& val = local_block_for_copy[idx];
+                const kmer<N> val = local_block_for_copy[idx];
 
                 const Occurrence occ = bloom_filter.insert_prepared(probes[slot]);
 
@@ -589,21 +479,7 @@ private:
                     bloom_filter.prefetch_insert(probes[slot]);
                 }
 
-                if (occ == Occurrence::FIRST)
-                {
-                    push_occurrence_first(val);
-                }
-                else if (occ == Occurrence::SECOND)
-                {
-                    push_occurrence_second(val);
-                    local_block_for_copy[local_block_count++] = val;
-                    to_tree_count++;
-                }
-                else
-                {
-                    local_block_for_copy[local_block_count++] = val;
-                    to_tree_count++;
-                }
+                to_tree_count += route_occurrence(val, occ, local_block_count);
             }
 
             read_offset += prefix_count;
@@ -629,7 +505,7 @@ private:
     {
         uint64_t local_block_count = 0;
 
-        uint64_t read_offset = 0;
+        uint64_t read_offset = INPUT_BLOCK_CAPACITY;
         for (uint64_t prefix = 0; prefix < local_block_prefix_counts.size(); prefix++)
         {
             const uint32_t prefix_count = local_block_prefix_counts[prefix];
@@ -638,57 +514,25 @@ private:
                 continue;
             }
 
-            uint32_t prefix_export_count = 0;
+            uint32_t to_tree_count = 0;
 
-            // Bloom 保持原样：共享 filter + 逐个 insert，无 prefetch；不走本线程 Buf 去重
+            // 共享 Bloom filter；FIRST 缓存仍属于当前 classifier。
             ConcurrentBloomFilter<N>& bloom_filter = *local_global_bloom_filter[prefix];
 
             for (uint32_t i = 0; i < prefix_count; i++)
             {
-                const kmer<N>& val = local_block_for_copy[read_offset];
+                const kmer<N> val = local_block_for_copy[read_offset];
 
-                if (bloom_filter.insert(val) == Occurrence::FIRST)
-                {
-                    export_one_kmer(val);
-                    prefix_export_count++;
-                }
-                else
-                {
-                    // SECOND 与 THIRD_PLUS：立刻进树缓冲
-                    local_block_for_copy[local_block_count++] = val;
-                }
+                const Occurrence occ = bloom_filter.insert(val);
+                to_tree_count += route_occurrence(val, occ, local_block_count);
 
                 read_offset++;
             }
 
-            // uint32_t third_count = 0;
-            // for (uint32_t i = 0; i < prefix_count; i++)
-            // {
-            //     const kmer<N>& val = local_block_for_copy[read_offset];
-
-            //     const Occurrence occ = bloom_filter.insert(val);
-
-            //     if (occ == Occurrence::FIRST)
-            //     {
-            //         push_occurrence_first(val);
-            //     }
-            //     else if (occ == Occurrence::SECOND)
-            //     {
-            //         push_occurrence_second(val);
-            //     }
-            //     else
-            //     {
-            //         local_block_for_copy[local_block_count++] = val;
-            //         third_count++;
-            //     }
-
-            //     read_offset++;
-            // }
-
-            local_block_prefix_counts[prefix] -= prefix_export_count;
+            local_block_prefix_counts[prefix] = to_tree_count;
 #ifdef TEST_MODE
-            // export 已在 export_one_kmer 中计数；此处计非 FIRST 进树
-            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+            // Includes recovered FIRST occurrences; exports are counted separately.
+            total_kmers_send_to_tree += to_tree_count;
 #endif
         }
 
