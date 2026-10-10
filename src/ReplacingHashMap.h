@@ -189,11 +189,6 @@ private:
         recent_[slot >> 6] |= uint64_t{ 1 } << (slot & 63);
     }
 
-    void clear_recent(size_t slot) noexcept
-    {
-        recent_[slot >> 6] &= ~(uint64_t{ 1 } << (slot & 63));
-    }
-
     /**
      * @brief Extract the 16 recent bits starting at an arbitrary probe base.
      *
@@ -290,7 +285,7 @@ public:
     KeyType keys_[CAPACITY];
 
 private:
-    // One CLOCK/reference bit per physical slot.
+    // One CLOCK/reference bit per physical slot; EMPTY slots may retain old bits.
     alignas(64) uint64_t recent_[RECENT_WORDS] = {};
 };
 
@@ -321,7 +316,8 @@ bool ReplacingHashMap<N, MAX_CAPACITY>::erase(const KeyType& key) noexcept
         return false;
 
     set_control(slot, 0);
-    clear_recent(slot);
+    // Replacement reads recent_ only for a full probe window. Reusing this
+    // EMPTY slot always marks it recent, so its old reference bit is harmless.
     --size_;
     return true;
 }
