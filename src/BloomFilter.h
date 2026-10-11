@@ -224,7 +224,7 @@ public:
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx, 1, 0);
+        __builtin_prefetch(bins + probe.block_idx * 2, 1, 0);
 #else
         (void)probe;
 #endif
@@ -232,8 +232,8 @@ public:
 
     Occurrence insert_prepared(const InsertProbe& probe) noexcept
     {
-        std::atomic<uint64_t>& cell1 = bins[probe.block_idx];
-        std::atomic<uint64_t>& cell2 = bins[probe.block_idx + capacity_];
+        std::atomic<uint64_t>& cell1 = bins[probe.block_idx * 2];
+        std::atomic<uint64_t>& cell2 = bins[probe.block_idx * 2 + 1];
         const uint64_t bf1_word = cell1.load(std::memory_order_relaxed);
         if ((bf1_word & probe.insert_num) == probe.insert_num)
         {

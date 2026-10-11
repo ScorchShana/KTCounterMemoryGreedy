@@ -50,6 +50,10 @@ public:
     std::atomic<uint64_t> total_local_tasks{ 0 };
     std::atomic<uint64_t> total_global_tasks{ 0 };
     std::atomic<uint64_t> total_owner_tasks{ 0 };
+    std::atomic<uint64_t> total_insert_time{ 0 };
+    std::atomic<uint64_t> total_erase_time{ 0 };
+    std::atomic<uint64_t> total_search_empty_time{ 0 };
+    std::atomic<uint64_t> total_replace_time{ 0 };
 #endif
 
     explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
@@ -100,6 +104,10 @@ public:
                     total_local_tasks.fetch_add(classifier.local_tasks, std::memory_order_relaxed);
                     total_global_tasks.fetch_add(classifier.global_tasks, std::memory_order_relaxed);
                     total_owner_tasks.fetch_add(classifier.owner_tasks, std::memory_order_relaxed);
+                    total_insert_time.fetch_add(classifier.local_insert_time, std::memory_order_relaxed);
+                    total_erase_time.fetch_add(classifier.local_erase_time, std::memory_order_relaxed);
+                    total_search_empty_time.fetch_add(classifier.get_search_empty_time(), std::memory_order_relaxed);
+                    total_replace_time.fetch_add(classifier.get_replace_time(), std::memory_order_relaxed);
 #endif
                 }));
         }
@@ -119,7 +127,11 @@ public:
         {
             std::cout << "Classifier " << i << " dealt k-mer count: " << deal_kmer_counts[i] << "\n";
         }
-#endif
+        std::cout<<"Classifier total insert time: " << total_insert_time.load(std::memory_order_relaxed) << "\n";
+        std::cout<<"Classifier total erase time: " << total_erase_time.load(std::memory_order_relaxed) << "\n";
+        std::cout<<"Classifier total search empty time: " << total_search_empty_time.load(std::memory_order_relaxed) << "\n";
+        std::cout<<"Classifier total replace time: " << total_replace_time.load(std::memory_order_relaxed) << "\n";
+        #endif
     }
 };
 

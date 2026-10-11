@@ -105,6 +105,18 @@ public:
     uint64_t global_tasks = 0;
     uint64_t local_tasks = 0;
     uint64_t owner_tasks = 0;
+    uint64_t local_insert_time = 0;
+    uint64_t local_erase_time = 0;
+
+    uint64_t get_replace_time() const
+    {
+        return first_occurrence_map_->replace_time;
+    }
+
+    uint64_t get_search_empty_time() const
+    {
+        return first_occurrence_map_->search_empty_time;
+    }
 #endif
 
     explicit FastqClassifier(uint32_t in_k_len,
@@ -375,8 +387,11 @@ private:
 
     void push_occurrence_first(const kmer<N>& val) noexcept
     {
+#ifdef TEST_MODE
+        local_insert_time++;
+#endif
         kmer<N> evicted_key;
-        if (first_occurrence_map_->insert(val, evicted_key)) [[unlikely]]
+        if (first_occurrence_map_->insert(val, evicted_key))
         {
             export_one_kmer(evicted_key);
         }
@@ -396,6 +411,9 @@ private:
         local_block_for_copy[output_count++] = val;
         if (recovered_first)
         {
+#ifdef TEST_MODE
+            local_erase_time++;
+#endif
             local_block_for_copy[output_count++] = val;
             return 2;
         }
