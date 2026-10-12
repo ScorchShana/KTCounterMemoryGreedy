@@ -27,18 +27,7 @@ template <uint32_t N>
 class FastqClassifier
 {
 
-    // 每线程 FIRST 缓存：key 数组不超过 512 MiB，控制字节和位图另计。
-    static constexpr size_t FIRST_MAP_KEY_BYTES = 512ULL * 1024 * 1024;
-    static constexpr size_t FIRST_MAP_CAPACITY =
-        std::bit_floor(FIRST_MAP_KEY_BYTES / sizeof(kmer<N>));
-    using FirstOccurrenceMap = ReplacingHashMap<N, FIRST_MAP_CAPACITY>;
-
-    static_assert(FIRST_MAP_CAPACITY >= 16,
-        "FIRST map must hold at least one probe group");
-    static_assert(FirstOccurrenceMap::capacity() == FIRST_MAP_CAPACITY,
-        "FIRST map slot count must match the key memory budget");
-    static_assert(FirstOccurrenceMap::capacity() * sizeof(kmer<N>) <= FIRST_MAP_KEY_BYTES,
-        "FIRST map keys must fit within 512 MiB");
+    using FirstOccurrenceMap = ReplacingHashMap<N>;
 
     // 自旋参数
     static constexpr int SLEEP_THRESHOLD = 128 + 16;
@@ -126,7 +115,8 @@ public:
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         KmerTree<N>* in_tree,
         ConcurrentMemoryPool* in_memory_pool,
-        std::barrier<>& in_barrier)
+        std::barrier<>& in_barrier,
+        size_t in_first_map_max_bytes)
         : k_len(in_k_len), classifier_index(in_classifier_index), global_classifier_task_queue(in_global_classifier_task_queue), parser_classifier_ring_pool(in_ring_pool), classify_task_queue(in_classify_task_queue), tree(in_tree),
         export_block_ptr(nullptr), export_kmer_block_count(0)
     {
@@ -134,9 +124,8 @@ public:
         dequeue_data_to_export_writer(raw_block_ptr);
         export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
 
-        // pool large 分配（须 init_arenas 之后）；空槽的 key 无须初始化。
-        void* map_mem = in_memory_pool->allocate_large(sizeof(FirstOccurrenceMap));
-        first_occurrence_map_ = new (map_mem) FirstOccurrenceMap;
+        // One budgeted pool allocation includes the map, arrays and alignment.
+        first_occurrence_map_ = FirstOccurrenceMap::create(in_memory_pool, in_first_map_max_bytes);
 
         local_prefix_owners = prefix_owners;
 

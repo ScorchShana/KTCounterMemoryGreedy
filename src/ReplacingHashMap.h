@@ -2,6 +2,7 @@
 
 #include "definition.h"
 #include "kmer.h"
+#include "ConcurrentMemoryPool.h"
 #include "../include/rapidhash.h"
 
 #include <bit>
@@ -9,6 +10,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <type_traits>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -22,8 +26,8 @@
 // Replacement is round-robin / approximate FIFO, NOT true insertion-time FIFO.
 // The input and output references of insert() must not alias each other.
 //
-// Preserve the sizing convention and public API of ReplacingHashMap_Bucket64.
-template <uint32_t N, uint64_t MAX_CAPACITY>
+// Object and storage share one pool allocation bounded by a byte budget.
+template <uint32_t N>
 class ReplacingHashMap
 {
 public:
@@ -31,22 +35,22 @@ public:
 
 private:
     static_assert(N > 0);
-    static constexpr size_t CAPACITY = std::bit_ceil(MAX_CAPACITY * 7 / 8);
-    static_assert(CAPACITY >= 64 && (CAPACITY & (CAPACITY - 1)) == 0);
     static constexpr size_t BUCKET_SIZE = 64;
-    static constexpr size_t BUCKETS = CAPACITY / BUCKET_SIZE;
-    static constexpr size_t BUCKET_MASK = BUCKETS - 1;
+    static_assert(alignof(KeyType) <= 64);
+    static_assert(std::is_trivially_destructible_v<KeyType>);
 
     // Low 6 bits: [0,63] FIFO hand. Bit 6: all 64 slots occupied.
     static constexpr uint8_t FULL_BIT = 0x40;
     static constexpr uint8_t HAND_MASK = 0x3f;
 
     size_t size_ = 0;
+    size_t bucket_count_;
+    size_t capacity_;
 
 public:
     // Keep separated SoA metadata. One bucket's controls fit one cache line.
-    alignas(64) uint8_t controls_[CAPACITY] = {};
-    KeyType keys_[CAPACITY];
+    uint8_t* controls_;
+    KeyType* keys_;
 #ifdef TEST_MODE
     inline static thread_local uint64_t search_empty_time = 0;
     inline static thread_local uint64_t replace_time = 0;
@@ -54,7 +58,25 @@ public:
 
 private:
     // Exactly one byte per bucket, same footprint as the old hand_ array.
-    alignas(64) uint8_t state_[BUCKETS] = {};
+    uint8_t* state_;
+
+    ReplacingHashMap(size_t buckets, uint8_t* storage) noexcept
+        : bucket_count_(buckets), capacity_(buckets * BUCKET_SIZE),
+          controls_(::new (storage) uint8_t[capacity_]),
+          keys_(::new (storage + capacity_) KeyType[capacity_]),
+          state_(::new (storage + capacity_ + capacity_ * sizeof(KeyType))
+              uint8_t[bucket_count_])
+    {
+        // Start all array lifetimes, but leave empty keys uninitialized.
+        std::memset(controls_, 0, capacity_);
+        std::memset(state_, 0, bucket_count_);
+    }
+
+    size_t bucket_index(uint64_t h) const noexcept
+    {
+        // Low hash bits select a bucket independently of the high-bit fingerprint.
+        return (uint64_t(uint32_t(h)) * uint64_t(bucket_count_)) >> 32;
+    }
 
     static uint8_t fingerprint(uint64_t h) noexcept
     {
@@ -62,7 +84,7 @@ private:
         return f != 0 ? f : uint8_t{ 255 };
     }
 
-    // ctrl is 64-byte aligned: controls_ is alignas(64), and each bucket
+    // ctrl is 64-byte aligned: controls_ follows a 64-byte padded header, and each bucket
     // starts at a multiple of BUCKET_SIZE (64).
     // Bit i in the result corresponds to control byte i (0 <= i < 64).
     static uint64_t scan_matches(const uint8_t* ctrl, uint8_t f) noexcept
@@ -145,18 +167,41 @@ private:
     }
 
 public:
-    ReplacingHashMap() = default;
+    ReplacingHashMap(const ReplacingHashMap&) = delete;
+    ReplacingHashMap& operator=(const ReplacingHashMap&) = delete;
+    ReplacingHashMap(ReplacingHashMap&&) = delete;
+    ReplacingHashMap& operator=(ReplacingHashMap&&) = delete;
 
-    static constexpr size_t capacity() noexcept { return CAPACITY; }
+    // Call after init_arenas(). Storage lives until the pool is destroyed;
+    // deallocate() only recycles 4 KiB blocks and must not be used on this map.
+    static ReplacingHashMap* create(ConcurrentMemoryPool* pool, size_t max_bytes)
+    {
+        constexpr size_t header_bytes = align_up(sizeof(ReplacingHashMap), 64);
+        constexpr size_t bucket_bytes = BUCKET_SIZE * (sizeof(KeyType) + 1) + 1;
+        const size_t usable_bytes = max_bytes / BLOCK_SIZE * BLOCK_SIZE;
+        if (usable_bytes < header_bytes || usable_bytes - header_bytes < bucket_bytes)
+        {
+            std::cerr << "ReplacingHashMap budget is too small for one bucket" << std::endl;
+            std::exit(-1);
+        }
+        const size_t buckets = std::min<size_t>(
+            (usable_bytes - header_bytes) / bucket_bytes,
+            std::numeric_limits<uint32_t>::max());
+        auto* memory = static_cast<uint8_t*>(
+            pool->allocate_large(header_bytes + buckets * bucket_bytes));
+        return ::new (memory) ReplacingHashMap(buckets, memory + header_bytes);
+    }
+
+    size_t capacity() const noexcept { return capacity_; }
     size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
-    bool full() const noexcept { return size_ == CAPACITY; }
-    float load_factor() const noexcept { return static_cast<float>(size_) / CAPACITY; }
+    bool full() const noexcept { return size_ == capacity_; }
+    float load_factor() const noexcept { return static_cast<float>(size_) / capacity_; }
 
     bool contains(const KeyType& key) noexcept
     {
         const uint64_t h = rapidhash(&key, sizeof(KeyType));
-        const size_t bucket = static_cast<size_t>(h) & BUCKET_MASK;
+        const size_t bucket = bucket_index(h);
         const size_t base = bucket * BUCKET_SIZE;
         uint64_t matches = scan_matches(controls_ + base, fingerprint(h));
         while (matches != 0) {
@@ -170,7 +215,7 @@ public:
     bool erase(const KeyType& key) noexcept
     {
         const uint64_t h = rapidhash(&key, sizeof(KeyType));
-        const size_t bucket = static_cast<size_t>(h) & BUCKET_MASK;
+        const size_t bucket = bucket_index(h);
         const size_t base = bucket * BUCKET_SIZE;
         uint64_t matches = scan_matches(controls_ + base, fingerprint(h));
         while (matches != 0) {
@@ -193,7 +238,7 @@ public:
     {
         assert(&key != &evicted_key);
         const uint64_t h = rapidhash(&key, sizeof(KeyType));
-        const size_t bucket = static_cast<size_t>(h) & BUCKET_MASK;
+        const size_t bucket = bucket_index(h);
         const size_t base = bucket * BUCKET_SIZE;
         const uint8_t state = state_[bucket];
         const uint32_t head = state & HAND_MASK;
@@ -233,8 +278,8 @@ public:
 
     void clear() noexcept
     {
-        std::memset(controls_, 0, sizeof(controls_));
-        std::memset(state_, 0, sizeof(state_));
+        std::memset(controls_, 0, capacity_);
+        std::memset(state_, 0, bucket_count_);
         size_ = 0;
     }
 
@@ -242,66 +287,36 @@ public:
     void for_each(F&& func) const
     {
         size_t remaining = size_;
-        if constexpr (CAPACITY > BUCKET_SIZE)
+        for (size_t i = 0; i < capacity_ && remaining; i += BUCKET_SIZE)
         {
-            for (size_t i = 0; i < CAPACITY && remaining; i += BUCKET_SIZE)
+#if defined(__AVX2__)
+            constexpr size_t GROUP_SIZE = 32;
+#elif defined(__SSE2__)
+            constexpr size_t GROUP_SIZE = 16;
+#else
+            constexpr size_t GROUP_SIZE = 1;
+#endif
+            for (size_t j = 0; j < BUCKET_SIZE; j += GROUP_SIZE)
             {
 #if defined(__AVX2__)
-                constexpr size_t GROUP_SIZE = 32;
-                for (size_t j = 0; j < BUCKET_SIZE; j += GROUP_SIZE)
-                {
-                    const auto* p = reinterpret_cast<const __m256i*>(controls_ + i + j);
-                    const __m256i ctrl_bucket = _mm256_load_si256(p);
-                    const __m256i zero = _mm256_setzero_si256();
-                    auto mask = static_cast<uint32_t>(
-                        _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl_bucket, zero)));
-                    mask = ~mask;
-                    while (mask != 0)
-                    {
-                        const unsigned lane = std::countr_zero(mask);
-                        func(keys_[i + j + lane]);
-                        --remaining;
-                        mask &= mask - 1;
-                    }
-            }
+                const auto* p = reinterpret_cast<const __m256i*>(controls_ + i + j);
+                const __m256i ctrl = _mm256_load_si256(p);
+                auto mask = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                    _mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256())));
 #elif defined(__SSE2__)
-                constexpr size_t GROUP_SIZE = 16;
-                for (size_t j = 0; j < BUCKET_SIZE; j += GROUP_SIZE)
-                {
-                    const auto* p = reinterpret_cast<const __m128i*>(controls_ + i + j);
-                    const __m128i ctrl_bucket = _mm_load_si128(p);
-                    const __m128i zero = _mm_setzero_si128();
-                    auto mask = static_cast<uint16_t>(
-                        _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl_bucket, zero)));
-                    mask = ~mask;
-                    while (mask != 0)
-                    {
-                        const unsigned lane = std::countr_zero(mask);
-                        func(keys_[i + j + lane]);
-                        --remaining;
-                        mask &= mask - 1;
-                    }
-                }
+                const auto* p = reinterpret_cast<const __m128i*>(controls_ + i + j);
+                const __m128i ctrl = _mm_load_si128(p);
+                auto mask = static_cast<uint16_t>(~_mm_movemask_epi8(
+                    _mm_cmpeq_epi8(ctrl, _mm_setzero_si128())));
 #else
-                for (size_t j = 0; j < BUCKET_SIZE; ++j)
-                {
-                    if (controls_[i + j] != 0)
-                    {
-                        func(keys_[i + j]);
-                        --remaining;
-                    }
-        }
+                uint32_t mask = controls_[i + j] != 0;
 #endif
-
-    }
-}
-        else {
-            for (size_t i = 0; i < CAPACITY && remaining; ++i)
-            {
-                if (controls_[i] != 0)
+                while (mask != 0)
                 {
-                    func(keys_[i]);
+                    const unsigned lane = std::countr_zero(mask);
+                    func(keys_[i + j + lane]);
                     --remaining;
+                    mask &= mask - 1;
                 }
             }
         }

@@ -75,20 +75,20 @@ public:
         threads_ptr.reserve(classifier_count);
     }
 
-    void start()
+    void start(size_t first_map_max_bytes)
     {
         start_barrier = std::make_shared<std::barrier<>>(classifier_count);
         finish_barrier = std::make_shared<std::barrier<>>(classifier_count);
 
         for (uint32_t i = 0; i < classifier_count; i++)
         {
-            threads_ptr.push_back(std::make_unique<std::thread>([&, i]
+            threads_ptr.push_back(std::make_unique<std::thread>([&, i, first_map_max_bytes]
                 {
 #if HAS_LIBNUMA
                     numa_run_on_node(numa_nodes[i % numa_nodes.size()]);
 #endif
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier);
+                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, first_map_max_bytes);
                     classifier.classify_and_push();
                     task_thread_pool->mark_producer_done();
                     finish_barrier->arrive_and_wait();

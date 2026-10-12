@@ -93,6 +93,9 @@ constexpr uint64_t GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY = 8ULL << 9; // 全局�
 constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 32;
 constexpr uint64_t CLASSIFIER_TASK_QUEUE_HALF_WATERMARK = CLASSIFIER_TASK_QUEUES_CAPACITY / 2;
 
+// ReplacingHashMap 配置常量
+constexpr size_t MAX_REPLACING_HASH_MAP_BYTES = 1ULL << 30; // 替换哈希表最大字节数
+
 // 写入文件部分的RingMemoryPool配置常量
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 2ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024; // 导出环形内存池块大小（字节）
