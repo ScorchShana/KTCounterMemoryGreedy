@@ -6,6 +6,7 @@
 #include "../include/rapidhash.h"
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -14,7 +15,7 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #elif defined(__SSE4_2__)
-#include <immintrin.h>
+#include <emmintrin.h>
 #endif
 
 /**
@@ -51,6 +52,7 @@ public:
 
     /**
      * @brief Iterate over all entries
+     * @pre Callback must not insert into or clear this map during traversal.
      * @tparam Func Function type: void(const KeyType&, ValueType&)
      * @param func Callback function for each entry
      */
@@ -59,6 +61,7 @@ public:
 
     /**
      * @brief Iterate over all entries (const version)
+     * @pre Callback must not insert into or clear this map during traversal.
      * @tparam Func Function type: void(const KeyType&, ValueType)
      * @param func Callback function for each entry
      */
@@ -249,26 +252,90 @@ template <uint32_t N, typename ValueType>
 template <typename Func>
 void CountingHashMap<N, ValueType>::for_each(Func&& func)
 {
-    for (size_t i = 0; i < CAPACITY; ++i)
+#if defined(__AVX2__)
+    constexpr size_t WIDTH = 32;
+    for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        if (controls_[i] != 0)
+        const __m256i ctrl = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(controls_ + base));
+        uint32_t occupied = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256())));
+
+        while (occupied != 0)
         {
-            func(keys_[i], counts_[i]);
+            const unsigned lane = std::countr_zero(occupied);
+            const size_t slot = base + lane;
+            func(keys_[slot], counts_[slot]);
+            occupied &= occupied - 1;
         }
     }
+
+#elif defined(__SSE4_2__)
+    constexpr size_t WIDTH = 16;
+    for (size_t base = 0; base < CAPACITY; base += WIDTH)
+    {
+        const __m128i ctrl = _mm_load_si128(
+            reinterpret_cast<const __m128i*>(controls_ + base));
+        uint32_t occupied = ~static_cast<uint32_t>(_mm_movemask_epi8(
+            _mm_cmpeq_epi8(ctrl, _mm_setzero_si128()))) & 0xffffU;
+        
+        while (occupied != 0)
+        {
+            const unsigned lane = std::countr_zero(occupied);
+            const size_t slot = base + lane;
+            func(keys_[slot], counts_[slot]);
+            occupied &= occupied - 1;
+        }
+    }
+#else
+    for (size_t i = 0; i < CAPACITY; ++i)
+        if (controls_[i] != 0) func(keys_[i], counts_[i]);
+#endif
 }
 
 template <uint32_t N, typename ValueType>
 template <typename Func>
 void CountingHashMap<N, ValueType>::for_each(Func&& func) const
 {
-    for (size_t i = 0; i < CAPACITY; ++i)
+#if defined(__AVX2__)
+    constexpr size_t WIDTH = 32;
+    for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        if (controls_[i] != 0)
+        const __m256i ctrl = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(controls_ + base));
+        uint32_t occupied = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256())));
+
+        while (occupied != 0)
         {
-            func(keys_[i], counts_[i]);
+            const unsigned lane = std::countr_zero(occupied);
+            const size_t slot = base + lane;
+            func(keys_[slot], counts_[slot]);
+            occupied &= occupied - 1;
         }
     }
+
+#elif defined(__SSE4_2__)
+    constexpr size_t WIDTH = 16;
+    for (size_t base = 0; base < CAPACITY; base += WIDTH)
+    {
+        const __m128i ctrl = _mm_load_si128(
+            reinterpret_cast<const __m128i*>(controls_ + base));
+        uint32_t occupied = ~static_cast<uint32_t>(_mm_movemask_epi8(
+            _mm_cmpeq_epi8(ctrl, _mm_setzero_si128()))) & 0xffffU;
+
+        while (occupied != 0)
+        {
+            const unsigned lane = std::countr_zero(occupied);
+            const size_t slot = base + lane;
+            func(keys_[slot], counts_[slot]);
+            occupied &= occupied - 1;
+        }
+    }
+#else
+    for (size_t i = 0; i < CAPACITY; ++i)
+        if (controls_[i] != 0) func(keys_[i], counts_[i]);
+#endif
 }
 
 template <uint32_t N, typename ValueType>

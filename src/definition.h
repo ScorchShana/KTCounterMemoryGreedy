@@ -1,7 +1,7 @@
 #ifndef TREE_DEFINITION_HEADER
 #define TREE_DEFINITION_HEADER
 
-#define TEST_MODE
+// #define TEST_MODE
 
 // #include "SpinLock.h"
 
@@ -94,7 +94,7 @@ constexpr uint64_t CLASSIFIER_TASK_QUEUES_CAPACITY = 32;
 constexpr uint64_t CLASSIFIER_TASK_QUEUE_HALF_WATERMARK = CLASSIFIER_TASK_QUEUES_CAPACITY / 2;
 
 // ReplacingHashMap 配置常量
-constexpr size_t MAX_REPLACING_HASH_MAP_BYTES = 1ULL << 30; // 替换哈希表最大字节数
+constexpr size_t MAX_REPLACING_HASH_MAP_BYTES = 512ULL << 20; // 替换哈希表最大字节数
 
 // 写入文件部分的RingMemoryPool配置常量
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 2ULL << 10;     // 导出环形内存池容量（块数），必须为2的幂
