@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -21,8 +22,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "FlatConcurrentHashMap.h"
-#include "Partition.h"
+#include "../src/kmer.h"
+
 
 namespace
 {
@@ -677,461 +678,6 @@ namespace
         return files;
     }
 
-    // build hash map from high files
-    template <uint32_t N>
-    static void build_hash_map(const std::vector<RootFileInfo> &files,
-                               FlatConcurrentHashMap<N> &hash_map,
-                               uint32_t worker_count,
-                               uint32_t min_freq,
-                               uint32_t max_freq,
-                               uint32_t k_len,
-                               uint32_t count_bytes,
-                               ProgressPrinter *progress)
-    {
-        std::atomic<uint64_t> next_file{0};
-
-        auto worker = [&]()
-        {
-            std::vector<ExportRecord<N>> buffer(65536);
-            for (;;)
-            {
-                uint64_t index = next_file.fetch_add(1, std::memory_order_relaxed);
-                if (index >= files.size())
-                    break;
-                const RootFileInfo &info = files[index];
-                int fd = ::open(info.filename.c_str(), O_RDONLY);
-                if (fd < 0)
-                {
-                    std::cerr << "open: " << info.filename << '\n';
-                    exit(-1);
-                }
-
-                uint64_t remaining = info.record_count;
-                uint64_t offset = 0;
-                while (remaining > 0)
-                {
-                    uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                    uint64_t bytes = read_compact_high_records<N>(fd, offset, batch,
-                                                                  buffer.data(), k_len, count_bytes);
-                    for (uint64_t i = 0; i < batch; ++i)
-                        if (in_range(buffer[i].count, min_freq, max_freq))
-                            hash_map.insert_unique(buffer[i].key, buffer[i].count);
-                    remaining -= batch;
-                    offset += batch;
-                    progress->add(bytes);
-                }
-                ::close(fd);
-            }
-        };
-
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count);
-        for (uint32_t i = 0; i < worker_count; ++i)
-            workers.emplace_back(worker);
-        for (auto &w : workers)
-            w.join();
-    }
-
-    // process low.bin
-    template <uint32_t N>
-    static void process_low_freq(const std::string &low_path,
-                                 FlatConcurrentHashMap<N> &hash_map,
-                                 uint32_t k_len,
-                                 uint32_t min_freq,
-                                 uint32_t max_freq,
-                                 uint32_t worker_count,
-                                 uint64_t packed_bytes,
-                                 uint32_t count_max,
-                                 ProgressPrinter *progress,
-                                 AsyncWriter *writer)
-    {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "open low.bin failed\n";
-            exit(-1);
-        }
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-        if (mapped == MAP_FAILED)
-        {
-            std::cerr << "mmap low.bin failed\n";
-            exit(-1);
-        }
-
-        const uint64_t full_data_words = k_len / BASES_PER_U64T;
-        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
-        const uint64_t tail_bytes = (tail_bits + 7) / 8;
-        uint64_t kmers_per_worker = (total_kmers + worker_count - 1) / worker_count;
-
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count);
-        for (uint32_t tid = 0; tid < worker_count; ++tid)
-        {
-            workers.emplace_back([&, tid]()
-                                 {
-            uint64_t start = tid * kmers_per_worker;
-            uint64_t end   = std::min(start + kmers_per_worker, total_kmers);
-            if (start >= end) return;
-
-            LineWriter<N> line_writer(writer, k_len);
-            kmer<N> key{};
-
-            for (uint64_t i = start; i < end; ++i) {
-                const char* record = mapped + i * packed_bytes;
-                uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
-                    std::memcpy(key.data.data(), record, full_bytes);
-                if (tail_bytes > 0) {
-                    uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
-                    key.data[full_data_words] = tail;
-                    for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
-                } else {
-                    for (uint64_t j = full_data_words; j < N; ++j) key.data[j] = 0;
-                }
-
-                auto lookup = hash_map.prepare_lookup(key);
-                hash_map.prefetch(lookup);
-                uint32_t count = 0;
-                uint64_t slot  = UINT64_MAX;
-                if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
-                    uint64_t merged = static_cast<uint64_t>(count) + 1;
-                    if (merged > count_max) merged = count_max;
-                    if (in_range(merged, min_freq, max_freq))
-                        line_writer.write_line(key, static_cast<uint32_t>(merged));
-                    *hash_map.mutable_count_at(slot) = 0;
-                } else if (in_range(1, min_freq, max_freq)) {
-                    line_writer.write_line(key, 1);
-                }
-            }
-            progress->add((end - start) * packed_bytes); });
-        }
-        for (auto &w : workers)
-            w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
-    }
-
-    // process low.bin
-    template <uint32_t N>
-    static void process_low_freq_collect(const std::string &low_path,
-                                         FlatConcurrentHashMap<N> &hash_map,
-                                         std::vector<ExportRecord<N>> &results,
-                                         uint32_t k_len,
-                                         uint32_t min_freq,
-                                         uint32_t max_freq,
-                                         uint32_t worker_count,
-                                         uint64_t packed_bytes,
-                                         uint32_t count_max,
-                                         ProgressPrinter *progress)
-    {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-
-        const uint64_t full_data_words = k_len / BASES_PER_U64T;
-        const uint64_t tail_bytes = (2ULL * (k_len % BASES_PER_U64T) + 7) / 8;
-        uint64_t kmers_per_worker = (total_kmers + worker_count - 1) / worker_count;
-
-        std::vector<std::vector<ExportRecord<N>>> high_results(worker_count);
-        for (auto &v : high_results)
-            v.reserve(total_kmers / worker_count + 1024);
-
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count);
-        for (uint32_t tid = 0; tid < worker_count; ++tid)
-        {
-            workers.emplace_back([&, tid]()
-                                 {
-            uint64_t start = tid * kmers_per_worker;
-            uint64_t end   = std::min(start + kmers_per_worker, total_kmers);
-            if (start >= end) return;
-            auto& local = high_results[tid];
-            kmer<N> key{};
-
-            for (uint64_t i = start; i < end; ++i) {
-                const char* record = mapped + i * packed_bytes;
-                uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
-                    std::memcpy(key.data.data(), record, full_bytes);
-                if (tail_bytes > 0) {
-                    uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
-                    key.data[full_data_words] = tail;
-                    for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
-                } else {
-                    for (uint64_t j = full_data_words; j < N; ++j) key.data[j] = 0;
-                }
-
-                auto lookup = hash_map.prepare_lookup(key);
-                hash_map.prefetch(lookup);
-                uint32_t count = 0;
-                uint64_t slot  = UINT64_MAX;
-                if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
-                    uint64_t merged = static_cast<uint64_t>(count) + 1;
-                    if (merged > count_max) merged = count_max;
-                    if (in_range(merged, min_freq, max_freq))
-                        local.push_back({key, static_cast<uint32_t>(merged)});
-                    *hash_map.mutable_count_at(slot) = 0;
-                } else if (in_range(1, min_freq, max_freq)) {
-                    local.push_back({key, 1});
-                }
-            }
-            progress->add((end - start) * packed_bytes); });
-        }
-        for (auto &w : workers)
-            w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
-
-        uint64_t total = 0;
-        for (auto &v : high_results)
-            total += v.size();
-        results.reserve(results.size() + total);
-        for (auto &v : high_results)
-        {
-            results.insert(results.end(), v.begin(), v.end());
-            v.clear();
-        }
-    }
-
-    // collect remaining hash entries
-    template <uint32_t N>
-    static void collect_remaining_stream(FlatConcurrentHashMap<N> &hash_map,
-                                         uint32_t min_freq,
-                                         uint32_t max_freq,
-                                         AsyncWriter *writer,
-                                         uint32_t k_len)
-    {
-        LineWriter<N> line_writer(writer, k_len);
-        hash_map.for_each_entry([&](const kmer<N> &key, uint32_t count)
-                                {
-        if (count > 0 && in_range(count, min_freq, max_freq))
-            line_writer.write_line(key, count); });
-    }
-
-    //  Phase 3 collect remaining
-    template <uint32_t N>
-    static void collect_remaining_into_vector(FlatConcurrentHashMap<N> &hash_map,
-                                              std::vector<ExportRecord<N>> &results,
-                                              uint32_t min_freq, uint32_t max_freq)
-    {
-        hash_map.for_each_entry([&](const kmer<N> &key, uint32_t count)
-                                {
-        if (count > 0 && in_range(count, min_freq, max_freq))
-            results.push_back({key, count}); });
-    }
-
-    // ── Partition-based fallback for insufficient memory ──
-
-    template <uint32_t N>
-    static uint32_t compute_partition_bits(uint64_t total_records,
-                                           uint64_t max_memory_bytes)
-    {
-        for (uint32_t P = 1; P <= 10; ++P)
-        {
-            const uint64_t records_per_bucket =
-                (total_records + (1ULL << P) - 1) / (1ULL << P);
-            const uint64_t estimated_mem =
-                FlatConcurrentHashMap<N>::required_mmap_bytes(records_per_bucket);
-
-            // Add conservative overhead for mmap/low-file mmap/thread buffers
-            constexpr uint64_t overhead = 64ULL * 1024 * 1024;
-
-            if (estimated_mem + overhead <= max_memory_bytes)
-            {
-                return P;
-            }
-        }
-        return 0;
-    }
-
-    // Multi-way merge of sorted partition outputs
-    static void merge_sorted_outputs(const std::vector<std::string>& input_files,
-                                     const std::string& output_file)
-    {
-        struct HeapEntry
-        {
-            std::string line;
-            size_t file_idx;
-            bool operator<(const HeapEntry& other) const
-            {
-                // Min-heap: smaller k-mer string should come first
-                return line > other.line;
-            }
-        };
-
-        // Use raw pointers since we manage lifetime locally
-        std::vector<std::ifstream*> streams;
-        std::priority_queue<HeapEntry> heap;
-
-        for (size_t i = 0; i < input_files.size(); ++i)
-        {
-            auto* s = new std::ifstream(input_files[i]);
-            streams.push_back(s);
-            std::string line;
-            if (std::getline(*s, line))
-            {
-                heap.push({std::move(line), i});
-            }
-        }
-
-        std::ofstream out(output_file, std::ios::out | std::ios::trunc);
-        if (!out)
-        {
-            std::cerr << "merge_sorted_outputs: failed to open " << output_file << '\n';
-            for (auto* s : streams) { s->close(); delete s; }
-            std::exit(1);
-        }
-
-        while (!heap.empty())
-        {
-            auto entry = heap.top();
-            heap.pop();
-            out << entry.line << '\n';
-
-            std::string next_line;
-            if (std::getline(*streams[entry.file_idx], next_line))
-            {
-                heap.push({std::move(next_line), entry.file_idx});
-            }
-        }
-
-        for (auto* s : streams)
-        {
-            s->close();
-            delete s;
-        }
-    }
-
-    // Concatenate partition outputs (already prefix-ordered)
-    static void concat_outputs(const std::vector<std::string>& input_files,
-                               const std::string& output_file)
-    {
-        std::ofstream out(output_file, std::ios::out | std::ios::trunc | std::ios::binary);
-        if (!out)
-        {
-            std::cerr << "concat_outputs: failed to open " << output_file << '\n';
-            std::exit(1);
-        }
-
-        std::vector<char> buf(4ULL * 1024 * 1024);
-        for (const auto& path : input_files)
-        {
-            std::ifstream in(path, std::ios::binary);
-            while (in)
-            {
-                in.read(buf.data(), buf.size());
-                out.write(buf.data(), in.gcount());
-            }
-        }
-    }
-
-    template <uint32_t N>
-    static int run_partitioned_precise(const Options& opts)
-    {
-        // Count total high records
-        uint64_t total_high_records = 0;
-        (void)collect_high_files<N>(opts.tmp_dir, total_high_records, opts.k_len, opts.count_bytes);
-
-        const uint32_t P = compute_partition_bits<N>(total_high_records, opts.max_memory_bytes);
-        if (P == 0)
-        {
-            std::cerr << "insufficient memory: even at P=10 (1024 partitions), "
-                << "estimated memory still exceeds " << opts.max_memory_bytes << " bytes\n";
-            return 2;
-        }
-
-        const uint64_t num_partitions = 1ULL << P;
-        std::cout << "Using P=" << P << " (" << num_partitions
-                  << " partitions) to fit in " << opts.max_memory_bytes << " bytes"
-                  << std::endl;
-
-        // Phase 1: Partition high.bin and low.bin
-        const auto high_counts = partition::partition_high_file<N>(
-            opts.tmp_dir, P, opts.k_len);
-        const auto low_counts = partition::partition_low_file<N>(
-            opts.tmp_dir, P, opts.k_len);
-
-        // Phase 2: Process each partition independently
-        std::vector<std::string> part_outputs;
-        part_outputs.reserve(num_partitions);
-
-        for (uint64_t i = 0; i < num_partitions; ++i)
-        {
-            if (high_counts[i] == 0 && low_counts[i] == 0)
-            {
-                const std::string empty_marker = opts.tmp_dir + "partition_" + std::to_string(i) + "/empty";
-                part_outputs.push_back(empty_marker);
-                continue;
-            }
-
-            const std::string part_dir = opts.tmp_dir + "partition_" + std::to_string(i) + "/";
-            const std::string part_output = part_dir + "output.txt";
-
-            Options part_opts = opts;
-            part_opts.tmp_dir = part_dir;
-            part_opts.output_file = part_output;
-
-            std::cout << "Processing partition " << i << "/" << num_partitions
-                      << " (high=" << high_counts[i] << ", low=" << low_counts[i] << ")"
-                      << std::endl;
-
-            run_precise_impl<N>(part_opts);
-            part_outputs.push_back(part_output);
-        }
-
-        // Phase 3: Merge partition outputs
-        // Filter out empty partitions
-        std::vector<std::string> real_outputs;
-        for (const auto& p : part_outputs)
-        {
-            struct stat st {};
-            if (::stat(p.c_str(), &st) == 0 && st.st_size > 0)
-            {
-                real_outputs.push_back(p);
-            }
-        }
-
-        if (opts.sort_output)
-        {
-            std::cout << "Merging " << real_outputs.size()
-                      << " sorted partition outputs..." << std::endl;
-            merge_sorted_outputs(real_outputs, opts.output_file);
-        }
-        else
-        {
-            std::cout << "Concatenating " << real_outputs.size()
-                      << " partition outputs..." << std::endl;
-            concat_outputs(real_outputs, opts.output_file);
-        }
-
-        // Phase 4: Clean up partition files
-        for (uint64_t i = 0; i < num_partitions; ++i)
-        {
-            const std::string part_dir = opts.tmp_dir + "partition_" + std::to_string(i) + "/";
-            std::remove((part_dir + "high.bin").c_str());
-            std::remove((part_dir + "low.bin").c_str());
-            std::remove((part_dir + "output.txt").c_str());
-            ::rmdir(part_dir.c_str());
-        }
-
-        std::cout << "Partitioned dump complete." << std::endl;
-        return 0;
-    }
 
     // ── Phase 4  sort records then write through AsyncWriter
     template <uint32_t N>
@@ -1197,26 +743,41 @@ namespace
         writer.finish();
     }
 
-    // Precise mode — core processing (no memory check).
+    // ==================================================================
+    // 两趟遍历专用快路径
+    //
+    // 第二趟的过滤器查询只读，同一个 k-mer 的每一次出现必然得到相同判定，
+    // 所以 low.bin 与 high.bin 的 key 集合永不重叠：
+    //
+    //   high.bin —— 记录里的 count 就是最终计数，落在 [min_freq,max_freq]
+    //               范围内的直接输出，无需再去 low.bin 里找 +1；
+    //   low.bin  —— 每条都是“只出现一次”的 k-mer，频次恒为 1，
+    //               只有 min_freq <= 1 时才需要输出。
+    //
+    // 因此不需要高频哈希表，也不需要逐条查询 low.bin。
+    // ==================================================================
     template <uint32_t N>
-    static int run_precise_impl(const Options &opts)
+    static int run_two_pass_dump_tool(const Options &opts)
     {
         temp_dir = opts.tmp_dir;
-        uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
-        uint64_t pkb = packed_kmer_bytes<N>(opts.k_len);
+        const uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
+        const uint64_t pkb = packed_kmer_bytes<N>(opts.k_len);
+        const uint32_t count_bytes = opts.count_bytes;
+        const uint32_t full_words = opts.k_len / BASES_PER_U64T;
+        const uint32_t tail_bits = 2U * (opts.k_len % BASES_PER_U64T);
+        const uint32_t tail_bytes = (tail_bits + 7U) / 8U;
+        const uint64_t compact_rec = pkb + count_bytes;
 
-        // Collect high file metadata
         uint64_t total_high_records = 0;
-        auto high_files = collect_high_files<N>(opts.tmp_dir, total_high_records, opts.k_len, opts.count_bytes);
+        auto high_files = collect_high_files<N>(opts.tmp_dir, total_high_records, opts.k_len, count_bytes);
         uint64_t high_bytes = 0;
         for (auto &rf : high_files)
             high_bytes += rf.file_size;
 
-        // Check low.bin
+        const std::string low_path = opts.tmp_dir + "low.bin";
         uint64_t low_bytes = 0;
         {
-            std::string low_path = opts.tmp_dir + "low.bin";
-            int fd = ::open(low_path.c_str(), O_RDONLY);
+            const int fd = ::open(low_path.c_str(), O_RDONLY);
             if (fd < 0)
             {
                 std::cerr << "open low.bin failed\n";
@@ -1232,63 +793,124 @@ namespace
                 exit(-1);
             }
         }
+        const uint64_t low_entries = low_bytes / pkb;
 
         ProgressPrinter progress(high_bytes + low_bytes);
         progress.start();
 
-        // build hash map
-        FlatConcurrentHashMap<N> hash_map(total_high_records, wc);
-        build_hash_map<N>(high_files, hash_map, wc,
-                          opts.min_freq, opts.max_freq, opts.k_len, opts.count_bytes, &progress);
-        hash_map.seal();
+        std::vector<ExportRecord<N>> results;
+        results.reserve(static_cast<size_t>(
+            total_high_records + ((opts.min_freq <= 1) ? low_entries : 0)));
+
+        // ---- 第一段：high.bin 的 count 就是最终计数 ----
+        for (const RootFileInfo &rf : high_files)
+        {
+            const int fd = ::open(rf.filename.c_str(), O_RDONLY);
+            if (fd < 0)
+            {
+                std::cerr << "open high.bin failed\n";
+                exit(-1);
+            }
+            const char *mapped = static_cast<const char *>(
+                ::mmap(nullptr, rf.file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
+            ::close(fd);
+            if (mapped == MAP_FAILED)
+            {
+                std::cerr << "mmap high.bin failed\n";
+                exit(-1);
+            }
+
+            const uint64_t record_count = rf.file_size / compact_rec;
+            for (uint64_t i = 0; i < record_count; ++i)
+            {
+                const char *src = mapped + i * compact_rec;
+                uint32_t count = 0;
+                std::memcpy(&count, src + pkb, count_bytes);
+                if (count < opts.min_freq || count > opts.max_freq)
+                    continue;
+
+                ExportRecord<N> rec;
+                rec.key.reset();
+                std::memcpy(rec.key.data.data(), src, full_words * sizeof(uint64_t));
+                if (tail_bytes > 0)
+                {
+                    uint64_t tail = 0;
+                    std::memcpy(reinterpret_cast<char *>(&tail) + (8 - tail_bytes),
+                                src + full_words * sizeof(uint64_t), tail_bytes);
+                    rec.key.data[full_words] = tail;
+                }
+                rec.count = count;
+                results.push_back(rec);
+            }
+
+            ::munmap(const_cast<char *>(mapped), rf.file_size);
+            progress.add(rf.file_size);
+        }
+
+        // ---- 第二段：low.bin 全部是频次 1 ----
+        if (opts.min_freq <= 1 && 1 <= opts.max_freq)
+        {
+            const int fd = ::open(low_path.c_str(), O_RDONLY);
+            if (fd < 0)
+            {
+                std::cerr << "open low.bin failed\n";
+                exit(-1);
+            }
+            const char *mapped = static_cast<const char *>(
+                ::mmap(nullptr, low_bytes, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
+            ::close(fd);
+            if (mapped == MAP_FAILED)
+            {
+                std::cerr << "mmap low.bin failed\n";
+                exit(-1);
+            }
+
+            for (uint64_t i = 0; i < low_entries; ++i)
+            {
+                const char *src = mapped + i * pkb;
+                ExportRecord<N> rec;
+                rec.key.reset();
+                std::memcpy(rec.key.data.data(), src, full_words * sizeof(uint64_t));
+                if (tail_bytes > 0)
+                {
+                    uint64_t tail = 0;
+                    std::memcpy(reinterpret_cast<char *>(&tail) + (8 - tail_bytes),
+                                src + full_words * sizeof(uint64_t), tail_bytes);
+                    rec.key.data[full_words] = tail;
+                }
+                rec.count = 1;
+                results.push_back(rec);
+            }
+
+            ::munmap(const_cast<char *>(mapped), low_bytes);
+        }
+        progress.add(low_bytes);
+        progress.finish();
 
         if (opts.sort_output)
         {
-            // Sort path
-            std::vector<ExportRecord<N>> results;
-            process_low_freq_collect<N>(opts.tmp_dir + "low.bin", hash_map, results,
-                                        opts.k_len, opts.min_freq, opts.max_freq,
-                                        wc, pkb, opts.count_max, &progress);
-            collect_remaining_into_vector<N>(hash_map, results,
-                                             opts.min_freq, opts.max_freq);
-            progress.finish();
             sort_and_write<N>(results, opts.output_file, opts.k_len, wc);
         }
         else
         {
             AsyncWriter writer;
             writer.open(opts.output_file);
-            process_low_freq<N>(opts.tmp_dir + "low.bin", hash_map,
-                                opts.k_len, opts.min_freq, opts.max_freq,
-                                wc, pkb, opts.count_max, &progress, &writer);
-            collect_remaining_stream<N>(hash_map, opts.min_freq, opts.max_freq,
-                                        &writer, opts.k_len);
+            LineWriter<N> line_writer(&writer, opts.k_len);
+            for (const ExportRecord<N> &rec : results)
+            {
+                line_writer.write_line(rec.key, rec.count);
+            }
             writer.finish();
-            progress.finish();
         }
+
         return 0;
     }
 
-    // Precise mode — public entry point with memory check.
+    // Precise mode — public entry point.
     template <uint32_t N>
     static int run_precise(const Options &opts)
     {
-        temp_dir = opts.tmp_dir;
-
-        uint64_t total_high_records = 0;
-        (void)collect_high_files<N>(opts.tmp_dir, total_high_records, opts.k_len, opts.count_bytes);
-
-        // Memory check
-        uint64_t estimated_mem = FlatConcurrentHashMap<N>::required_mmap_bytes(total_high_records);
-        if (estimated_mem > opts.max_memory_bytes)
-        {
-            std::cout << "estimated memory " << estimated_mem
-                      << " exceeds max " << opts.max_memory_bytes
-                      << ", falling back to partitioned mode" << std::endl;
-            return run_partitioned_precise<N>(opts);
-        }
-
-        return run_precise_impl<N>(opts);
+        return run_two_pass_dump_tool<N>(opts);
     }
 
     // Approximate mode
@@ -1446,10 +1068,19 @@ namespace
 
 int main(int argc, char *argv[])
 {
+    const auto tool_start = std::chrono::steady_clock::now();
+
     Options opts = parse_options(argc, argv);
     const Infos info = read_infos(opts.tmp_dir);
     opts.k_len = info.k_len;
     opts.count_max = info.count_max;
     opts.count_bytes = info.count_bytes;
-    return opts.is_precise ? dispatch_precise(opts) : dispatch_approximate(opts);
+    const int exit_code = opts.is_precise ? dispatch_precise(opts) : dispatch_approximate(opts);
+
+    const auto tool_end = std::chrono::steady_clock::now();
+    std::cout << "Total elapsed us: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(tool_end - tool_start).count()
+              << std::endl;
+
+    return exit_code;
 }

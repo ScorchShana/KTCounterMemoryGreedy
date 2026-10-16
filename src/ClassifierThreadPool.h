@@ -18,7 +18,6 @@
 #include <utility>
 #include <chrono>
 #include <bitset>
-#include <barrier>
 #include <iostream>
 
 template <uint32_t N>
@@ -31,11 +30,9 @@ class ClassifierThreadPool
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
     SchedulerThreadPool<N>* task_thread_pool;
-    ConcurrentMemoryPool* memory_pool;
     KmerTree<N>* tree;
+    ClassifyPass pass;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
-    std::shared_ptr<std::barrier<>> start_barrier;
-    std::shared_ptr<std::barrier<>> finish_barrier;
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> deal_kmer_counts{};
 
 public:
@@ -52,30 +49,28 @@ public:
     std::atomic<uint64_t> total_owner_tasks{ 0 };
 #endif
 
+    // task_thread_pool 与 tree 只在第二趟(QueryRoute)需要，第一趟可以传 nullptr
     explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool_ptr,
         std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         SchedulerThreadPool<N>* task_thread_pool_ptr,
-        ConcurrentMemoryPool* in_memory_pool_ptr,
-        uint32_t in_classifier_count)
+        uint32_t in_classifier_count,
+        ClassifyPass in_pass)
         : k_len(in_k),
-        tree(tree_ptr),
+        classifier_count(in_classifier_count),
         parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
         classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue),
-        classifier_count(in_classifier_count),
         task_thread_pool(task_thread_pool_ptr),
-        memory_pool(in_memory_pool_ptr)
+        tree(tree_ptr),
+        pass(in_pass)
     {
         threads_ptr.reserve(classifier_count);
     }
 
     void start()
     {
-        start_barrier = std::make_shared<std::barrier<>>(classifier_count);
-        finish_barrier = std::make_shared<std::barrier<>>(classifier_count);
-
         for (uint32_t i = 0; i < classifier_count; i++)
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&, i]
@@ -84,10 +79,13 @@ public:
                     numa_run_on_node(numa_nodes[i % numa_nodes.size()]);
 #endif
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier);
+                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, pass);
                     classifier.classify_and_push();
-                    task_thread_pool->mark_producer_done();
-                    finish_barrier->arrive_and_wait();
+                    // 第一趟没有调度器，也就不需要通知生产者结束
+                    if (pass == ClassifyPass::QueryRoute)
+                    {
+                        task_thread_pool->mark_producer_done();
+                    }
                     deal_kmer_counts[i] = classifier.total_deal_kmer_count;
 #ifdef TEST_MODE
                     consumer_enqueue_spin_time.fetch_add(classifier.consumer_enqueue_spin_time, std::memory_order_relaxed);

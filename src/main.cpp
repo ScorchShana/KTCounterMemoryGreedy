@@ -491,36 +491,82 @@ int process_main()
     pool->init_arenas();
     // pool->perform_first_touch(n_thread);
 
-    // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
-    auto tree = std::make_shared<KmerTree<N>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
-    // 初始化布隆过滤器的MPSC队列
+    // ================================================================
+    // 双 Bloom 过滤器：跨两趟遍历持久存在，由主线程一次性创建并发布。
+    // 第一趟只更新它们，第二趟只查询它们，因此不再需要任何 per-thread 缓冲。
+    // ================================================================
+    std::vector<ConcurrentBloomFilter<N>> bloom_filters;
+    bloom_filters.reserve(1ULL << (2 * ROOT_BASES));
+    {
+        uint64_t total_bloom_bytes = 0;
+        for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); i++)
+        {
+            bloom_filters.emplace_back(bloom_filter_capacity[i], pool.get());
+            global_bloom_filter[i] = &bloom_filters.back();
+            total_bloom_bytes += 2 * bloom_filter_capacity[i] * sizeof(uint64_t);
+        }
+        std::cout << "Double bloom filters: " << bloom_filters.size()
+            << " prefixes, " << total_bloom_bytes / (1024 * 1024) << " MB" << std::endl;
+    }
+
+    // 初始化布隆过滤器的MPSC队列（两趟共用，趟间必须彻底排空）
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     for (uint32_t i = 0; i < classifier_num; i++)
     {
         classifier_task_queues.push_back(std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>());
     }
+
+    const auto init_end = std::chrono::steady_clock::now();
+
+    const auto mid_start = std::chrono::steady_clock::now();
+
+    // ================================================================
+    // 第一趟遍历：只用 BF_once / BF_multi 统计每个 k-mer 的出现次数。
+    // 不导出、不入树、不分配 per-thread 缓冲。
+    // ================================================================
+    {
+        reader_parser_ring_pool->reset_producers(reader_num);
+        parser_classifier_ring_pool->reset_producers(parser_num);
+
+        ReaderThreadPool<N> pass1_reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_num, reader_parser_ring_pool.get());
+        auto pass1_parser_pool = std::make_shared<ParserThreadPool<N>>(k_len, classifier_task_queues, global_classifier_task_queue.get(), pool.get(), reader_parser_ring_pool.get(), parser_classifier_ring_pool.get(), parser_num);
+        auto pass1_classifier_pool = std::make_shared<ClassifierThreadPool<N>>(k_len, nullptr, parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), nullptr, classifier_num, ClassifyPass::BuildFilters);
+
+        pass1_reader_pool.start();
+        pass1_parser_pool->start();
+        pass1_classifier_pool->start();
+
+        pass1_reader_pool.join();
+        pass1_parser_pool->join();
+        pass1_classifier_pool->join();
+
+        std::cout << "Pass 1 (build filters) k-mer count: " << pass1_parser_pool->get_total_read_kmer() << std::endl;
+    }
+
+    // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
+    auto tree = std::make_shared<KmerTree<N>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
     auto task_thread_pool = std::make_shared<SchedulerThreadPool<N>>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
-    // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
-    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<N>>(k_len, tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num);
-    // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
-    auto parser_thread_pool = std::make_shared<ParserThreadPool<N>>(k_len, classifier_task_queues, global_classifier_task_queue.get(), pool.get(), reader_parser_ring_pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
     auto export_writer = std::make_shared<ExportWriter<N>>(k_len, export_ring_pool.get());
 
-    // 正式计数阶段
+    // ================================================================
+    // 第二趟遍历：只查询两个过滤器。
+    //   BF_multi 命中                 → 多次出现，进树
+    //   BF_once 命中且 BF_multi 未命中 → 只出现一次，写盘
+    // ================================================================
     reader_parser_ring_pool->reset_producers(reader_num);
     parser_classifier_ring_pool->reset_producers(parser_num);
     // 初始化最终排干(drain)阶段所需的初始任务
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
+    // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<N>>(k_len, tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), classifier_num, ClassifyPass::QueryRoute);
+    // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
+    auto parser_thread_pool = std::make_shared<ParserThreadPool<N>>(k_len, classifier_task_queues, global_classifier_task_queue.get(), pool.get(), reader_parser_ring_pool.get(), parser_classifier_ring_pool.get(), parser_num);
+
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
     ReaderThreadPool<N> reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_num, reader_parser_ring_pool.get());
-    // FastqClassifier<N> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
-
-    const auto init_end = std::chrono::steady_clock::now();
-
-    const auto mid_start = std::chrono::steady_clock::now();
 
     const auto read_start = std::chrono::steady_clock::now();
 
@@ -529,9 +575,6 @@ int process_main()
     classifier_thread_pool->start();
     task_thread_pool->start();
     export_writer->start();
-
-    // classifier.classify_and_push();
-    // task_thread_pool->mark_producer_done(); // 显式标记 Classifier 的生产者角色完成，通知 Scheduler 不再有新数据
 
     reader_pool.join();
     const auto read_end = std::chrono::steady_clock::now();
