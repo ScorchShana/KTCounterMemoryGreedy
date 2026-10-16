@@ -941,8 +941,12 @@ public:
         dealing_root_index = root_node - root_nodes;
 #endif
 
-        std::vector<DrainFrame> node_stack;
-        std::vector<Task<N>> drain_stack;
+        static thread_local std::vector<DrainFrame> node_stack;
+        static thread_local std::vector<Task<N>> drain_stack;
+
+        // 清空上一根节点的内容，保留已经分配的容量。
+        node_stack.clear();
+        drain_stack.clear();
 
         node_stack.reserve(1024);
         drain_stack.reserve(1024);

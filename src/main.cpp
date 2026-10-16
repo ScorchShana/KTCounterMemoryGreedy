@@ -206,7 +206,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     }
 #ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
-    std::cout << "Total Bloom Filter size: " << total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
+    std::cout << "Total Bloom Filter size: " << 2 * total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
 #endif
 }
 
@@ -413,6 +413,9 @@ int process_main()
         sampled_gz_compressed_bytes += pr->get_sampled_gz_compressed_bytes();
     }
 
+    // 预读线程已结束，质量值和采样统计已保存。
+    pre_readers.clear();
+
     // 根据采样得到的实际解压比重新估计完整 FASTQ 大小(替代原来的 *4)
     uint64_t total_plain_file_size = 0;
     uint64_t total_gz_compressed_file_size = 0;
@@ -471,6 +474,8 @@ int process_main()
     const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
     const bool high_quailty = (avgQuality >= 33 + 30);
     const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
+    const size_t first_map_max_bytes = std::min<size_t>(MAX_REPLACING_HASH_MAP_BYTES,
+        memory_limit * 1024ULL * 1024ULL * 1024ULL / 8 / classifier_num);
     const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
     const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
 
@@ -526,7 +531,7 @@ int process_main()
 
     reader_pool.start();
     parser_thread_pool->start();
-    classifier_thread_pool->start();
+    classifier_thread_pool->start(first_map_max_bytes);
     task_thread_pool->start();
     export_writer->start();
 

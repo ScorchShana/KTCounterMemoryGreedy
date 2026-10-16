@@ -36,7 +36,7 @@ class FastqClassifier
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr size_t INPUT_BLOCK_CAPACITY = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 16; // 预取 Bloom Filter 的距离（单位：k-mer数量）
+    static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
 
     static constexpr uint32_t MAX_CHECK_LOCAL_ROUND = 128;
     static constexpr uint32_t MIN_CHECK_LOCAL_ROUND = 16;

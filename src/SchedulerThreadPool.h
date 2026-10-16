@@ -164,8 +164,8 @@ public:
             uint64_t total_tasks = 0;
             for (uint32_t w = 0;w < thread_count_ - 1; ++w)
             {
-                total_cycles = worker_infos[w].depth_task_cycles[d].load();
-                total_tasks = worker_infos[w].depth_task_count[d].load();
+                total_cycles += worker_infos[w].depth_task_cycles[d].load();
+                total_tasks += worker_infos[w].depth_task_count[d].load();
             }
             const uint64_t avg_cycles_per_task = (total_tasks > 0) ? total_cycles / total_tasks : 0;
             std::cout << "SchedulerThreadPool Depth " << d << " Task cycles : " << avg_cycles_per_task << std::endl;
@@ -784,6 +784,11 @@ private:
         const std::array<uint32_t, MAX_DEPTH>& depth_desired_worker,
         std::vector<WorkerSnapshot>& worker_snapshots)
     {
+        if (depth_worker_count_snapshot == depth_desired_worker)
+        {
+            return;
+        }
+
         const uint32_t total_workers = thread_count_ - 1;
 
         std::array<int32_t, MAX_DEPTH>movein_worker_count;

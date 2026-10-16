@@ -224,7 +224,7 @@ public:
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx * 2, 1, 0);
+        __builtin_prefetch(bins + probe.block_idx * 2, 0, 0);
 #else
         (void)probe;
 #endif
