@@ -1,376 +1,238 @@
-#include "../src/ExportWriter.h"
-#include "../src/RingMemoryPool.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <iterator>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace
 {
-    template <uint32_t N>
-    using Kmer = kmer<N>;
+    using Records = std::vector<std::pair<uint64_t, uint32_t>>;
+    std::filesystem::path test_dir;
+    std::string tool;
 
-    template <uint32_t N>
-    using Record = ExportRecord<N>;
-
-    std::string shell_quote(const std::string& value)
+    void require(bool ok, const std::string& message)
     {
-        std::string quoted = "'";
-        for (const char ch : value)
+        if (!ok) throw std::runtime_error(message);
+    }
+
+    std::string quote(const std::string& value)
+    {
+        std::string result = "'";
+        for (char ch : value) result += ch == '\'' ? "'\\''" : std::string(1, ch);
+        return result + "'";
+    }
+
+    // Independent encoder: base-4 digits occupy the most significant bits of
+    // each word; complete words and the high bytes of a partial word go to disk.
+    void write_key(std::ofstream& out, uint32_t k, uint64_t id)
+    {
+        for (uint32_t base = 0; base < k; base += 32)
         {
-            if (ch == '\'')
+            uint64_t word = 0;
+            uint32_t bases = std::min(32U, k - base);
+            uint64_t digits = id ^ ((base / 32) * 0x9e3779b97f4a7c15ULL);
+            for (uint32_t j = 0; j < bases; ++j)
             {
-                quoted += "'\\''";
+                word |= (digits & 3) << (62 - 2 * j);
+                digits >>= 2;
             }
-            else
-            {
-                quoted.push_back(ch);
-            }
-        }
-        quoted.push_back('\'');
-        return quoted;
-    }
-
-    std::filesystem::path make_test_dir(const std::string& name)
-    {
-        const std::filesystem::path dir = std::filesystem::current_path() / name;
-        std::filesystem::remove_all(dir);
-        std::filesystem::create_directories(dir);
-        return dir;
-    }
-
-    template <uint32_t N>
-    Kmer<N> make_kmer(const std::vector<uint64_t>& words)
-    {
-        Kmer<N> value{};
-        value.reset();
-        for (uint32_t i = 0; i < N && i < words.size(); ++i)
-        {
-            value.data[i] = words[i];
-        }
-        return value;
-    }
-
-    template <uint32_t N>
-    void write_root_file(
-        const std::filesystem::path& dir,
-        const uint32_t root_id,
-        const std::vector<Record<N>>& records)
-    {
-        const std::filesystem::path filename = dir / ("root_" + std::to_string(root_id) + ".bin");
-        std::ofstream output(filename, std::ios::binary | std::ios::trunc);
-        if (!output)
-        {
-            throw std::runtime_error("failed to open root file for writing");
-        }
-        if (!records.empty())
-        {
-            output.write(
-                reinterpret_cast<const char*>(records.data()),
-                static_cast<std::streamsize>(records.size() * sizeof(Record<N>)));
+            uint32_t bytes = (bases + 3) / 4;
+            const char* data = reinterpret_cast<const char*>(&word);
+            out.write(data + (bases == 32 ? 0 : 8 - bytes), bytes);
         }
     }
 
-    template <uint32_t N>
-    void write_low_bin(
-        const std::filesystem::path& dir,
-        const uint32_t k_len,
-        const std::vector<Kmer<N>>& records)
+    void fixture(uint32_t k, uint32_t cap, const Records& high, const std::vector<uint64_t>& low)
     {
-        temp_dir = dir.generic_string() + "/";
-
-        RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> pool(
-            EXPORT_RING_MEMORY_POOL_BLOCK_SIZE,
-            1);
-        ExportWriter<N> writer(k_len, &pool);
-
-        size_t offset = 0;
-        while (offset < records.size())
+        std::ofstream info(test_dir / "infos.bin", std::ios::binary);
+        info.write(reinterpret_cast<const char*>(&k), 4);
+        info.write(reinterpret_cast<const char*>(&cap), 4);
+        uint32_t bytes = cap <= 255 ? 1 : cap <= 65535 ? 2 : cap <= 16777215 ? 3 : 4;
+        std::ofstream high_out(test_dir / "high.bin", std::ios::binary);
+        for (auto [key, count] : high)
         {
-            char* block_ptr = nullptr;
-            pool.producer_dequeue(block_ptr);
-            auto* export_block = reinterpret_cast<ExportBlock<N>*>(block_ptr);
-            const size_t count = std::min(export_block->k_mers.size(), records.size() - offset);
-            for (size_t i = 0; i < count; ++i)
-            {
-                export_block->k_mers[i] = records[offset + i];
-            }
-            pool.producer_enqueue(content_type{block_ptr, count});
-            offset += count;
+            write_key(high_out, k, key);
+            high_out.write(reinterpret_cast<const char*>(&count), bytes);
         }
-
-        pool.producer_set_finished();
-        writer.start();
-        writer.join();
+        std::ofstream low_out(test_dir / "low.bin", std::ios::binary);
+        for (uint64_t key : low) write_key(low_out, k, key);
     }
 
-    std::vector<int64_t> read_histogram(const std::filesystem::path& filename)
+    int run(const std::string& mode, uint32_t threads, const std::string& memory,
+            uint32_t min, uint32_t max, const std::string& output = "hist.tsv")
     {
-        std::ifstream input(filename);
-        if (!input)
-        {
-            throw std::runtime_error("failed to open histogram output");
-        }
-
-        std::string line;
-        std::getline(input, line);
-
-        std::vector<int64_t> values;
-        while (std::getline(input, line))
-        {
-            std::istringstream iss(line);
-            uint64_t freq = 0;
-            int64_t count = 0;
-            if (!(iss >> freq >> count))
-            {
-                throw std::runtime_error("invalid histogram line: " + line);
-            }
-            values.push_back(count);
-        }
-        return values;
-    }
-
-    int run_tool(
-        const std::string& tool_path,
-        const std::filesystem::path& dir,
-        const uint32_t k_len,
-        const uint32_t min_freq,
-        const uint32_t max_freq,
-        const std::string& output_name,
-        const std::string& memory_gb = "1")
-    {
-        const std::filesystem::path output_path = dir / output_name;
-        const std::filesystem::path stdout_path = dir / "tool_stdout.txt";
-        const std::string command =
-            shell_quote(tool_path) + " " +
-            shell_quote(dir.generic_string()) + " " +
-            std::to_string(k_len) + " 4 " +
-            memory_gb + " " +
-            shell_quote(output_path.generic_string()) + " " +
-            std::to_string(min_freq) + " " +
-            std::to_string(max_freq) +
-            " > " + shell_quote(stdout_path.generic_string());
+        std::string command = quote(tool) + " " + mode + " " + quote(test_dir.string()) + " " +
+            std::to_string(threads) + " " + memory + " " + quote((test_dir / output).string()) +
+            " " + std::to_string(min) + " " + std::to_string(max) + " > " +
+            quote((test_dir / "stdout").string()) + " 2> " + quote((test_dir / "stderr").string());
         return std::system(command.c_str());
     }
 
-    bool expect_progress_output(const std::filesystem::path& dir, const char* label)
+    std::string read(const char* name)
     {
-        std::ifstream input(dir / "tool_stdout.txt");
-        if (!input)
-        {
-            std::cerr << label << " missing stdout capture\n";
-            return false;
-        }
-
-        const std::string content(
-            (std::istreambuf_iterator<char>(input)),
-            std::istreambuf_iterator<char>());
-        if (content.find("progress 0%") == std::string::npos ||
-            content.find("progress 100%") == std::string::npos)
-        {
-            std::cerr << label << " progress output missing 0% or 100%\n";
-            return false;
-        }
-        return true;
+        std::ifstream input(test_dir / name);
+        return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     }
 
-    bool expect_histogram(
-        const std::filesystem::path& filename,
-        const std::vector<int64_t>& expected,
-        const char* label)
+    void check(const Records& high, const std::vector<uint64_t>& low, uint32_t cap,
+               uint32_t min, uint32_t max, bool precise, uint32_t threads = 4,
+               const std::string& memory = "1", bool segmented = false)
     {
-        const std::vector<int64_t> actual = read_histogram(filename);
-        if (actual == expected)
-        {
-            return true;
-        }
-
-        std::cerr << label << " histogram mismatch\nactual:";
-        for (const int64_t value : actual)
-        {
-            std::cerr << ' ' << value;
-        }
-        std::cerr << "\nexpected:";
-        for (const int64_t value : expected)
-        {
-            std::cerr << ' ' << value;
-        }
-        std::cerr << '\n';
-        return false;
-    }
-
-    bool test_k33_two_phase(const std::string& tool_path)
-    {
-        const std::filesystem::path dir = make_test_dir("tmp_histogram_k33");
-
-        const Kmer<2> a = make_kmer<2>({0x0123456789abcdefULL, 0xc000000000000000ULL});
-        const Kmer<2> b = make_kmer<2>({0x1111111111111111ULL, 0x8000000000000000ULL});
-        const Kmer<2> c = make_kmer<2>({0x2222222222222222ULL, 0x4000000000000000ULL});
-        const Kmer<2> e = make_kmer<2>({0x3333333333333333ULL, 0x0000000000000000ULL});
-
-        write_root_file<2>(dir, 0, {
-            Record<2>{a, 2},
-            Record<2>{c, 1},
-            Record<2>{e, 4},
-        });
-        write_low_bin<2>(dir, 33, {a, b, c, e});
-
-        if (run_tool(tool_path, dir, 33, 1, 4, "hist.tsv") != 0)
-        {
-            std::cerr << "k33 tool run failed\n";
-            return false;
-        }
-
-        return expect_progress_output(dir, "k33") &&
-            expect_histogram(dir / "hist.tsv", {1, 1, 1, 0}, "k33");
-    }
-
-    bool test_min_filter(const std::string& tool_path)
-    {
-        const std::filesystem::path dir = make_test_dir("tmp_histogram_min_filter");
-
-        const Kmer<2> g = make_kmer<2>({0x4444444444444444ULL, 0xc000000000000000ULL});
-        const Kmer<2> h = make_kmer<2>({0x5555555555555555ULL, 0x8000000000000000ULL});
-        const Kmer<2> i = make_kmer<2>({0x6666666666666666ULL, 0x4000000000000000ULL});
-        const Kmer<2> j = make_kmer<2>({0x7777777777777777ULL, 0x0000000000000000ULL});
-
-        write_root_file<2>(dir, 1, {
-            Record<2>{g, 1},
-            Record<2>{h, 2},
-            Record<2>{i, 5},
-        });
-        write_low_bin<2>(dir, 33, {g, h, i, j});
-
-        if (run_tool(tool_path, dir, 33, 3, 5, "hist.tsv") != 0)
-        {
-            std::cerr << "min-filter tool run failed\n";
-            return false;
-        }
-
-        return expect_histogram(dir / "hist.tsv", {1, 0, 0}, "min-filter");
-    }
-
-    bool test_n1_and_n4_dispatch(const std::string& tool_path)
-    {
-        {
-            const std::filesystem::path dir = make_test_dir("tmp_histogram_n1");
-            const Kmer<1> key = make_kmer<1>({0xaaaaaaaa55555555ULL});
-            write_root_file<1>(dir, 2, {Record<1>{key, 1}});
-            write_low_bin<1>(dir, 32, {key});
-
-            if (run_tool(tool_path, dir, 32, 1, 3, "hist.tsv") != 0)
+        // Serial reference joins unique keys, then builds the histogram of final
+        // counts. It does not repeat the production histogram correction rules.
+        std::map<uint64_t, uint64_t> counts;
+        for (auto [key, count] : high) counts.emplace(key, count);
+        if (precise)
+            for (uint64_t key : low)
             {
-                std::cerr << "n1 tool run failed\n";
-                return false;
+                auto found = counts.find(key);
+                if (found == counts.end()) counts[key] = 1;
+                else found->second = std::min<uint64_t>(cap, found->second + 1);
             }
-            if (!expect_histogram(dir / "hist.tsv", {0, 1, 0}, "n1"))
+        std::vector<int64_t> expected(static_cast<size_t>(max) - min + 1, 0);
+        for (auto [key, count] : counts)
+            if (count >= min && count <= max) ++expected[count - min];
+        int status = run(precise ? "precise" : "approximate", threads, memory, min, max);
+        require(status == 0, "tool failed: " + read("stderr"));
+        std::ifstream input(test_dir / "hist.tsv");
+        uint64_t freq;
+        int64_t count;
+        // The TSV has no header: verify its first bucket as well as every other.
+        for (size_t i = 0; i < expected.size(); ++i)
+        {
+            require(static_cast<bool>(input >> freq >> count), "missing TSV row");
+            require(freq == min + i && count == expected[i], "histogram mismatch at " + std::to_string(min + i));
+        }
+        require(!(input >> freq), "extra TSV rows");
+        auto output = read("stdout");
+        require(output.find("progress 0%") != std::string::npos &&
+                output.find("progress 100%") != std::string::npos, "missing progress");
+        if (segmented) require(output.find("Streaming mode:") != std::string::npos, "segmented path not exercised");
+    }
+
+    void test_boundaries()
+    {
+        for (uint32_t k : {1U, 4U, 31U, 32U, 33U, 63U, 64U, 65U, 95U, 96U, 97U, 127U, 128U})
+            for (uint32_t cap : {1U, 255U, 65535U, 16777215U, 4294967295U})
             {
-                return false;
+                // Two keys also fit k=1. A saturated high record must stay in
+                // its original bucket when it is present in low.bin.
+                Records high{{0, 1}, {1, cap}};
+                std::vector<uint64_t> low{0, 1, 2};
+                fixture(k, cap, high, low);
+                check(high, low, cap, 1, 4, true, 1);
+                check(high, low, cap, 1, 4, true, 4);
+                check(high, low, cap, cap - 1, cap, true);
+                check(high, low, cap, 1, 4, false);
+                check(high, low, cap, cap - 1, cap, false);
+            }
+        Records high{{0, 1}, {1, 2}, {2, 5}};
+        std::vector<uint64_t> low{0, 1, 2, 3};
+        fixture(33, 255, high, low);
+        check(high, low, 255, 3, 5, true);
+        check(high, low, 255, 0, 5, true);
+    }
+
+    void test_empty_and_errors()
+    {
+        for (Records high : {Records{}, Records{{0, 2}}})
+            for (std::vector<uint64_t> low : {std::vector<uint64_t>{}, std::vector<uint64_t>{0, 1}})
+            {
+                fixture(33, 255, high, low);
+                check(high, low, 255, 1, 4, true);
+                check(high, low, 255, 1, 4, false);
+            }
+        for (const std::string mode : {"precise", "approximate"})
+        {
+            fixture(33, 255, {{0, 2}}, {});
+            require(run(mode, 1, "0.001", 1, 4) != 0, "insufficient budget accepted");
+            require(run(mode, 1, "nan", 1, 4) != 0, "NaN budget accepted");
+            require(run(mode, 1, "inf", 1, 4) != 0, "infinite budget accepted");
+            require(run(mode, 1, "1", 1, 4, "missing/out.tsv") != 0, "bad output path accepted");
+            // A writable file that fails on flush catches buffered output errors.
+            if (std::filesystem::exists("/dev/full"))
+            {
+                std::filesystem::create_symlink("/dev/full", test_dir / "full");
+                require(run(mode, 1, "1", 1, 4, "full") != 0, "output write failure ignored");
+                std::filesystem::remove(test_dir / "full");
+            }
+            for (const char* name : {"infos.bin", "high.bin", "low.bin"})
+            {
+                fixture(33, 255, {{0, 2}}, {});
+                std::ofstream corrupt(test_dir / name, std::ios::binary | std::ios::app);
+                corrupt.put('x');
+                corrupt.close();
+                // approximate mode consumes high only, as before.
+                if (mode == "approximate" && std::string(name) == "low.bin") continue;
+                require(run(mode, 1, "1", 1, 4) != 0, "misaligned input accepted: " + std::string(name));
+            }
+            for (auto [k, cap] : Records{{0, 255}, {129, 255}, {33, 0}})
+            {
+                fixture(static_cast<uint32_t>(k), cap, {}, {});
+                require(run(mode, 1, "1", 1, 4) != 0, "bad metadata accepted");
+            }
+            for (const char* name : {"infos.bin", "high.bin", "low.bin"})
+            {
+                fixture(33, 255, {{0, 2}}, {});
+                std::filesystem::remove(test_dir / name);
+                if (mode == "approximate" && std::string(name) == "low.bin") continue;
+                require(run(mode, 1, "1", 1, 4) != 0, "missing input accepted");
             }
         }
-
-        {
-            const std::filesystem::path dir = make_test_dir("tmp_histogram_n4");
-            const Kmer<4> key = make_kmer<4>({
-                0xaaaaaaaa55555555ULL,
-                0x0123456789abcdefULL,
-                0xc000000000000000ULL,
-                0x0000000000000000ULL});
-            write_root_file<4>(dir, 3, {Record<4>{key, 1}});
-            write_low_bin<4>(dir, 65, {key});
-
-            if (run_tool(tool_path, dir, 65, 1, 3, "hist.tsv") != 0)
-            {
-                std::cerr << "n4 tool run failed\n";
-                return false;
-            }
-            if (!expect_histogram(dir / "hist.tsv", {0, 1, 0}, "n4"))
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 
-    bool test_invalid_root_size(const std::string& tool_path)
+    void test_large_stream()
     {
-        const std::filesystem::path dir = make_test_dir("tmp_histogram_invalid_root");
-        write_low_bin<2>(dir, 33, {});
-
-        std::ofstream invalid(dir / "root_0.bin", std::ios::binary | std::ios::trunc);
-        invalid.put('\0');
-        invalid.close();
-
-        if (run_tool(tool_path, dir, 33, 1, 3, "hist.tsv") == 0)
+        Records high;
+        std::vector<uint64_t> low;
+        for (uint64_t i = 0; i < 300000; ++i)
         {
-            std::cerr << "invalid root size should fail\n";
-            return false;
+            high.emplace_back(i, static_cast<uint32_t>(1 + i % 10));
+            if (i % 2 == 0) low.push_back(i);
         }
-        return true;
-    }
-
-    bool test_memory_stub(const std::string& tool_path)
-    {
-        const std::filesystem::path dir = make_test_dir("tmp_histogram_memory_stub");
-        write_low_bin<1>(dir, 32, {});
-
-        if (run_tool(tool_path, dir, 32, 1, 3, "hist.tsv", "0.001") == 0)
-        {
-            std::cerr << "memory stub should fail\n";
-            return false;
-        }
-        return true;
+        low.push_back(400000);
+        fixture(128, 255, high, low);
+        check(high, low, 255, 1, 11, false, 1);
+        check(high, low, 255, 1, 11, false, 4);
+        check(high, low, 255, 1, 11, true, 1);
+        check(high, low, 255, 1, 11, true, 4);
+        check(high, low, 255, 1, 11, true, 1, "0.035", true);
+        check(high, low, 255, 1, 11, true, 4, "0.060", true);
+        check(high, low, 255, 3, 9, true, 1, "0.035", true);
+        fixture(128, 255, high, {});
+        check(high, {}, 255, 1, 11, true, 1, "0.035", true);
     }
 }
 
 int main(int argc, char* argv[])
 {
-    if (argc != 2)
-    {
-        std::cerr << "Usage: " << argv[0] << " <histogram_tool_path>\n";
-        return 1;
-    }
-
-    const std::string tool_path = argv[1];
+    if (argc != 2) return 1;
+    tool = std::filesystem::absolute(argv[1]).string();
+    std::string pattern = (std::filesystem::temp_directory_path() / "histogram-test-XXXXXX").string();
+    char* dir = ::mkdtemp(pattern.data());
+    if (!dir) return 1;
+    test_dir = dir;
     try
     {
-        if (!test_k33_two_phase(tool_path))
-        {
-            return 1;
-        }
-        if (!test_min_filter(tool_path))
-        {
-            return 1;
-        }
-        if (!test_n1_and_n4_dispatch(tool_path))
-        {
-            return 1;
-        }
-        if (!test_invalid_root_size(tool_path))
-        {
-            return 1;
-        }
-        if (!test_memory_stub(tool_path))
-        {
-            return 1;
-        }
+        test_boundaries();
+        test_empty_and_errors();
+        test_large_stream();
+        std::filesystem::remove_all(test_dir);
+        std::cout << "Histogram serial-reference, boundary, error and segmented tests passed\n";
+        return 0;
     }
     catch (const std::exception& ex)
     {
         std::cerr << ex.what() << '\n';
+        std::filesystem::remove_all(test_dir);
         return 1;
     }
-
-    std::cout << "Histogram tool tests passed\n";
-    return 0;
 }

@@ -408,65 +408,81 @@ private:
         std::vector<std::pair<void*, uint64_t>> kmer_range;
         std::vector<std::pair<void*, uint64_t>> count_range;
 
-        uint8_t* ctrl_ptr = static_cast<uint8_t*>(map_memory(ctrl_bytes));
-        kmer<N>* kmer_ptr = static_cast<kmer<N>*>(map_memory(kmer_bytes));
-        uint32_t* count_ptr = static_cast<uint32_t*>(map_memory(count_bytes));
-
-
-        uint64_t ctrl_total_pages = ctrl_bytes / PAGE_SIZE_2MB;
-        uint64_t kmer_total_pages = kmer_bytes / PAGE_SIZE_2MB;
-        uint64_t count_total_pages = count_bytes / PAGE_SIZE_2MB;
-
-        for (uint32_t i = 0;i < n_thread;i++)
-        {
-            size_t ctrl_start_page = (i * ctrl_total_pages) / n_thread;
-            size_t ctrl_end_page = (i + 1) * ctrl_total_pages / n_thread;
-            size_t ctrl_my_pages = ctrl_end_page - ctrl_start_page;           // 该线程负责的 2 MB 页数
-            char* ctrl_my_start = (char*)ctrl_ptr + ctrl_start_page * PAGE_SIZE_2MB; // 起始地址
-            ctrl_range.emplace_back(ctrl_my_start, ctrl_my_pages);
-
-            size_t kmer_start_page = (i * kmer_total_pages) / n_thread;
-            size_t kmer_end_page = (i + 1) * kmer_total_pages / n_thread;
-            size_t kmer_my_pages = kmer_end_page - kmer_start_page;           // 该线程负责的 2 MB 页数
-            char* kmer_my_start = (char*)kmer_ptr + kmer_start_page * PAGE_SIZE_2MB; // 起始地址
-            kmer_range.emplace_back(kmer_my_start, kmer_my_pages);
-
-            size_t count_start_page = (i * count_total_pages) / n_thread;
-            size_t count_end_page = (i + 1) * count_total_pages / n_thread;
-            size_t count_my_pages = count_end_page - count_start_page;           // 该线程负责的 2 MB 页数
-            char* count_my_start = (char*)count_ptr + count_start_page * PAGE_SIZE_2MB; // 起始地址
-            count_range.emplace_back(count_my_start, count_my_pages);
-        }
-
+        uint8_t* ctrl_ptr = nullptr;
+        kmer<N>* kmer_ptr = nullptr;
+        uint32_t* count_ptr = nullptr;
         std::vector<std::thread> threads;
-        for (uint32_t i = 0;i < n_thread;i++)
+        try
         {
-            threads.emplace_back([&, i]()
-                {
-                    for (size_t j = 0; j < ctrl_range[i].second; ++j)
-                    {
-                        volatile char* page_addr = ((volatile char*)ctrl_range[i].first) + j * PAGE_SIZE_2MB;
-                        *page_addr = 0;
-                    }
-                    for (size_t j = 0; j < kmer_range[i].second; ++j)
-                    {
-                        volatile char* page_addr = ((volatile char*)kmer_range[i].first) + j * PAGE_SIZE_2MB;
-                        *page_addr = 0;
-                    }
-                    for (size_t j = 0; j < count_range[i].second; ++j)
-                    {
-                        volatile char* page_addr = ((volatile char*)count_range[i].first) + j * PAGE_SIZE_2MB;
-                        *page_addr = 0;
-                    }
-                });
-        }
+            ctrl_ptr = static_cast<uint8_t*>(map_memory(ctrl_bytes));
+            kmer_ptr = static_cast<kmer<N>*>(map_memory(kmer_bytes));
+            count_ptr = static_cast<uint32_t*>(map_memory(count_bytes));
 
-        for (auto& t : threads)
+            uint64_t ctrl_total_pages = ctrl_bytes / PAGE_SIZE_2MB;
+            uint64_t kmer_total_pages = kmer_bytes / PAGE_SIZE_2MB;
+            uint64_t count_total_pages = count_bytes / PAGE_SIZE_2MB;
+
+            for (uint32_t i = 0;i < n_thread;i++)
+            {
+                size_t ctrl_start_page = (i * ctrl_total_pages) / n_thread;
+                size_t ctrl_end_page = (i + 1) * ctrl_total_pages / n_thread;
+                size_t ctrl_my_pages = ctrl_end_page - ctrl_start_page;           // 该线程负责的 2 MB 页数
+                char* ctrl_my_start = (char*)ctrl_ptr + ctrl_start_page * PAGE_SIZE_2MB; // 起始地址
+                ctrl_range.emplace_back(ctrl_my_start, ctrl_my_pages);
+
+                size_t kmer_start_page = (i * kmer_total_pages) / n_thread;
+                size_t kmer_end_page = (i + 1) * kmer_total_pages / n_thread;
+                size_t kmer_my_pages = kmer_end_page - kmer_start_page;           // 该线程负责的 2 MB 页数
+                char* kmer_my_start = (char*)kmer_ptr + kmer_start_page * PAGE_SIZE_2MB; // 起始地址
+                kmer_range.emplace_back(kmer_my_start, kmer_my_pages);
+
+                size_t count_start_page = (i * count_total_pages) / n_thread;
+                size_t count_end_page = (i + 1) * count_total_pages / n_thread;
+                size_t count_my_pages = count_end_page - count_start_page;           // 该线程负责的 2 MB 页数
+                char* count_my_start = (char*)count_ptr + count_start_page * PAGE_SIZE_2MB; // 起始地址
+                count_range.emplace_back(count_my_start, count_my_pages);
+            }
+
+            threads.reserve(n_thread);
+            for (uint32_t i = 0;i < n_thread;i++)
+            {
+                threads.emplace_back([&, i]()
+                    {
+                        for (size_t j = 0; j < ctrl_range[i].second; ++j)
+                        {
+                            volatile char* page_addr = ((volatile char*)ctrl_range[i].first) + j * PAGE_SIZE_2MB;
+                            *page_addr = 0;
+                        }
+                        for (size_t j = 0; j < kmer_range[i].second; ++j)
+                        {
+                            volatile char* page_addr = ((volatile char*)kmer_range[i].first) + j * PAGE_SIZE_2MB;
+                            *page_addr = 0;
+                        }
+                        for (size_t j = 0; j < count_range[i].second; ++j)
+                        {
+                            volatile char* page_addr = ((volatile char*)count_range[i].first) + j * PAGE_SIZE_2MB;
+                            *page_addr = 0;
+                        }
+                    });
+            }
+
+            for (auto& t : threads)
+            {
+                t.join();
+            }
+
+            return std::make_tuple(ctrl_ptr, kmer_ptr, count_ptr);
+        }
+        catch (...)
         {
-            t.join();
+            // Range vectors and mappings must outlive already-started workers.
+            for (auto& thread : threads)
+                if (thread.joinable()) thread.join();
+            if (ctrl_ptr) munmap(ctrl_ptr, ctrl_bytes);
+            if (kmer_ptr) munmap(kmer_ptr, kmer_bytes);
+            if (count_ptr) munmap(count_ptr, count_bytes);
+            throw;
         }
-
-        return std::make_tuple(ctrl_ptr, kmer_ptr, count_ptr);
     }
 
     uint64_t fast_mod(const uint64_t value) const noexcept
