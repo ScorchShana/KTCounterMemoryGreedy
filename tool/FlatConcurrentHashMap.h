@@ -40,7 +40,7 @@ template <uint32_t N>
 class FlatConcurrentHashMap
 {
 public:
-    static constexpr double LOAD_FACTOR = 0.65;
+    static constexpr double LOAD_FACTOR = 0.7;
     static constexpr uint64_t GROUP_SIZE = FLAT_HASHMAP_GROUP_SIZE;
 
     using Entry = ExportRecord<N>;
