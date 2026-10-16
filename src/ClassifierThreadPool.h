@@ -17,7 +17,6 @@
 #include <vector>
 #include <utility>
 #include <chrono>
-#include <bitset>
 #include <barrier>
 #include <iostream>
 
@@ -50,10 +49,9 @@ public:
     std::atomic<uint64_t> total_local_tasks{ 0 };
     std::atomic<uint64_t> total_global_tasks{ 0 };
     std::atomic<uint64_t> total_owner_tasks{ 0 };
-    std::atomic<uint64_t> total_insert_time{ 0 };
-    std::atomic<uint64_t> total_erase_time{ 0 };
-    std::atomic<uint64_t> total_search_empty_time{ 0 };
-    std::atomic<uint64_t> total_replace_time{ 0 };
+    std::atomic<uint64_t> total_first_occurrences{ 0 };
+    std::atomic<uint64_t> total_repeat_queries{ 0 };
+    std::atomic<uint64_t> total_recovered_firsts{ 0 };
 #endif
 
     explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
@@ -75,20 +73,20 @@ public:
         threads_ptr.reserve(classifier_count);
     }
 
-    void start(size_t first_map_max_bytes)
+    void start(size_t first_ring_max_bytes)
     {
         start_barrier = std::make_shared<std::barrier<>>(classifier_count);
         finish_barrier = std::make_shared<std::barrier<>>(classifier_count);
 
         for (uint32_t i = 0; i < classifier_count; i++)
         {
-            threads_ptr.push_back(std::make_unique<std::thread>([&, i, first_map_max_bytes]
+            threads_ptr.push_back(std::make_unique<std::thread>([&, i, first_ring_max_bytes]
                 {
 #if HAS_LIBNUMA
                     numa_run_on_node(numa_nodes[i % numa_nodes.size()]);
 #endif
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, first_map_max_bytes);
+                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, first_ring_max_bytes);
                     classifier.classify_and_push();
                     task_thread_pool->mark_producer_done();
                     finish_barrier->arrive_and_wait();
@@ -104,10 +102,9 @@ public:
                     total_local_tasks.fetch_add(classifier.local_tasks, std::memory_order_relaxed);
                     total_global_tasks.fetch_add(classifier.global_tasks, std::memory_order_relaxed);
                     total_owner_tasks.fetch_add(classifier.owner_tasks, std::memory_order_relaxed);
-                    total_insert_time.fetch_add(classifier.local_insert_time, std::memory_order_relaxed);
-                    total_erase_time.fetch_add(classifier.local_erase_time, std::memory_order_relaxed);
-                    total_search_empty_time.fetch_add(classifier.get_search_empty_time(), std::memory_order_relaxed);
-                    total_replace_time.fetch_add(classifier.get_replace_time(), std::memory_order_relaxed);
+                    total_first_occurrences.fetch_add(classifier.first_occurrence_count, std::memory_order_relaxed);
+                    total_repeat_queries.fetch_add(classifier.repeat_query_count, std::memory_order_relaxed);
+                    total_recovered_firsts.fetch_add(classifier.recovered_first_count, std::memory_order_relaxed);
 #endif
                 }));
         }
@@ -127,11 +124,12 @@ public:
         {
             std::cout << "Classifier " << i << " dealt k-mer count: " << deal_kmer_counts[i] << "\n";
         }
-        std::cout<<"Classifier total insert time: " << total_insert_time.load(std::memory_order_relaxed) << "\n";
-        std::cout<<"Classifier total erase time: " << total_erase_time.load(std::memory_order_relaxed) << "\n";
-        std::cout<<"Classifier total search empty time: " << total_search_empty_time.load(std::memory_order_relaxed) << "\n";
-        std::cout<<"Classifier total replace time: " << total_replace_time.load(std::memory_order_relaxed) << "\n";
-        #endif
+        std::cout << "Classifier FIRST occurrences: " << total_first_occurrences.load() << '\n';
+        std::cout << "Classifier repeat queries: " << total_repeat_queries.load() << '\n';
+        std::cout << "Classifier recovered FIRSTs: " << total_recovered_firsts.load() << '\n';
+        std::cout << "Classifier FIRST query conservation: "
+            << (total_first_occurrences.load() == total_repeat_queries.load()) << '\n';
+#endif
     }
 };
 

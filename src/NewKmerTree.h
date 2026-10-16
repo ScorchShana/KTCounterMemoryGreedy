@@ -438,6 +438,71 @@ public:
         }
     }
 
+    // 向当前 Classifier 的一个本地 root 批量追加，不访问共享 root 的锁。
+    void main_add_kmers_to_local_root(const kmer<N>* kmers, uint64_t count,
+        const uint32_t prefix, node<N>* local_root_nodes)
+    {
+        constexpr uint32_t capacity = get_block_capacity();
+        node<N>* local_root = local_root_nodes + prefix;
+        auto queue_ptr = layer_queue_->get_queue(0);
+        uint32_t enqueued_count = 0;
+
+        while (count > 0)
+        {
+            kmer_block<N>* block = local_root->active_block;
+            if (block == nullptr || block->count == capacity)
+            {
+                if (local_root->count == MAX_KMER_BLOCK_NUM)
+                {
+                    Task<N> task{};
+                    task.current_node = root_nodes + prefix;
+                    task.depth = 0;
+                    task.kmer_blocks = local_root->kmer_blocks;
+                    task.count = local_root->count;
+#ifdef TEST_MODE
+                    const uint64_t start_cycles = __rdtsc();
+#endif
+                    if (queue_ptr->try_enqueue(task))
+                    {
+                        classifier_enqueue_spin_backoff.reset();
+                    }
+                    else
+                    {
+                        classifier_enqueue_spin_backoff.backoff();
+                        while (!queue_ptr->try_enqueue(task))
+                        {
+                            classifier_enqueue_spin_backoff.backoff();
+                        }
+                        classifier_enqueue_spin_backoff.decay();
+                    }
+#ifdef TEST_MODE
+                    classifier_wait_cycles += __rdtsc() - start_cycles;
+#endif
+                    ++enqueued_count;
+                    local_root->count = 0;
+                }
+
+                block = reinterpret_cast<kmer_block<N>*>(memory_pool->allocate());
+                block->count = 0;
+                local_root->active_block = block;
+                local_root->kmer_blocks[local_root->count++] = block;
+            }
+
+            const uint64_t copy_count = std::min<uint64_t>(capacity - block->count, count);
+            std::memcpy(block->k_mers.data() + block->count, kmers, copy_count * sizeof(kmer<N>));
+            block->count += copy_count;
+            kmers += copy_count;
+            count -= copy_count;
+#ifdef TEST_MODE
+            total_kmers_added.fetch_add(copy_count, std::memory_order_relaxed);
+#endif
+        }
+        if (enqueued_count > 0)
+        {
+            layer_queue_->increase_size(0, enqueued_count);
+        }
+    }
+
     // 线程池工作线程函数
     void thread_add_kmer(const Task<N>& current_task)
     {

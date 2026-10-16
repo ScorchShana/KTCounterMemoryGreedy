@@ -474,7 +474,7 @@ int process_main()
     const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
     const bool high_quailty = (avgQuality >= 33 + 30);
     const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
-    const size_t first_map_max_bytes = std::min<size_t>(MAX_REPLACING_HASH_MAP_BYTES,
+    const size_t first_ring_max_bytes = std::min<size_t>(MAX_FIRST_OCCURRENCE_RING_BYTES,
         memory_limit * 1024ULL * 1024ULL * 1024ULL / 8 / classifier_num);
     const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
     const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
@@ -531,7 +531,7 @@ int process_main()
 
     reader_pool.start();
     parser_thread_pool->start();
-    classifier_thread_pool->start(first_map_max_bytes);
+    classifier_thread_pool->start(first_ring_max_bytes);
     task_thread_pool->start();
     export_writer->start();
 

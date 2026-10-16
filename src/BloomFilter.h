@@ -141,8 +141,7 @@ private:
 enum class Occurrence : uint8_t
 {
     FIRST = 0,
-    SECOND = 1,
-    THIRD_PLUS = 2,
+    REPEAT = 1,
 };
 
 template <uint32_t N>
@@ -150,7 +149,8 @@ class ConcurrentBloomFilter
 {
 
 private:
-    std::atomic<uint64_t>* bins = nullptr; //  bins[2i]=BF1(初始全0), bins[2i+1]=BF2(初始全0)
+    // Even words register repeats; odd words register first occurrences.
+    std::atomic<uint64_t>* bins = nullptr;
     uint64_t capacity_;
     uint64_t mod;
 
@@ -237,46 +237,43 @@ public:
         const uint64_t bf1_word = cell1.load(std::memory_order_relaxed);
         if ((bf1_word & probe.insert_num) == probe.insert_num)
         {
-            // BF1命中：已出现2次，本次为第3次及以上出现
-            return Occurrence::THIRD_PLUS;
+            return Occurrence::REPEAT;
         }
-        else
+
+        const uint64_t bf2_word_before = cell2.fetch_or(probe.insert_num, std::memory_order_relaxed);
+        if ((bf2_word_before & probe.insert_num) != probe.insert_num)
         {
-            const uint64_t bf2_word = cell2.load(std::memory_order_relaxed);
-            if ((bf2_word & probe.insert_num) == probe.insert_num)
-            {
-                // BF1未命中，BF2命中：已出现1次，本次为第2次出现，置BF1对应位
-                const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
-                if ((bf1_word_before & probe.insert_num) == probe.insert_num)
-                {
-                    // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
-                    return Occurrence::THIRD_PLUS;
-                }
-                return Occurrence::SECOND;
-            }
-            else {
-                // BF1未命中、BF2未命中：首次出现，置BF2对应位
-                const uint64_t bf2_word_before = cell2.fetch_or(probe.insert_num, std::memory_order_relaxed);
-                if ((bf2_word_before & probe.insert_num) == probe.insert_num)
-                {
-                    // 可能存在竞争，BF2命中，已出现1次，本次为第2次出现，置BF1对应位
-                    const uint64_t bf1_word_before = cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
-                    if ((bf1_word_before & probe.insert_num) == probe.insert_num)
-                    {
-                        // 可能存在竞争，BF1命中，已出现2次，本次为第3次及以上出现
-                        return Occurrence::THIRD_PLUS;
-                    }
-                    return Occurrence::SECOND;
-                }
-                return Occurrence::FIRST;
-            }
+            return Occurrence::FIRST;
         }
+
+        cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
+        return Occurrence::REPEAT;
     }
 
     Occurrence insert(const kmer<N>& k_mer) noexcept
     {
         const InsertProbe probe = prepare_insert(k_mer);
         return insert_prepared(probe);
+    }
+
+    void prefetch_contains(const InsertProbe& probe) const noexcept
+    {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(bins + probe.block_idx * 2, 0, 1);
+#else
+        (void)probe;
+#endif
+    }
+
+    bool contains_repeat_prepared(const InsertProbe& probe) const noexcept
+    {
+        const uint64_t word = bins[probe.block_idx * 2].load(std::memory_order_relaxed);
+        return (word & probe.insert_num) == probe.insert_num;
+    }
+
+    bool contains_repeat(const kmer<N>& key) const noexcept
+    {
+        return contains_repeat_prepared(prepare_insert(key));
     }
 
     std::atomic<uint64_t>* get_bins()
