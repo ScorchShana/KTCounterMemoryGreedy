@@ -11,6 +11,7 @@
 #include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
 #include "PackedKmerRing.h"
+#include "ConcurrentFirstBlockRing.h"
 
 #include <array>
 #include <algorithm>
@@ -35,7 +36,7 @@ class FastqClassifier
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr size_t INPUT_BLOCK_CAPACITY = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 16; // 预取 Bloom Filter 的距离（单位：k-mer数量）
-    static constexpr size_t EVICTED_BUFFER_BYTES = 16ULL * 1024;
+    static constexpr size_t EVICTED_BUFFER_BYTES = 32ULL * 1024;
 
     static constexpr uint32_t MAX_CHECK_LOCAL_ROUND = 128;
     static constexpr uint32_t MIN_CHECK_LOCAL_ROUND = 16;
@@ -76,7 +77,11 @@ class FastqClassifier
 
     SplitMix64 rng;
 
-    PackedKmerRing<N>* first_occurrence_ring_ = nullptr;
+    PackedKmerCodec<N> first_codec_;
+    ConcurrentFirstBlockRing* first_occurrence_ring_;
+    uint8_t* first_block_;
+    size_t first_block_count_ = 0;
+    const size_t first_block_capacity_;
     std::array<uint8_t, EVICTED_BUFFER_BYTES> evicted_buffer_;
     size_t evicted_count_ = 0;
     size_t evicted_capacity_ = 0;
@@ -118,17 +123,19 @@ public:
         KmerTree<N>* in_tree,
         ConcurrentMemoryPool* in_memory_pool,
         std::barrier<>& in_barrier,
-        size_t in_first_ring_max_bytes)
+        ConcurrentFirstBlockRing* in_first_ring,
+        uint32_t in_producer_rank)
         : classifier_index(in_classifier_index), parser_classifier_ring_pool(in_ring_pool),
         classify_task_queue(in_classify_task_queue), global_classifier_task_queue(in_global_classifier_task_queue),
-        tree(in_tree), classifier_barrier(in_barrier)
+        tree(in_tree), classifier_barrier(in_barrier), first_codec_(in_k_len),
+        first_occurrence_ring_(in_first_ring), first_block_(in_first_ring->initial_block(in_producer_rank)),
+        first_block_capacity_(ConcurrentFirstBlockRing::BLOCK_BYTES / first_codec_.packed_bytes())
     {
         char* raw_block_ptr = nullptr;
         dequeue_data_to_export_writer(raw_block_ptr);
         export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
 
-        first_occurrence_ring_ = PackedKmerRing<N>::create(in_memory_pool, in_k_len, in_first_ring_max_bytes);
-        const size_t packed_bytes = first_occurrence_ring_->codec().packed_bytes();
+        const size_t packed_bytes = first_codec_.packed_bytes();
         evicted_capacity_ = EVICTED_BUFFER_BYTES / packed_bytes;
         const size_t grouped_bytes = evicted_capacity_ * sizeof(kmer<N>);
         auto* grouped_storage = in_memory_pool->allocate_large(grouped_bytes);
@@ -384,13 +391,27 @@ private:
 #ifdef TEST_MODE
         first_occurrence_count++;
 #endif
-        const size_t width = first_occurrence_ring_->codec().packed_bytes();
-        if (first_occurrence_ring_->push(val, evicted_buffer_.data() + evicted_count_ * width))
+        const size_t width = first_codec_.packed_bytes();
+        first_codec_.pack(val, first_block_ + first_block_count_ * width);
+        if (++first_block_count_ == first_block_capacity_)
         {
-            if (++evicted_count_ == evicted_capacity_)
-            {
-                flush_evicted_batch();
-            }
+            if (first_occurrence_ring_->publish_full_block(first_block_))
+                append_evicted_records(first_block_, first_block_capacity_);
+            first_block_count_ = 0;
+        }
+    }
+
+    void append_evicted_records(const uint8_t* records, size_t count) noexcept
+    {
+        const size_t width = first_codec_.packed_bytes();
+        while (count != 0)
+        {
+            const size_t take = std::min(count, evicted_capacity_ - evicted_count_);
+            std::memcpy(evicted_buffer_.data() + evicted_count_ * width, records, take * width);
+            evicted_count_ += take;
+            records += take * width;
+            count -= take;
+            if (evicted_count_ == evicted_capacity_) flush_evicted_batch();
         }
     }
 
@@ -406,9 +427,9 @@ private:
         return 1;
     }
 
-    void sort_evicted_by_root() noexcept
+    void group_and_decode_evicted() noexcept
     {
-        const auto& codec = first_occurrence_ring_->codec();
+        const auto& codec = first_codec_;
         const size_t width = codec.packed_bytes();
         evicted_prefix_counts_.fill(0);
         for (size_t i = 0; i < evicted_count_; ++i)
@@ -423,28 +444,12 @@ private:
             offset += evicted_prefix_counts_[prefix];
         }
 
-        // 每个 root 有一个固定区间，遇到其他 root 的记录就交换到它的区间。
-        std::array<uint8_t, sizeof(kmer<N>)> temporary;
-        uint32_t bucket_end = 0;
-        for (uint32_t prefix = 0; prefix < evicted_prefix_counts_.size(); ++prefix)
+        // Decode each packed record directly into its root's contiguous range.
+        for (size_t i = 0; i < evicted_count_; ++i)
         {
-            bucket_end += evicted_prefix_counts_[prefix];
-            while (evicted_prefix_offsets_[prefix] < bucket_end)
-            {
-                uint8_t* current = evicted_buffer_.data() + evicted_prefix_offsets_[prefix] * width;
-                const uint32_t target_prefix = codec.root_prefix(current);
-                if (target_prefix == prefix)
-                {
-                    ++evicted_prefix_offsets_[prefix];
-                }
-                else
-                {
-                    uint8_t* target = evicted_buffer_.data() + evicted_prefix_offsets_[target_prefix]++ * width;
-                    std::memcpy(temporary.data(), current, width);
-                    std::memcpy(current, target, width);
-                    std::memcpy(target, temporary.data(), width);
-                }
-            }
+            const uint8_t* record = evicted_buffer_.data() + i * width;
+            const uint32_t prefix = codec.root_prefix(record);
+            codec.unpack(record, evicted_grouped_[evicted_prefix_offsets_[prefix]++]);
         }
     }
 
@@ -462,13 +467,7 @@ private:
         {
             return;
         }
-        sort_evicted_by_root();
-        const auto& codec = first_occurrence_ring_->codec();
-        const size_t width = codec.packed_bytes();
-        for (size_t i = 0; i < evicted_count_; ++i)
-        {
-            codec.unpack(evicted_buffer_.data() + i * width, evicted_grouped_[i]);
-        }
+        group_and_decode_evicted();
 
         // 记录已按 root 连续排列，命中项可以直接向前收集。
         evicted_prefix_counts_.fill(0);
@@ -518,13 +517,13 @@ private:
 
     void drain_first_occurrences() noexcept
     {
-        const size_t width = first_occurrence_ring_->codec().packed_bytes();
-        while (first_occurrence_ring_->pop_oldest(evicted_buffer_.data() + evicted_count_ * width))
+        append_evicted_records(first_block_, first_block_count_);
+        first_block_count_ = 0;
+        uint64_t begin, end;
+        while (first_occurrence_ring_->claim_drain_range(begin, end))
         {
-            if (++evicted_count_ == evicted_capacity_)
-            {
-                flush_evicted_batch();
-            }
+            for (uint64_t slot = begin; slot < end; ++slot)
+                append_evicted_records(first_occurrence_ring_->drain_block(slot), first_block_capacity_);
         }
         flush_evicted_batch();
     }
@@ -633,7 +632,7 @@ private:
 
             uint32_t to_tree_count = 0;
 
-            // Shared Bloom filter; the FIRST ring belongs to this classifier.
+            // Shared Bloom filter and node-local FIRST ring.
             ConcurrentBloomFilter<N>& bloom_filter = *local_global_bloom_filter[prefix];
 
             for (uint32_t i = 0; i < prefix_count; i++)

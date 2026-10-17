@@ -6,6 +6,7 @@
 #include "../include/xxh3.h"
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +37,10 @@
 #include <immintrin.h>
 #endif
 
+#if defined(HISTOGRAM_COMPACT_KEYS) && !HISTOGRAM_COMPACT_KEYS
+#error "Non-compact histogram keys are no longer supported; remove HISTOGRAM_COMPACT_KEYS=0"
+#endif
+
 template <uint32_t N>
 class FlatConcurrentHashMap
 {
@@ -51,13 +56,13 @@ public:
         uint8_t fp = 0;
     };
 
-    [[nodiscard]] static uint64_t required_mmap_bytes(uint64_t expected_unique_key)
+    [[nodiscard]] static uint64_t required_mmap_bytes(uint64_t expected_unique_key, uint32_t k_len = 32 * N)
     {
-        return calculate_layout(expected_unique_key).mmap_bytes;
+        return calculate_layout(expected_unique_key, k_len).mmap_bytes;
     }
 
-    explicit FlatConcurrentHashMap(uint64_t expected_unique, uint32_t in_n_thread = 1)
-        : FlatConcurrentHashMap(calculate_layout(expected_unique), in_n_thread)
+    explicit FlatConcurrentHashMap(uint64_t expected_unique, uint32_t in_n_thread = 1, uint32_t k_len = 32 * N)
+        : FlatConcurrentHashMap(calculate_layout(expected_unique, k_len), in_n_thread)
     {
     }
 
@@ -68,10 +73,10 @@ public:
             munmap(ctrl_, ctrl_size_);
             ctrl_ = nullptr;
         }
-        if (kmer_ != nullptr)
+        if (packed_keys_ != nullptr)
         {
-            munmap(kmer_, kmer_size_);
-            kmer_ = nullptr;
+            munmap(packed_keys_, kmer_size_);
+            packed_keys_ = nullptr;
         }
         if (count_ != nullptr)
         {
@@ -87,12 +92,22 @@ public:
 
     bool insert_unique(const kmer<N>& key, uint32_t count) noexcept
     {
+        if (key_bytes_ == sizeof(key))
+            return insert_unique(reinterpret_cast<const char*>(&key), count);
+        char packed[sizeof(key)];
+        pack_key(packed, reinterpret_cast<const char*>(&key));
+        return insert_unique(packed, count);
+    }
+
+    // Packed keys are hashed, stored and compared without expansion.
+    bool insert_unique(const char* packed_key, uint32_t count) noexcept
+    {
         if (sealed_.load(std::memory_order_acquire)) [[unlikely]]
         {
             return false;
         }
 
-        const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+        const uint64_t hash = XXH3_64bits(packed_key, key_bytes_);
         const uint8_t fp = fingerprint(hash);
         uint64_t base = initial_slot(hash);
 
@@ -114,8 +129,7 @@ public:
                     std::memory_order_acq_rel,
                     std::memory_order_acquire))
                 {
-                    kmer<N>& k_mer = kmer_[slot];
-                    k_mer = key;
+                    std::memcpy(packed_keys_ + slot * key_bytes_, packed_key, key_bytes_);
                     count_[slot] = count;
 
                     // size_.fetch_add(1, std::memory_order_relaxed);
@@ -147,7 +161,16 @@ public:
 
     [[nodiscard]] PreparedLookup prepare_lookup(const kmer<N>& key) const noexcept
     {
-        const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+        if (key_bytes_ == sizeof(key))
+            return prepare_lookup(reinterpret_cast<const char*>(&key));
+        char packed[sizeof(key)];
+        pack_key(packed, reinterpret_cast<const char*>(&key));
+        return prepare_lookup(packed);
+    }
+
+    [[nodiscard]] PreparedLookup prepare_lookup(const char* packed_key) const noexcept
+    {
+        const uint64_t hash = XXH3_64bits(packed_key, key_bytes_);
         return PreparedLookup{ initial_slot(hash), fingerprint(hash) };
     }
 
@@ -158,11 +181,10 @@ public:
         constexpr int COUNT_PREFETCH_LOCALITY = 0;
 #if defined(__GNUC__) || defined(__clang__)
         const uint8_t* ctrl = ctrl_ + lookup.base;
-        const kmer<N>* k_mer = kmer_ + lookup.base;
         const uint32_t* count = count_ + lookup.base;
         __builtin_prefetch(ctrl, 0, CTRL_PREFETCH_LOCALITY);
         // __builtin_prefetch(ctrl + GROUP_SIZE - 1, 0, CTRL_PREFETCH_LOCALITY);
-        __builtin_prefetch(k_mer, 0, KMER_PREFETCH_LOCALITY);
+        __builtin_prefetch(packed_keys_ + lookup.base * key_bytes_, 0, KMER_PREFETCH_LOCALITY);
         __builtin_prefetch(count, 0, COUNT_PREFETCH_LOCALITY);
 
 #else
@@ -172,39 +194,27 @@ public:
 
     bool find_prepared(const kmer<N>& key, const PreparedLookup& lookup, uint32_t& out_count) const noexcept
     {
-        const uint8_t fp = lookup.fp;
-        uint64_t base = lookup.base;
+        uint64_t slot;
+        return find_prepared_slot(key, lookup, out_count, slot);
+    }
 
-        for (uint64_t probe = 0; probe < group_count_; ++probe)
-        {
-            const auto masks = match_and_empty(base, fp);
-            uint32_t match_mask = masks.first;
-            const uint32_t empty_mask = masks.second;
-
-            while (match_mask != 0)
-            {
-                const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(match_mask));
-                const uint64_t slot = wrap_slot(base + bit);
-                const kmer<N>& k_mer = kmer_[slot];
-                if (k_mer == key) [[likely]]
-                {
-                    out_count = count_[slot];
-                    return true;
-                }
-                match_mask &= match_mask - 1;
-            }
-
-            if (empty_mask != 0)
-            {
-                return false;
-            }
-            base = next_group_base(base);
-        }
-
-        return false;
+    bool find_prepared(const char* packed_key, const PreparedLookup& lookup, uint32_t& out_count) const noexcept
+    {
+        uint64_t slot;
+        return find_prepared_slot(packed_key, lookup, out_count, slot);
     }
 
     bool find_prepared_slot(const kmer<N>& key, const PreparedLookup& lookup,
+                            uint32_t& out_count, uint64_t& out_slot) const noexcept
+    {
+        if (key_bytes_ == sizeof(key))
+            return find_prepared_slot(reinterpret_cast<const char*>(&key), lookup, out_count, out_slot);
+        char packed[sizeof(key)];
+        pack_key(packed, reinterpret_cast<const char*>(&key));
+        return find_prepared_slot(packed, lookup, out_count, out_slot);
+    }
+
+    bool find_prepared_slot(const char* packed_key, const PreparedLookup& lookup,
                             uint32_t& out_count, uint64_t& out_slot) const noexcept
     {
         const uint8_t fp = lookup.fp;
@@ -220,8 +230,7 @@ public:
             {
                 const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(match_mask));
                 const uint64_t slot = wrap_slot(base + bit);
-                const kmer<N>& k_mer = kmer_[slot];
-                if (k_mer == key) [[likely]]
+                if (std::memcmp(packed_keys_ + slot * key_bytes_, packed_key, key_bytes_) == 0) [[likely]]
                 {
                     out_count = count_[slot];
                     out_slot = slot;
@@ -263,7 +272,16 @@ public:
         {
             if (ctrl_[i] != 0)
             {
-                func(kmer_[i], count_[i]);
+                // Legacy callbacks borrow a reconstructed key only for this call.
+                kmer<N> key{};
+                const char* stored = packed_keys_ + i * key_bytes_;
+                const uint32_t full_bytes = key_bytes_ & ~7U;
+                const uint32_t tail_bytes = key_bytes_ & 7U;
+                std::memcpy(key.data.data(), stored, full_bytes);
+                if (tail_bytes)
+                    std::memcpy(reinterpret_cast<char*>(key.data.data()) + full_bytes + 8 - tail_bytes,
+                                stored + full_bytes, tail_bytes);
+                func(key, count_[i]);
             }
         }
     }
@@ -279,12 +297,23 @@ public:
     }
 
 private:
+    // Legacy callers supply the full-width representation.
+    void pack_key(char* stored, const char* key) const noexcept
+    {
+        const uint32_t full_bytes = key_bytes_ & ~7U;
+        const uint32_t tail_bytes = key_bytes_ & 7U;
+        if (full_bytes) std::memcpy(stored, key, full_bytes);
+        if (tail_bytes)
+            std::memcpy(stored + full_bytes, key + full_bytes + 8 - tail_bytes, tail_bytes);
+    }
+
     static constexpr uint64_t HUGE_PAGE_BYTES = 2ULL * 1024ULL * 1024ULL;
     static_assert(std::is_trivially_destructible_v<Entry>, "Entry must be trivially destructible");
 
     struct Layout
     {
         uint64_t capacity;
+        uint32_t key_bytes;
         uint64_t ctrl_bytes;
         uint64_t kmer_bytes;
         uint64_t count_bytes;
@@ -293,10 +322,11 @@ private:
 
     explicit FlatConcurrentHashMap(const Layout& layout, uint32_t in_n_thread)
         : capacity_(layout.capacity),
-        inv_(((__uint128_t)1 << 64) / capacity_),
         group_count_(capacity_ / GROUP_SIZE),
+        inv_(((__uint128_t)1 << 64) / capacity_),
         mmap_size_(layout.mmap_bytes),
         ctrl_size_(layout.ctrl_bytes),
+        key_bytes_(layout.key_bytes),
         kmer_size_(layout.kmer_bytes),
         count_size_(layout.count_bytes),
         n_thread(in_n_thread)
@@ -304,17 +334,19 @@ private:
         std::tuple<void*, void*, void*> ptrs;
         ptrs = mmap_hash_map_memory(ctrl_size_, kmer_size_, count_size_);
         ctrl_ = static_cast<uint8_t*>(std::get<0>(ptrs));
-        kmer_ = static_cast<kmer<N>*>(std::get<1>(ptrs));
+        packed_keys_ = static_cast<char*>(std::get<1>(ptrs));
         count_ = static_cast<uint32_t*>(std::get<2>(ptrs));
     }
 
-    static uint64_t round_up(uint64_t value, uint64_t alignment) noexcept
+    static uint64_t round_up(uint64_t value, uint64_t alignment)
     {
         const uint64_t remainder = value % alignment;
+        if (remainder && value > std::numeric_limits<uint64_t>::max() - (alignment - remainder))
+            throw std::length_error("hash table size overflow");
         return remainder == 0 ? value : value + alignment - remainder;
     }
 
-    static uint64_t calculate_capacity(uint64_t expected_unique) noexcept
+    static uint64_t calculate_capacity(uint64_t expected_unique)
     {
         if (expected_unique == 0)
         {
@@ -323,6 +355,8 @@ private:
 
         const long double raw =
             static_cast<long double>(expected_unique) / static_cast<long double>(LOAD_FACTOR);
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max() / GROUP_SIZE * GROUP_SIZE;
+        if (raw > static_cast<long double>(maximum)) throw std::length_error("hash table capacity overflow");
         uint64_t requested = static_cast<uint64_t>(raw);
         if (static_cast<long double>(requested) < raw)
         {
@@ -332,26 +366,32 @@ private:
         {
             requested = GROUP_SIZE;
         }
-        if (requested > std::numeric_limits<uint64_t>::max() - GROUP_SIZE) [[unlikely]]
-        {
-            return std::numeric_limits<uint64_t>::max() / GROUP_SIZE * GROUP_SIZE;
-        }
         return round_up(requested, GROUP_SIZE);
     }
 
-    static Layout calculate_layout(uint64_t expected_unique_key)
+    static Layout calculate_layout(uint64_t expected_unique_key, uint32_t k_len)
     {
+        if (!k_len || k_len > 128 || k_len > 32 * N)
+            throw std::invalid_argument("invalid hash table k_len");
+        const uint32_t key_bytes = (k_len + 3) / 4;
         const uint64_t capacity = calculate_capacity(expected_unique_key);
+        const uint64_t maximum = std::numeric_limits<size_t>::max();
+        if (capacity > maximum / key_bytes || capacity > maximum / sizeof(uint32_t) ||
+            capacity > maximum - (GROUP_SIZE - 1))
+            throw std::length_error("hash table size overflow");
 
         const uint64_t ctrl_bytes = round_up(capacity + GROUP_SIZE - 1, 2LL * 1024 * 1024);
 
-        const uint64_t kmer_bytes = round_up(capacity * sizeof(kmer<N>), 2ULL * 1024 * 1024);
+        const uint64_t kmer_bytes = round_up(capacity * key_bytes, 2ULL * 1024 * 1024);
 
         const uint64_t count_bytes = round_up(capacity * sizeof(uint32_t), 2ULL * 1024 * 1024);
 
+        if (ctrl_bytes > maximum || kmer_bytes > maximum - ctrl_bytes ||
+            count_bytes > maximum - ctrl_bytes - kmer_bytes)
+            throw std::length_error("hash table size overflow");
         const uint64_t mmap_bytes = ctrl_bytes + kmer_bytes + count_bytes;
 
-        return Layout{ capacity, ctrl_bytes, kmer_bytes, count_bytes, mmap_bytes };
+        return Layout{ capacity, key_bytes, ctrl_bytes, kmer_bytes, count_bytes, mmap_bytes };
     }
 
     static void* map_memory(uint64_t mmap_bytes)
@@ -409,13 +449,13 @@ private:
         std::vector<std::pair<void*, uint64_t>> count_range;
 
         uint8_t* ctrl_ptr = nullptr;
-        kmer<N>* kmer_ptr = nullptr;
+        char* packed_ptr = nullptr;
         uint32_t* count_ptr = nullptr;
         std::vector<std::thread> threads;
         try
         {
             ctrl_ptr = static_cast<uint8_t*>(map_memory(ctrl_bytes));
-            kmer_ptr = static_cast<kmer<N>*>(map_memory(kmer_bytes));
+            packed_ptr = static_cast<char*>(map_memory(kmer_bytes));
             count_ptr = static_cast<uint32_t*>(map_memory(count_bytes));
 
             uint64_t ctrl_total_pages = ctrl_bytes / PAGE_SIZE_2MB;
@@ -433,7 +473,7 @@ private:
                 size_t kmer_start_page = (i * kmer_total_pages) / n_thread;
                 size_t kmer_end_page = (i + 1) * kmer_total_pages / n_thread;
                 size_t kmer_my_pages = kmer_end_page - kmer_start_page;           // 该线程负责的 2 MB 页数
-                char* kmer_my_start = (char*)kmer_ptr + kmer_start_page * PAGE_SIZE_2MB; // 起始地址
+                char* kmer_my_start = (char*)packed_ptr + kmer_start_page * PAGE_SIZE_2MB; // 起始地址
                 kmer_range.emplace_back(kmer_my_start, kmer_my_pages);
 
                 size_t count_start_page = (i * count_total_pages) / n_thread;
@@ -471,7 +511,7 @@ private:
                 t.join();
             }
 
-            return std::make_tuple(ctrl_ptr, kmer_ptr, count_ptr);
+            return std::make_tuple(ctrl_ptr, packed_ptr, count_ptr);
         }
         catch (...)
         {
@@ -479,7 +519,7 @@ private:
             for (auto& thread : threads)
                 if (thread.joinable()) thread.join();
             if (ctrl_ptr) munmap(ctrl_ptr, ctrl_bytes);
-            if (kmer_ptr) munmap(kmer_ptr, kmer_bytes);
+            if (packed_ptr) munmap(packed_ptr, kmer_bytes);
             if (count_ptr) munmap(count_ptr, count_bytes);
             throw;
         }
@@ -562,7 +602,8 @@ private:
     uint64_t mmap_size_ = 0;
     uint8_t* ctrl_ = nullptr;
     uint64_t ctrl_size_ = 0;
-    kmer<N>* kmer_ = nullptr;
+    const uint32_t key_bytes_;
+    char* packed_keys_ = nullptr;
     uint64_t kmer_size_ = 0;
     uint32_t* count_ = nullptr;
     uint64_t count_size_ = 0;

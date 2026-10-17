@@ -19,6 +19,7 @@
 #include <chrono>
 #include <barrier>
 #include <iostream>
+#include <limits>
 
 template <uint32_t N>
 class ClassifierThreadPool
@@ -36,6 +37,14 @@ class ClassifierThreadPool
     std::shared_ptr<std::barrier<>> start_barrier;
     std::shared_ptr<std::barrier<>> finish_barrier;
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> deal_kmer_counts{};
+    struct FirstRingGroup
+    {
+        uint32_t producer_count = 0;
+        ConcurrentFirstBlockRing* ring = nullptr;
+    };
+    std::array<FirstRingGroup, MAX_NUMA_NODES> first_ring_groups_{};
+    std::vector<int> classifier_nodes_;
+    std::vector<uint32_t> classifier_ranks_;
 
 public:
 #ifdef TEST_MODE
@@ -78,15 +87,44 @@ public:
         start_barrier = std::make_shared<std::barrier<>>(classifier_count);
         finish_barrier = std::make_shared<std::barrier<>>(classifier_count);
 
+        classifier_nodes_.resize(classifier_count);
+        classifier_ranks_.resize(classifier_count);
+        for (uint32_t i = 0; i < classifier_count; ++i)
+        {
+            int node = 0;
+#if HAS_LIBNUMA
+            node = numa_nodes[i % numa_nodes.size()];
+#endif
+            if (node < 0 || node >= MAX_NUMA_NODES) {
+                std::cerr << "Classifier NUMA node is out of range\n";
+                std::exit(-1);
+            }
+            classifier_nodes_[i] = node;
+            classifier_ranks_[i] = first_ring_groups_[node].producer_count++;
+        }
+
         for (uint32_t i = 0; i < classifier_count; i++)
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&, i, first_ring_max_bytes]
                 {
+                    const int node = classifier_nodes_[i];
+                    const uint32_t rank = classifier_ranks_[i];
 #if HAS_LIBNUMA
-                    numa_run_on_node(numa_nodes[i % numa_nodes.size()]);
+                    numa_run_on_node(node);
 #endif
+                    auto& group = first_ring_groups_[node];
+                    if (rank == 0)
+                    {
+                        if (first_ring_max_bytes > std::numeric_limits<size_t>::max() / group.producer_count) {
+                            std::cerr << "Classifier FIRST ring budget overflow\n";
+                            std::exit(-1);
+                        }
+                        group.ring = ConcurrentFirstBlockRing::create(memory_pool, node,
+                            group.producer_count, first_ring_max_bytes * group.producer_count);
+                    }
+                    start_barrier->arrive_and_wait();
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, first_ring_max_bytes);
+                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, group.ring, rank);
                     classifier.classify_and_push();
                     task_thread_pool->mark_producer_done();
                     finish_barrier->arrive_and_wait();

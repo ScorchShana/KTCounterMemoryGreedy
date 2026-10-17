@@ -1,22 +1,18 @@
 #pragma once
 
 #include "HistogramCommon.h"
-#include <aio.h>
-#include <array>
 #include <cerrno>
 #include <fcntl.h>
-#include <memory>
 #include <sys/stat.h>
-#include <thread>
 #include <unistd.h>
 
-// Double-buffered raw input. Only complete, unchanged on-disk records are
-// copied to the caller; decoding belongs to the consumer threads.
+// Read complete raw records directly into the caller's buffer;
+// decoding belongs to the consumer threads.
 class CompactRecordReader
 {
 public:
-    static constexpr uint64_t RAW_BUFFER_SIZE = 512 * 1024;
-    static constexpr uint64_t BUFFER_BYTES = 2 * RAW_BUFFER_SIZE;
+    static constexpr uint64_t RAW_BUFFER_SIZE = 2 * 1024 * 1024; // Maximum pread request.
+    static constexpr uint64_t BUFFER_BYTES = 0; // No internal read buffers.
 
     CompactRecordReader(uint32_t k_len, uint32_t count_bytes)
         : record_bytes_(RecordLayout(k_len, count_bytes).record_bytes) {}
@@ -47,11 +43,6 @@ public:
                 ? records - first_record : record_count;
             ::posix_fadvise(fd_, static_cast<off_t>(first_record * record_bytes_),
                             static_cast<off_t>(record_count_ * record_bytes_), POSIX_FADV_SEQUENTIAL);
-            if (record_count_)
-            {
-                for (auto& buffer : buffers_) buffer = std::make_unique<char[]>(RAW_BUFFER_SIZE);
-                schedule(0);
-            }
         }
         catch (...)
         {
@@ -62,87 +53,38 @@ public:
 
     void close() noexcept
     {
-        for (uint32_t i = 0; i < 2; ++i)
-        {
-            if (active_[i])
-            {
-                wait(i);
-                ::aio_return(&cbs_[i]);
-                active_[i] = false;
-            }
-            buffers_[i].reset();
-            available_[i] = cursor_[i] = 0;
-        }
         if (fd_ >= 0) ::close(fd_);
         fd_ = -1;
-        first_record_ = record_count_ = scheduled_ = delivered_ = 0;
-        current_ = 0;
+        first_record_ = record_count_ = delivered_ = 0;
     }
 
     [[nodiscard]] bool finished() const noexcept { return delivered_ >= record_count_; }
 
     uint64_t read_compact_records(char* output, uint64_t max_records)
     {
-        uint64_t total = 0;
-        while (total < max_records && !finished())
+        uint64_t count = std::min(max_records, record_count_ - delivered_);
+        uint64_t bytes = count * record_bytes_;
+        uint64_t offset = (first_record_ + delivered_) * record_bytes_;
+        uint64_t completed = 0;
+        while (completed < bytes)
         {
-            uint32_t i = current_;
-            if (active_[i])
+            ssize_t result = ::pread(fd_, output + completed,
+                                     static_cast<size_t>(std::min(bytes - completed, RAW_BUFFER_SIZE)),
+                                     static_cast<off_t>(offset + completed));
+            if (result < 0)
             {
-                wait(i);
-                int error = ::aio_error(&cbs_[i]);
-                ssize_t bytes = ::aio_return(&cbs_[i]);
-                active_[i] = false;
-                if (error || bytes != static_cast<ssize_t>(cbs_[i].aio_nbytes))
-                    throw std::runtime_error("failed or partial compact input read");
-                schedule(1 - i);
+                if (errno == EINTR) continue;
+                throw std::runtime_error(std::string("pread failed: ") + std::strerror(errno));
             }
-            uint64_t count = std::min(max_records - total, available_[i] - cursor_[i]);
-            std::memcpy(output + total * record_bytes_, buffers_[i].get() + cursor_[i] * record_bytes_,
-                        static_cast<size_t>(count * record_bytes_));
-            total += count;
-            delivered_ += count;
-            cursor_[i] += count;
-            if (cursor_[i] == available_[i])
-            {
-                available_[i] = cursor_[i] = 0;
-                current_ = 1 - i;
-            }
+            if (result == 0) throw std::runtime_error("unexpected end of compact input");
+            completed += static_cast<uint64_t>(result);
         }
-        return total;
+        delivered_ += count;
+        return count;
     }
 
 private:
-    void wait(uint32_t i) noexcept
-    {
-        const aiocb* list[] = {&cbs_[i]};
-        while (::aio_error(&cbs_[i]) == EINPROGRESS)
-            if (::aio_suspend(list, 1, nullptr) != 0 && errno != EINTR) std::this_thread::yield();
-    }
-
-    void schedule(uint32_t i)
-    {
-        if (scheduled_ == record_count_ || active_[i]) return;
-        uint64_t count = std::min(RAW_BUFFER_SIZE / record_bytes_, record_count_ - scheduled_);
-        std::memset(&cbs_[i], 0, sizeof(aiocb));
-        cbs_[i].aio_fildes = fd_;
-        cbs_[i].aio_buf = buffers_[i].get();
-        cbs_[i].aio_nbytes = count * record_bytes_;
-        cbs_[i].aio_offset = static_cast<off_t>((first_record_ + scheduled_) * record_bytes_);
-        if (::aio_read(&cbs_[i]) != 0)
-            throw std::runtime_error(std::string("aio_read failed: ") + std::strerror(errno));
-        active_[i] = true;
-        available_[i] = count;
-        cursor_[i] = 0;
-        scheduled_ += count;
-    }
-
     int fd_ = -1;
     uint64_t record_bytes_;
-    uint64_t first_record_ = 0, record_count_ = 0, scheduled_ = 0, delivered_ = 0;
-    uint32_t current_ = 0;
-    std::array<aiocb, 2> cbs_{};
-    std::array<std::unique_ptr<char[]>, 2> buffers_{};
-    std::array<bool, 2> active_{};
-    std::array<uint64_t, 2> available_{}, cursor_{};
+    uint64_t first_record_ = 0, record_count_ = 0, delivered_ = 0;
 };

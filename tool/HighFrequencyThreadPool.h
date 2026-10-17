@@ -6,13 +6,12 @@
 #include "../src/SpinBackoff.h"
 #include <thread>
 
-// Worker pool for the insert phase: every worker unpacks one compact record
-// into local variables and inserts it immediately - no second-level queue
-// and no block-sized array of unpacked records.
+// Workers insert compact records directly from ring blocks. Only the count
+// is decoded here; the table restores bytes locally for the legacy hash.
 template <uint32_t N, uint64_t RING_CAPACITY>
 class HighFrequencyThreadPool
 {
-    static constexpr int SLEEP_THRESHOLD = 128;
+    static constexpr int SLEEP_THRESHOLD = 64 + 16;
     static constexpr int YIELD_THRESHOLD = 64;
     static constexpr int MAX_BACKOFF = 256;
 
@@ -111,14 +110,12 @@ private:
             return;
         }
 
-        kmer<N> key{};
         uint32_t count = 0;
 
         const char* record = content.data;
         const char* const record_end = record + content.length * layout_.record_bytes;
         for (; record < record_end; record += layout_.record_bytes)
         {
-            unpack_key(record, layout_, key);
             count = unpack_count(record, layout_);
 
             if (in_range(count, min_freq_, max_freq_)) [[likely]]
@@ -126,7 +123,7 @@ private:
                 local_histogram[histogram_index(count, min_freq_)] += 1;
             }
 
-            if (!hash_map_->insert_unique(key, count)) [[unlikely]]
+            if (!hash_map_->insert_unique(record, count)) [[unlikely]]
             {
                 insert_failed_.store(true, std::memory_order_release);
             }

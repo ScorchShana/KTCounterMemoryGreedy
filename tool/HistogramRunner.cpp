@@ -10,8 +10,8 @@
 
 namespace
 {
-    constexpr uint64_t RING_CAPACITY = 1ULL << 7;
-    constexpr uint64_t BLOCK_BYTES = 128ULL * 1024;
+    constexpr uint64_t RING_CAPACITY = 1ULL << 8;
+    constexpr uint64_t BLOCK_BYTES = 512ULL * 1024;
 
     class ProgressPrinter
     {
@@ -78,7 +78,7 @@ namespace
 
     // High and low phases are sequential: exactly one ring and reader are live.
     // Include all local histograms, default worker stacks, and allocation/I/O
-    // slack (including the AIO service thread), in addition to the mmap table.
+    // slack, in addition to the mmap table.
     uint64_t fixed_memory_bytes(uint32_t workers, size_t buckets)
     {
         pthread_attr_t attr;
@@ -129,7 +129,8 @@ namespace
                                SPMCRingMemoryPool<RING_CAPACITY>& pool,
                                std::atomic<uint64_t>* matched)
     {
-        FlatConcurrentHashMap<N> hash_map(records, options.max_threads);
+        const uint32_t table_k_len = options.k_len;
+        FlatConcurrentHashMap<N> hash_map(records, options.max_threads, table_k_len);
         pool.reset_producers(1);
         {
             HighFrequencyThreadPool<N, RING_CAPACITY> threads(
@@ -158,10 +159,11 @@ namespace
                     uint64_t low_bytes, size_t buckets, uint64_t fixed)
     {
         uint64_t available = options.max_memory_bytes - fixed;
-        if (FlatConcurrentHashMap<N>::required_mmap_bytes(records ? 1 : 0) > available)
+        const uint32_t table_k_len = options.k_len;
+        if (FlatConcurrentHashMap<N>::required_mmap_bytes(records ? 1 : 0, table_k_len) > available)
             throw std::runtime_error("insufficient memory budget for histogram hash table");
         uint64_t per_segment = records;
-        bool segmented = FlatConcurrentHashMap<N>::required_mmap_bytes(records) > available;
+        bool segmented = FlatConcurrentHashMap<N>::required_mmap_bytes(records, table_k_len) > available;
         if (segmented)
         {
             // Find the largest contiguous range whose actual rounded mmap fits.
@@ -169,7 +171,7 @@ namespace
             while (lo < hi)
             {
                 uint64_t mid = lo + (hi - lo + 1) / 2;
-                if (FlatConcurrentHashMap<N>::required_mmap_bytes(mid) <= available) lo = mid;
+                if (FlatConcurrentHashMap<N>::required_mmap_bytes(mid, table_k_len) <= available) lo = mid;
                 else hi = mid - 1;
             }
             per_segment = lo;

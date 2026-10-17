@@ -20,7 +20,7 @@ template <uint32_t N, uint64_t RING_CAPACITY>
 class LowFrequencyThreadPool
 {
 
-    static constexpr int SLEEP_THRESHOLD = 128;
+    static constexpr int SLEEP_THRESHOLD = 64 + 16;
     static constexpr int YIELD_THRESHOLD = 64;
     static constexpr int MAX_BACKOFF = 256;
     static constexpr uint64_t QUERY_PREFETCH_DISTANCE = 8;
@@ -124,12 +124,10 @@ private:
         using Lookup = typename FlatConcurrentHashMap<N>::PreparedLookup;
 
         std::array<Lookup, QUERY_PREFETCH_DISTANCE> lookups{};
-        std::array<kmer<N>, QUERY_PREFETCH_DISTANCE> unpacked_kmers{};
         const uint64_t warmup_count = std::min<uint64_t>(content.length, QUERY_PREFETCH_DISTANCE);
         for (uint64_t i = 0; i < warmup_count; ++i)
         {
-            unpack_key(packed_kmers + i * layout_.key_bytes, layout_, unpacked_kmers[static_cast<size_t>(i)]);
-            lookups[static_cast<size_t>(i)] = hash_map_->prepare_lookup(unpacked_kmers[static_cast<size_t>(i)]);
+            lookups[static_cast<size_t>(i)] = hash_map_->prepare_lookup(packed_kmers + i * layout_.key_bytes);
             hash_map_->prefetch(lookups[static_cast<size_t>(i)]);
         }
 
@@ -137,7 +135,7 @@ private:
         {
             const uint64_t lookup_slot = i % QUERY_PREFETCH_DISTANCE;
             const Lookup lookup = lookups[static_cast<size_t>(lookup_slot)];
-            const kmer<N>& key = unpacked_kmers[static_cast<size_t>(lookup_slot)];
+            const char* key = packed_kmers + i * layout_.key_bytes;
 
             uint32_t count = 0;
             if (hash_map_->find_prepared(key, lookup, count)) [[unlikely]]
@@ -153,11 +151,8 @@ private:
             const uint64_t next_index = i + QUERY_PREFETCH_DISTANCE;
             if (next_index < content.length)
             {
-                unpack_key(
-                    packed_kmers + next_index * layout_.key_bytes, layout_,
-                    unpacked_kmers[static_cast<size_t>(lookup_slot)]);
                 lookups[static_cast<size_t>(lookup_slot)] =
-                    hash_map_->prepare_lookup(unpacked_kmers[static_cast<size_t>(lookup_slot)]);
+                    hash_map_->prepare_lookup(packed_kmers + next_index * layout_.key_bytes);
                 hash_map_->prefetch(lookups[static_cast<size_t>(lookup_slot)]);
             }
         }
