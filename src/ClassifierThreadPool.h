@@ -20,6 +20,8 @@
 #include <barrier>
 #include <iostream>
 #include <limits>
+#include <latch>
+#include <semaphore>
 
 template <uint32_t N>
 class ClassifierThreadPool
@@ -37,6 +39,8 @@ class ClassifierThreadPool
     std::shared_ptr<std::barrier<>> start_barrier;
     std::shared_ptr<std::barrier<>> finish_barrier;
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> deal_kmer_counts{};
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_scanned_counts{};
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_recovered_counts{};
     struct FirstRingGroup
     {
         uint32_t producer_count = 0;
@@ -45,8 +49,12 @@ class ClassifierThreadPool
     std::array<FirstRingGroup, MAX_NUMA_NODES> first_ring_groups_{};
     std::vector<int> classifier_nodes_;
     std::vector<uint32_t> classifier_ranks_;
+    std::latch first_pass_done;
+    std::counting_semaphore<> low_pass_start{0};
 
 public:
+    uint64_t low_records_scanned = 0;
+    uint64_t low_records_recovered = 0;
 #ifdef TEST_MODE
     std::atomic<uint64_t> producer_enqueue_spin_time{ 0 };
     std::atomic<uint64_t> producer_dequeue_spin_time{ 0 };
@@ -77,7 +85,7 @@ public:
         global_classifier_task_queue(in_global_classifier_task_queue),
         classifier_count(in_classifier_count),
         task_thread_pool(task_thread_pool_ptr),
-        memory_pool(in_memory_pool_ptr)
+        memory_pool(in_memory_pool_ptr), first_pass_done(in_classifier_count)
     {
         threads_ptr.reserve(classifier_count);
     }
@@ -125,10 +133,20 @@ public:
                     start_barrier->arrive_and_wait();
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
                     FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, group.ring, rank);
-                    classifier.classify_and_push();
+                    classifier.classify_first_pass();
+                    first_pass_done.count_down();
+                    low_pass_start.acquire();
+                    if (filter_min <= 1 && filter_max >= 1)
+                        classifier.template reconcile_low<true>();
+                    else
+                        classifier.template reconcile_low<false>();
+                    classifier.finish_tree_input();
                     task_thread_pool->mark_producer_done();
                     finish_barrier->arrive_and_wait();
                     deal_kmer_counts[i] = classifier.total_deal_kmer_count;
+                    // Each Classifier owns one result slot; aggregate after join.
+                    low_scanned_counts[i] = classifier.low_records_scanned;
+                    low_recovered_counts[i] = classifier.low_records_recovered;
 #ifdef TEST_MODE
                     consumer_enqueue_spin_time.fetch_add(classifier.consumer_enqueue_spin_time, std::memory_order_relaxed);
                     consumer_dequeue_spin_time.fetch_add(classifier.consumer_dequeue_spin_time, std::memory_order_relaxed);
@@ -148,6 +166,10 @@ public:
         }
     }
 
+    void wait_for_first_pass() { first_pass_done.wait(); }
+
+    void start_low_pass() { low_pass_start.release(classifier_count); }
+
     void join()
     {
         for (auto& t : threads_ptr)
@@ -156,6 +178,10 @@ public:
             {
                 t->join();
             }
+        }
+        for (uint32_t i = 0; i < classifier_count; ++i) {
+            low_records_scanned += low_scanned_counts[i];
+            low_records_recovered += low_recovered_counts[i];
         }
 #ifdef TEST_MODE
         for (uint32_t i = 0; i < classifier_count; i++)

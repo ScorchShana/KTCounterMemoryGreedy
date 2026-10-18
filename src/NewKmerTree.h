@@ -1403,8 +1403,14 @@ private:
 
     void append_export_record(FinalDrainWriter<N>& writer, const kmer<N>& key, const uint32_t count)
     {
-        if (count + 1 < filter_min || count > filter_max)
+        if (count < filter_min)
         {
+            ++writer.local_filtered_below_min_count;
+            return;
+        }
+        if (count > filter_max)
+        {
+            ++writer.local_filtered_above_max_count;
             return;
         }
 

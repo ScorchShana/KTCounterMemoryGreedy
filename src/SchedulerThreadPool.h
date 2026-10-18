@@ -523,6 +523,9 @@ private:
                     uint32_t extra_id = total_workers + i;
                     extra_drain_threads_.emplace_back([this, extra_id]()
                         {
+#if HAS_LIBNUMA
+                            numa_run_on_node(numa_nodes[(extra_id + 1) % numa_nodes.size()]);
+#endif
                             ConcurrentOpenAddressHashMap<N>::set_memory_pool(tree_ptr_->get_memory_pool());
                             drain_all(extra_id % MAX_DEPTH);
                             drain_all_done_barrier.arrive_and_wait();

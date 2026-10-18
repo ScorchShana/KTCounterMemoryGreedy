@@ -100,6 +100,10 @@ namespace
         std::vector<int64_t> expected(static_cast<size_t>(max) - min + 1, 0);
         for (auto [key, count] : counts)
             if (count >= min && count <= max) ++expected[count - min];
+        // Final low.bin contains one distinct singleton per record. The fast
+        // path can count these directly without joining their keys with high.
+        if (!precise && min <= 1 && max >= 1)
+            expected[1 - min] += low.size();
         int status = run(precise ? "precise" : "approximate", threads, memory, min, max);
         require(status == 0, "tool failed: " + read("stderr"));
         std::ifstream input(test_dir / "hist.tsv");
@@ -116,11 +120,12 @@ namespace
         require(output.find("progress 0%") != std::string::npos &&
                 output.find("progress 100%") != std::string::npos, "missing progress");
         if (segmented) require(output.find("Streaming mode:") != std::string::npos, "segmented path not exercised");
+        else require(output.find("Streaming mode:") == std::string::npos, "unexpected extra low-file scans");
     }
 
     void test_boundaries()
     {
-        for (uint32_t k : {1U, 4U, 31U, 32U, 33U, 63U, 64U, 65U, 95U, 96U, 97U, 127U, 128U})
+        for (uint32_t k : {1U, 4U, 18U, 31U, 32U, 33U, 41U, 63U, 64U, 65U, 81U, 95U, 96U, 97U, 127U, 128U})
             for (uint32_t cap : {1U, 255U, 65535U, 16777215U, 4294967295U})
             {
                 // Two keys also fit k=1. A saturated high record must stay in
@@ -170,8 +175,6 @@ namespace
                 std::ofstream corrupt(test_dir / name, std::ios::binary | std::ios::app);
                 corrupt.put('x');
                 corrupt.close();
-                // approximate mode consumes high only, as before.
-                if (mode == "approximate" && std::string(name) == "low.bin") continue;
                 require(run(mode, 1, "1", 1, 4) != 0, "misaligned input accepted: " + std::string(name));
             }
             for (auto [k, cap] : Records{{0, 255}, {129, 255}, {33, 0}})
@@ -183,7 +186,6 @@ namespace
             {
                 fixture(33, 255, {{0, 2}}, {});
                 std::filesystem::remove(test_dir / name);
-                if (mode == "approximate" && std::string(name) == "low.bin") continue;
                 require(run(mode, 1, "1", 1, 4) != 0, "missing input accepted");
             }
         }
@@ -199,16 +201,29 @@ namespace
             if (i % 2 == 0) low.push_back(i);
         }
         low.push_back(400000);
+        fixture(18, 255, high, low);
+        check(high, low, 255, 1, 11, false, 1);
+        check(high, low, 255, 1, 11, true, 1);
+        check(high, low, 255, 1, 11, true, 4);
+        check(high, low, 255, 1, 11, true, 1, "0.142", true);
         fixture(128, 255, high, low);
         check(high, low, 255, 1, 11, false, 1);
         check(high, low, 255, 1, 11, false, 4);
         check(high, low, 255, 1, 11, true, 1);
         check(high, low, 255, 1, 11, true, 4);
-        check(high, low, 255, 1, 11, true, 1, "0.035", true);
-        check(high, low, 255, 1, 11, true, 4, "0.060", true);
-        check(high, low, 255, 3, 9, true, 1, "0.035", true);
+        check(high, low, 255, 1, 11, true, 1, "0.150", true);
+        check(high, low, 255, 1, 11, true, 4, "0.170", true);
+        check(high, low, 255, 3, 9, true, 1, "0.150", true);
         fixture(128, 255, high, {});
-        check(high, {}, 255, 1, 11, true, 1, "0.035", true);
+        check(high, {}, 255, 1, 11, true, 1, "0.150", true);
+        // Same budget formerly required multiple scans with 32-byte keys.
+        fixture(65, 255, high, low);
+        check(high, low, 255, 1, 11, true, 1, "0.150", false);
+        check(high, low, 255, 1, 11, true, 1, "0.146", true);
+        check(high, low, 255, 1, 11, true, 4, "0.170", false);
+        fixture(41, 255, high, low);
+        check(high, low, 255, 1, 11, true, 1, "0.145", false);
+        check(high, low, 255, 1, 11, true, 1, "0.143", true);
     }
 }
 
@@ -222,6 +237,13 @@ int main(int argc, char* argv[])
     test_dir = dir;
     try
     {
+        // Finalized files are disjoint; include high-side Bloom false positives
+        // at frequency one as well as the three records in low.bin.
+        Records high{{0, 1}, {1, 2}, {2, 255}};
+        std::vector<uint64_t> low{3, 4, 5};
+        fixture(33, 255, high, low);
+        check(high, low, 255, 1, 4, false);
+        check(high, low, 255, 1, 4, true);
         test_boundaries();
         test_empty_and_errors();
         test_large_stream();

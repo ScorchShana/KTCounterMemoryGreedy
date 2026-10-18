@@ -41,6 +41,7 @@ class FastqClassifier
     static constexpr uint32_t MAX_CHECK_LOCAL_ROUND = 128;
     static constexpr uint32_t MIN_CHECK_LOCAL_ROUND = 16;
 
+    const uint32_t k_len;
     uint32_t classifier_index;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>* classify_task_queue;
@@ -98,6 +99,8 @@ class FastqClassifier
 
 public:
     uint64_t total_deal_kmer_count = 0;
+    uint64_t low_records_scanned = 0;
+    uint64_t low_records_recovered = 0;
 #ifdef TEST_MODE
     uint64_t producer_enqueue_spin_time{ 0 };
     uint64_t producer_dequeue_spin_time{ 0 };
@@ -125,7 +128,7 @@ public:
         std::barrier<>& in_barrier,
         ConcurrentFirstBlockRing* in_first_ring,
         uint32_t in_producer_rank)
-        : classifier_index(in_classifier_index), parser_classifier_ring_pool(in_ring_pool),
+        : k_len(in_k_len), classifier_index(in_classifier_index), parser_classifier_ring_pool(in_ring_pool),
         classify_task_queue(in_classify_task_queue), global_classifier_task_queue(in_global_classifier_task_queue),
         tree(in_tree), classifier_barrier(in_barrier), first_codec_(in_k_len),
         first_occurrence_ring_(in_first_ring), first_block_(in_first_ring->initial_block(in_producer_rank)),
@@ -170,7 +173,7 @@ public:
         }
     }
 
-    void classify_and_push()
+    void classify_first_pass()
     {
         content_type content;
         //bool not_empty = true;
@@ -314,7 +317,46 @@ public:
         drain_first_occurrences();
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
+        export_block_ptr = nullptr;
+    }
 
+    template <bool WRITE_LOW>
+    void reconcile_low()
+    {
+        if constexpr (WRITE_LOW) {
+            char* raw_block_ptr = nullptr;
+            dequeue_data_to_export_writer(raw_block_ptr);
+            export_block_ptr = reinterpret_cast<ExportBlock<N>*>(raw_block_ptr);
+        }
+        local_first_round = 0;
+        check_local_first_round = MIN_CHECK_LOCAL_ROUND * 2;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> backoff;
+        content_type content;
+        while (true)
+        {
+            if (parser_classifier_ring_pool->producer_finished()) {
+                while (classify_task_queue->try_dequeue(content))
+                    reconcile_low_block<WRITE_LOW>(content);
+                while (global_classifier_task_queue->try_dequeue(content))
+                    reconcile_low_block<WRITE_LOW>(content);
+                break;
+            }
+            if (try_dequeue_low_task(content)) {
+                backoff.decay();
+                reconcile_low_block<WRITE_LOW>(content);
+            } else {
+                backoff.backoff();
+            }
+        }
+        if constexpr (WRITE_LOW) {
+            enqueue_content_to_export_writer({reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count});
+            export_kmer_block_count = 0;
+            export_block_ptr = nullptr;
+        }
+    }
+
+    void finish_tree_input()
+    {
         tree->flush_local_root_nodes(local_root_nodes.data(), rng());
 
 #ifdef TEST_MODE
@@ -324,6 +366,78 @@ public:
 
 
 private:
+    bool try_dequeue_low_task(content_type& content)
+    {
+        if (local_first_round < check_local_first_round) {
+            ++local_first_round;
+            return classify_task_queue->try_dequeue(content) || global_classifier_task_queue->try_dequeue(content);
+        }
+        const uint64_t global_queue_size = global_classifier_task_queue->size();
+        if (global_queue_size > PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY / 2)
+            check_local_first_round = std::max(check_local_first_round / 2, MIN_CHECK_LOCAL_ROUND);
+        else if (global_queue_size < PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY / 4)
+            check_local_first_round = std::min(check_local_first_round * 2, MAX_CHECK_LOCAL_ROUND);
+        local_first_round = 0;
+        return global_classifier_task_queue->try_dequeue(content) || classify_task_queue->try_dequeue(content);
+    }
+
+    template <bool WRITE_LOW>
+    void reconcile_low_block(const content_type& content)
+    {
+        const size_t batch_capacity = std::min(evicted_capacity_, INPUT_BLOCK_CAPACITY);
+        std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
+        const auto* keys = reinterpret_cast<const kmer<N>*>(content.data);
+        for (size_t pos = 0; pos < content.length; pos += batch_capacity)
+        {
+            const size_t count = std::min<size_t>(batch_capacity, content.length - pos);
+            evicted_prefix_counts_.fill(0);
+            for (size_t i = 0; i < std::min<size_t>(count, BLOOM_PREFETCH_DISTANCE); ++i)
+                prepare_repeat_lookup(lookups[i], keys[pos + i]);
+
+            size_t recovered = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
+                const kmer<N> val = keys[pos + i];
+                const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
+                if (i + BLOOM_PREFETCH_DISTANCE < count)
+                    prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
+                        keys[pos + i + BLOOM_PREFETCH_DISTANCE]);
+                if (repeated) {
+                    local_block_for_copy[recovered++] = val;
+                    ++evicted_prefix_counts_[lookup.prefix];
+                } else if constexpr (WRITE_LOW) {
+                    export_one_kmer(val);
+                }
+            }
+
+            uint32_t offset = 0;
+            for (size_t prefix = 0; prefix < evicted_prefix_counts_.size(); ++prefix) {
+                evicted_prefix_offsets_[prefix] = offset;
+                offset += evicted_prefix_counts_[prefix];
+            }
+            for (size_t i = 0; i < recovered; ++i) {
+                const auto& val = local_block_for_copy[i];
+                evicted_grouped_[evicted_prefix_offsets_[get_root_prefix(val)]++] = val;
+            }
+            offset = 0;
+            for (uint32_t prefix = 0; prefix < evicted_prefix_counts_.size(); ++prefix) {
+                const uint32_t amount = evicted_prefix_counts_[prefix];
+                if (amount > 0) {
+                    tree->main_add_kmers_to_local_root(evicted_grouped_ + offset, amount,
+                        prefix, local_root_nodes.data());
+                    offset += amount;
+                }
+            }
+            low_records_recovered += recovered;
+#ifdef TEST_MODE
+            total_kmers_send_to_tree += recovered;
+#endif
+        }
+        low_records_scanned += content.length;
+        parser_classifier_ring_pool->consumer_enqueue(content.data);
+    }
+
     void process_owned_block(kmer<N>* kmer_data, const uint64_t kmer_count)
     {
         calculate_block_prefix_counts(kmer_data, kmer_count);

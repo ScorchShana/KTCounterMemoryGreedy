@@ -332,7 +332,8 @@ public:
     ExportWriter(ExportWriter&&) = delete;
     ExportWriter& operator=(ExportWriter&&) = delete;
 
-    explicit ExportWriter(uint32_t in_k, RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* pool)
+    explicit ExportWriter(uint32_t in_k, RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* pool,
+        const std::string& filename = temp_dir + "low.bin")
         : k(in_k), ring_memory_pool(pool), fd(-1)
     {
         full_data_count = k / BASES_PER_U64T;
@@ -342,10 +343,10 @@ public:
 
         mask = (tail_bytes > 0) ? ((~uint64_t{ 0 }) << (64 - tail_bits)) : 0;
 
-        fd = ::open((temp_dir + "low.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) [[unlikely]]
         {
-            std::cerr << "Failed to open export file: " << temp_dir + "low.bin" << std::endl;
+            std::cerr << "Failed to open export file: " << filename << std::endl;
             std::exit(-1);
         }
 

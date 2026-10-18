@@ -29,6 +29,8 @@ private:
     SpinBackoff<> enqueue_backoff;
 
 public:
+    uint64_t local_filtered_below_min_count = 0;
+    uint64_t local_filtered_above_max_count = 0;
 
 #ifdef TEST_MODE
     uint64_t producer_enqueue_spin_time{ 0 };
@@ -61,6 +63,16 @@ public:
         }
         sorted_kmer_count.fetch_add(local_sorted_kmer_count, std::memory_order_relaxed);
         local_sorted_kmer_count = 0;
+        if (local_filtered_below_min_count != 0)
+        {
+            filtered_below_min_count.fetch_add(local_filtered_below_min_count, std::memory_order_relaxed);
+            local_filtered_below_min_count = 0;
+        }
+        if (local_filtered_above_max_count != 0)
+        {
+            filtered_above_max_count.fetch_add(local_filtered_above_max_count, std::memory_order_relaxed);
+            local_filtered_above_max_count = 0;
+        }
     }
 
     ~FinalDrainWriter()

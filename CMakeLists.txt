@@ -226,6 +226,13 @@ foreach(RING_TEST IN ITEMS packed_kmer_ring bloom_repeat classifier_first_batch 
         target_link_libraries(${RING_TEST}_test ${NUMA_LIBRARY})
     endif()
 endforeach()
+add_executable(low_frequency_io_test tests/test_low_frequency_io.cpp)
+target_link_libraries(low_frequency_io_test pthread rt atomic)
+if(NUMA_LIBRARY)
+    target_link_libraries(low_frequency_io_test ${NUMA_LIBRARY})
+endif()
+add_test(NAME LowFrequencyIOTest COMMAND low_frequency_io_test)
+set_tests_properties(LowFrequencyIOTest PROPERTIES TIMEOUT 30)
 target_compile_definitions(classifier_first_batch_test PRIVATE TEST_MODE)
 add_test(NAME ConcurrentFirstBlockRingTest COMMAND concurrent_first_block_ring_test)
 set_tests_properties(ConcurrentFirstBlockRingTest PROPERTIES TIMEOUT 60)
@@ -256,7 +263,8 @@ set_tests_properties(PackedKmerRingTest BloomRepeatTest ClassifierFirstBatchTest
 find_program(PYTHON3_EXECUTABLE NAMES python3)
 if(PYTHON3_EXECUTABLE)
     add_test(NAME ClassifierEndToEndTest
-        COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_classifier_end_to_end.py $<TARGET_FILE:Tree>)
+        COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_classifier_end_to_end.py
+            $<TARGET_FILE:Tree> $<TARGET_FILE:histogram_tool>)
     set_tests_properties(ClassifierEndToEndTest PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 

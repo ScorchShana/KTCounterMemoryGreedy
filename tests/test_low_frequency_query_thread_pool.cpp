@@ -95,7 +95,7 @@ namespace
         const Kmer count_four = make_kmer(0x1111222233334444ULL, 0x8000000000000000ULL);
         const Kmer missing = make_kmer(0x9999aaaabbbbccccULL, 0x4000000000000000ULL);
 
-        FlatConcurrentHashMap<kWords> hash_map(2);
+        FlatConcurrentHashMap<kWords> hash_map(2, 2, k);
         if (!hash_map.insert_unique(count_two, 2))
         {
             std::cerr << "failed to insert count_two\n";

@@ -84,6 +84,10 @@ static_assert(KMER_BLOCK_SIZE % 4096 == 0, "KMER_BLOCK_SIZE must be multiple of 
 constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 环形内存池容量（块数），必须为2的幂
 constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE = 32ULL * 1024; // 环形内存池块大小（字节）
 
+// LowFrequencyReader 与 LowFrequencyParser：512 × 256 KiB = 128 MiB
+constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY = 1ULL << 9;
+constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024;
+
 // Parser与Classifier之间的RingMemoryPool配置常量
 constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY = 1ULL << 11;     // 环形内存池容量（块数），必须为2的幂
 constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
@@ -223,6 +227,8 @@ struct ExportRecord
 
 // 写入k-mer计数
 alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> sorted_kmer_count{ 0 };
+alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> filtered_below_min_count{ 0 };
+alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> filtered_above_max_count{ 0 };
 
 // 临时文件目录
 inline std::string temp_dir = "./tmp/";

@@ -7,6 +7,7 @@
 #include "ConcurrentMemoryPool.h"
 #include "RingMemoryPool.h"
 #include "FastqParser.h"
+#include "LowFrequencyParser.h"
 #include "SchedulerThreadPool.h"
 
 #include <array>
@@ -26,7 +27,6 @@ class ParserThreadPool
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
     ConcurrentMemoryPool* pool = nullptr;
-    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* reader_parser_ring_pool;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
     const uint32_t parser_count;
@@ -47,28 +47,26 @@ public:
         std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         ConcurrentMemoryPool* pool_ptr,
-        RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool_ptr,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool_ptr,
         uint32_t in_parser_count)
         : k(in_k),
         classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue),
         pool(pool_ptr),
-        reader_parser_ring_pool(in_reader_parser_ring_pool_ptr),
         parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
         parser_count(in_parser_count)
     {
         threads_ptr.reserve(parser_count);
     }
 
-    void start()
+    void start(RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>& reads)
     {
         for (uint32_t i = 0; i < parser_count; ++i)
         {
-            threads_ptr.push_back(std::make_unique<std::thread>([&]
+            threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
                 {
                     std::this_thread::sleep_for(std::chrono::nanoseconds(20));
-                    FastqParser<N> parser(k, classifier_task_queues, global_classifier_task_queue, reader_parser_ring_pool, parser_classifier_ring_pool);
+                    FastqParser<N> parser(k, classifier_task_queues, global_classifier_task_queue, &reads, parser_classifier_ring_pool);
                     parser.parse_and_push();
                     total_read_kmer += parser.get_total_read_kmer();
                     parser_classifier_ring_pool->producer_set_finished();
@@ -82,6 +80,23 @@ public:
                     total_flush_cycles += parser.flush_cycles;
                     total_queue_wait_cycles += parser.queue_wait_cycles;
 #endif
+                }));
+        }
+    }
+
+    // First-pass threads must be joined; reads must outlive all low-pass threads.
+    void start_low_pass(SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY>& reads,
+        uint32_t low_parser_count)
+    {
+        threads_ptr.clear();
+        threads_ptr.reserve(low_parser_count);
+        for (uint32_t i = 0; i < low_parser_count; ++i)
+        {
+            threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
+                {
+                    LowFrequencyParser<N> parser(k, classifier_task_queues, global_classifier_task_queue);
+                    parser.parse_and_push(reads, *parser_classifier_ring_pool);
+                    parser_classifier_ring_pool->producer_set_finished();
                 }));
         }
     }
