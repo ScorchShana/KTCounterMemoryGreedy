@@ -17,9 +17,11 @@
 #include <vector>
 #include <utility>
 #include <chrono>
-#include <bitset>
 #include <barrier>
 #include <iostream>
+#include <limits>
+#include <latch>
+#include <semaphore>
 
 template <uint32_t N>
 class ClassifierThreadPool
@@ -37,8 +39,22 @@ class ClassifierThreadPool
     std::shared_ptr<std::barrier<>> start_barrier;
     std::shared_ptr<std::barrier<>> finish_barrier;
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> deal_kmer_counts{};
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_scanned_counts{};
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_recovered_counts{};
+    struct FirstRingGroup
+    {
+        uint32_t producer_count = 0;
+        ConcurrentFirstBlockRing* ring = nullptr;
+    };
+    std::array<FirstRingGroup, MAX_NUMA_NODES> first_ring_groups_{};
+    std::vector<int> classifier_nodes_;
+    std::vector<uint32_t> classifier_ranks_;
+    std::latch first_pass_done;
+    std::counting_semaphore<> low_pass_start{0};
 
 public:
+    uint64_t low_records_scanned = 0;
+    uint64_t low_records_recovered = 0;
 #ifdef TEST_MODE
     std::atomic<uint64_t> producer_enqueue_spin_time{ 0 };
     std::atomic<uint64_t> producer_dequeue_spin_time{ 0 };
@@ -50,6 +66,9 @@ public:
     std::atomic<uint64_t> total_local_tasks{ 0 };
     std::atomic<uint64_t> total_global_tasks{ 0 };
     std::atomic<uint64_t> total_owner_tasks{ 0 };
+    std::atomic<uint64_t> total_first_occurrences{ 0 };
+    std::atomic<uint64_t> total_repeat_queries{ 0 };
+    std::atomic<uint64_t> total_recovered_firsts{ 0 };
 #endif
 
     explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
@@ -66,29 +85,68 @@ public:
         global_classifier_task_queue(in_global_classifier_task_queue),
         classifier_count(in_classifier_count),
         task_thread_pool(task_thread_pool_ptr),
-        memory_pool(in_memory_pool_ptr)
+        memory_pool(in_memory_pool_ptr), first_pass_done(in_classifier_count)
     {
         threads_ptr.reserve(classifier_count);
     }
 
-    void start()
+    void start(size_t first_ring_max_bytes)
     {
         start_barrier = std::make_shared<std::barrier<>>(classifier_count);
         finish_barrier = std::make_shared<std::barrier<>>(classifier_count);
 
+        classifier_nodes_.resize(classifier_count);
+        classifier_ranks_.resize(classifier_count);
+        for (uint32_t i = 0; i < classifier_count; ++i)
+        {
+            int node = 0;
+#if HAS_LIBNUMA
+            node = numa_nodes[i % numa_nodes.size()];
+#endif
+            if (node < 0 || node >= MAX_NUMA_NODES) {
+                std::cerr << "Classifier NUMA node is out of range\n";
+                std::exit(-1);
+            }
+            classifier_nodes_[i] = node;
+            classifier_ranks_[i] = first_ring_groups_[node].producer_count++;
+        }
+
         for (uint32_t i = 0; i < classifier_count; i++)
         {
-            threads_ptr.push_back(std::make_unique<std::thread>([&, i]
+            threads_ptr.push_back(std::make_unique<std::thread>([&, i, first_ring_max_bytes]
                 {
+                    const int node = classifier_nodes_[i];
+                    const uint32_t rank = classifier_ranks_[i];
 #if HAS_LIBNUMA
-                    numa_run_on_node(numa_nodes[i % numa_nodes.size()]);
+                    numa_run_on_node(node);
 #endif
+                    auto& group = first_ring_groups_[node];
+                    if (rank == 0)
+                    {
+                        if (first_ring_max_bytes > std::numeric_limits<size_t>::max() / group.producer_count) {
+                            std::cerr << "Classifier FIRST ring budget overflow\n";
+                            std::exit(-1);
+                        }
+                        group.ring = ConcurrentFirstBlockRing::create(memory_pool, node,
+                            group.producer_count, first_ring_max_bytes * group.producer_count);
+                    }
+                    start_barrier->arrive_and_wait();
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier);
-                    classifier.classify_and_push();
+                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, group.ring, rank);
+                    classifier.classify_first_pass();
+                    first_pass_done.count_down();
+                    low_pass_start.acquire();
+                    if (filter_min <= 1 && filter_max >= 1)
+                        classifier.template reconcile_low<true>();
+                    else
+                        classifier.template reconcile_low<false>();
+                    classifier.finish_tree_input();
                     task_thread_pool->mark_producer_done();
                     finish_barrier->arrive_and_wait();
                     deal_kmer_counts[i] = classifier.total_deal_kmer_count;
+                    // Each Classifier owns one result slot; aggregate after join.
+                    low_scanned_counts[i] = classifier.low_records_scanned;
+                    low_recovered_counts[i] = classifier.low_records_recovered;
 #ifdef TEST_MODE
                     consumer_enqueue_spin_time.fetch_add(classifier.consumer_enqueue_spin_time, std::memory_order_relaxed);
                     consumer_dequeue_spin_time.fetch_add(classifier.consumer_dequeue_spin_time, std::memory_order_relaxed);
@@ -100,10 +158,17 @@ public:
                     total_local_tasks.fetch_add(classifier.local_tasks, std::memory_order_relaxed);
                     total_global_tasks.fetch_add(classifier.global_tasks, std::memory_order_relaxed);
                     total_owner_tasks.fetch_add(classifier.owner_tasks, std::memory_order_relaxed);
+                    total_first_occurrences.fetch_add(classifier.first_occurrence_count, std::memory_order_relaxed);
+                    total_repeat_queries.fetch_add(classifier.repeat_query_count, std::memory_order_relaxed);
+                    total_recovered_firsts.fetch_add(classifier.recovered_first_count, std::memory_order_relaxed);
 #endif
                 }));
         }
     }
+
+    void wait_for_first_pass() { first_pass_done.wait(); }
+
+    void start_low_pass() { low_pass_start.release(classifier_count); }
 
     void join()
     {
@@ -114,11 +179,20 @@ public:
                 t->join();
             }
         }
+        for (uint32_t i = 0; i < classifier_count; ++i) {
+            low_records_scanned += low_scanned_counts[i];
+            low_records_recovered += low_recovered_counts[i];
+        }
 #ifdef TEST_MODE
         for (uint32_t i = 0; i < classifier_count; i++)
         {
             std::cout << "Classifier " << i << " dealt k-mer count: " << deal_kmer_counts[i] << "\n";
         }
+        std::cout << "Classifier FIRST occurrences: " << total_first_occurrences.load() << '\n';
+        std::cout << "Classifier repeat queries: " << total_repeat_queries.load() << '\n';
+        std::cout << "Classifier recovered FIRSTs: " << total_recovered_firsts.load() << '\n';
+        std::cout << "Classifier FIRST query conservation: "
+            << (total_first_occurrences.load() == total_repeat_queries.load()) << '\n';
 #endif
     }
 };

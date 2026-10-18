@@ -11,12 +11,17 @@
 #include "FastqPreReader.h"
 #include "FastqParser.h"
 #include "FastqPreParser.h"
+#include "LowFrequencyReader.h"
 #include "definition.h"
 
+#include <charconv>
+#include <cstring>
+#include <stdexcept>
 #include <chrono>
 #include <iostream>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <memory>
 #include <limits>
@@ -206,7 +211,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     }
 #ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
-    std::cout << "Total Bloom Filter size: " << total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
+    std::cout << "Total Bloom Filter size: " << 2 * total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
 #endif
 }
 
@@ -316,6 +321,8 @@ int process_main()
 
     const uint32_t remaining = n_thread - reader_num - 1;  // -1: export writer
     const uint32_t parser_num = std::max(1U, remaining / 10);
+    constexpr uint32_t low_reader_num = 1;
+    const uint32_t low_parser_num = reader_num + parser_num - low_reader_num;
     const uint32_t worker_budget = remaining - parser_num;
 
     const auto init_start = std::chrono::steady_clock::now();
@@ -413,6 +420,9 @@ int process_main()
         sampled_gz_compressed_bytes += pr->get_sampled_gz_compressed_bytes();
     }
 
+    // 预读线程已结束，质量值和采样统计已保存。
+    pre_readers.clear();
+
     // 根据采样得到的实际解压比重新估计完整 FASTQ 大小(替代原来的 *4)
     uint64_t total_plain_file_size = 0;
     uint64_t total_gz_compressed_file_size = 0;
@@ -471,6 +481,8 @@ int process_main()
     const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
     const bool high_quailty = (avgQuality >= 33 + 30);
     const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
+    const size_t first_ring_max_bytes = std::min<size_t>(MAX_FIRST_OCCURRENCE_RING_BYTES,
+        memory_limit * 1024ULL * 1024ULL * 1024ULL / 8 / classifier_num);
     const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
     const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
 
@@ -504,19 +516,18 @@ int process_main()
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
     auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<N>>(k_len, tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
-    auto parser_thread_pool = std::make_shared<ParserThreadPool<N>>(k_len, classifier_task_queues, global_classifier_task_queue.get(), pool.get(), reader_parser_ring_pool.get(), parser_classifier_ring_pool.get(), parser_num);
+    auto parser_thread_pool = std::make_shared<ParserThreadPool<N>>(k_len, classifier_task_queues, global_classifier_task_queue.get(), pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
-    auto export_writer = std::make_shared<ExportWriter<N>>(k_len, export_ring_pool.get());
+    auto export_writer = std::make_shared<ExportWriter<N>>(k_len, export_ring_pool.get(), temp_dir + "low.pending.bin");
 
     // 正式计数阶段
     reader_parser_ring_pool->reset_producers(reader_num);
     parser_classifier_ring_pool->reset_producers(parser_num);
-    // 初始化最终排干(drain)阶段所需的初始任务
+    // 预置最终导出任务，第二阶段回灌完成后才执行。
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
-    ReaderThreadPool<N> reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_num, reader_parser_ring_pool.get());
-    // FastqClassifier<N> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
+    auto reader_pool = std::make_unique<ReaderThreadPool<N>>(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_num, reader_parser_ring_pool.get());
 
     const auto init_end = std::chrono::steady_clock::now();
 
@@ -524,48 +535,103 @@ int process_main()
 
     const auto read_start = std::chrono::steady_clock::now();
 
-    reader_pool.start();
-    parser_thread_pool->start();
-    classifier_thread_pool->start();
+    reader_pool->start();
+    parser_thread_pool->start(*reader_parser_ring_pool);
+    classifier_thread_pool->start(first_ring_max_bytes);
     task_thread_pool->start();
     export_writer->start();
 
-    // classifier.classify_and_push();
-    // task_thread_pool->mark_producer_done(); // 显式标记 Classifier 的生产者角色完成，通知 Scheduler 不再有新数据
-
-    reader_pool.join();
+    reader_pool->join();
     const auto read_end = std::chrono::steady_clock::now();
+    reader_pool.reset();
 
     // 阻塞等待 Parser 线程将所有文件块解析并生成 k-mer 完成
     parser_thread_pool->join();
     const auto parser_end = std::chrono::steady_clock::now();
-    classifier_thread_pool->join();
+    reader_parser_ring_pool.reset();
+    classifier_thread_pool->wait_for_first_pass();
     const auto classifier_end = std::chrono::steady_clock::now();
 
-    // 标记所有的缓存已经发送完毕，向导出环形队列发送 nullptr 或退出标志
+    // 第一阶段临时低频已全部提交，通知 Writer 排空队列并结束。
     const auto export_join_start = std::chrono::steady_clock::now();
     tree->mark_finish_export();
-    // 阻塞等待导出器将所有低频 k-mer 都安全写入磁盘完成
+    // 等待 low.pending.bin 写完后再开始回读。
     export_writer->join();
     const auto export_join_end = std::chrono::steady_clock::now();
 
-    // 阻塞等待 Tasker 线程消费完所有的分发任务
+    // 第二阶段：保留 Classifier 和 Bloom，回读临时低频并补齐首次出现。
+    // Scheduler 继续处理入树任务，此时不进入 final drain。
+    const auto low_start = std::chrono::steady_clock::now();
+    const bool write_low = filter_min <= 1 && filter_max >= 1;
+    parser_classifier_ring_pool->reset_producers(low_parser_num);
+    std::unique_ptr<ExportWriter<N>> low_writer;
+    if (write_low) {
+        export_ring_pool->reset_producers(1);
+        low_writer = std::make_unique<ExportWriter<N>>(k_len, export_ring_pool.get(), temp_dir + "low.final.tmp");
+        low_writer->start();
+    }
+    [[maybe_unused]] uint64_t low_records_read = 0;
+    {
+        SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> low_ring_pool(
+            LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, low_reader_num);
+        LowFrequencyReader low_reader(k_len, low_ring_pool);
+        parser_thread_pool->start_low_pass(low_ring_pool, low_parser_num);
+        low_reader.start(temp_dir + "low.pending.bin");
+        classifier_thread_pool->start_low_pass();
+        low_reader.join();
+        parser_thread_pool->join();
+        low_records_read = low_reader.records_read();
+    }
+    classifier_thread_pool->join();
+    if (write_low) {
+        tree->mark_finish_export();
+        low_writer->join();
+    } else {
+        const int low_fd = ::open((temp_dir + "low.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (low_fd < 0) {
+            std::perror("Failed to create empty final low file");
+            std::exit(-1);
+        }
+        if (::close(low_fd) != 0) {
+            std::perror("Failed to close empty final low file");
+            std::exit(-1);
+        }
+    }
+    const uint64_t low_records_unrecovered = classifier_thread_pool->low_records_scanned
+        - classifier_thread_pool->low_records_recovered;
+    const uint64_t low_records_kept = write_low ? low_records_unrecovered : 0;
+    const uint64_t low_records_discarded = write_low ? 0 : low_records_unrecovered;
+    const auto low_end = std::chrono::steady_clock::now();
+
+    // 所有 Classifier 已完成回灌和本地 root flush，再进入 final drain。
+    // Scheduler 排空剩余任务，直接导出 high.bin。
+    const auto final_start = std::chrono::steady_clock::now();
     task_thread_pool->join();
+    const auto final_end = std::chrono::steady_clock::now();
+    if (::rename((temp_dir + "low.final.tmp").c_str(), (temp_dir + "low.bin").c_str()) != 0) {
+        std::perror("Failed to publish final low file");
+        std::exit(-1);
+    }
+    if (::unlink((temp_dir + "low.pending.bin").c_str()) != 0) {
+        std::perror("Failed to remove pending low file");
+        std::exit(-1);
+    }
 
     const auto task_end = std::chrono::steady_clock::now();
 
     const auto mid_end = std::chrono::steady_clock::now();
 
-    const auto final_start = std::chrono::steady_clock::now();
-
-    // Final drain 阶段：多线程并行遍历整个字典树，将在节点中暂存但未下发的 k-mers 全部合并到全局哈希表中
-    // tree->final_drain_parallel(n_thread, std::max(1U, tasker_num - 1U));
-
     std::cout << "Total read k-mer count: " << parser_thread_pool->get_total_read_kmer() << std::endl;
+    std::cout << "Low frequency records scanned: " << classifier_thread_pool->low_records_scanned << std::endl;
+    std::cout << "Low frequency records recovered: " << classifier_thread_pool->low_records_recovered << std::endl;
+    std::cout << "Low frequency records kept: " << low_records_kept << std::endl;
+    std::cout << "Low frequency records discarded: " << low_records_discarded << std::endl;
+    std::cout << "Low frequency reconciliation elapsed us: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(low_end - low_start).count() << std::endl;
 
-    const auto final_end = std::chrono::steady_clock::now();
+    const auto total_end = std::chrono::steady_clock::now();
 
-    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
+    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(total_end - init_start).count();
 
 #ifdef TEST_MODE
     const auto init_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(init_end - init_start).count();
@@ -613,7 +679,10 @@ int process_main()
     std::cout << "KmerTree total kmers added: " << tree->total_kmers_added.load() << std::endl;
     std::cout << "Kmer total kmers exported: " << classifier_thread_pool->total_kmers_exported.load() << std::endl;
     std::cout << "Kmer total kmers sent to tree: " << classifier_thread_pool->total_kmers_send_to_tree.load() << std::endl;
-    std::cout << "equal : " << ((tree->total_kmers_added.load() + classifier_thread_pool->total_kmers_exported.load()) == parser_thread_pool->get_total_read_kmer()) << std::endl;
+    std::cout << "equal : " << ((tree->total_kmers_added.load() + low_records_kept + low_records_discarded) == parser_thread_pool->get_total_read_kmer()) << std::endl;
+    std::cout << "Low frequency conservation: "
+        << (low_records_read == classifier_thread_pool->low_records_scanned &&
+            classifier_thread_pool->low_records_scanned == classifier_thread_pool->low_records_recovered + low_records_kept + low_records_discarded) << std::endl;
 
     for (uint32_t i = 0;i < MAX_DEPTH;i++)
     {
@@ -623,6 +692,12 @@ int process_main()
 #endif
 
     std::cout << "High frequency unique k-mer : " << sorted_kmer_count.load() << std::endl;
+    std::cout << "Unique k-mers filtered below filter_min: "
+        << filtered_below_min_count.load(std::memory_order_relaxed)
+            + (filter_min > 1 ? low_records_unrecovered : 0) << std::endl;
+    std::cout << "Unique k-mers filtered above filter_max: "
+        << filtered_above_max_count.load(std::memory_order_relaxed)
+            + (filter_max < 1 ? low_records_unrecovered : 0) << std::endl;
 
 
     return 0;
@@ -631,10 +706,10 @@ int process_main()
 int main(int argc, char* argv[])
 {
 
-    if (argc < 6 || argc > 9)
+    if (argc < 6 || argc > 10)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [count_max=255]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255]" << std::endl;
         return 1;
     }
 
@@ -690,15 +765,32 @@ int main(int argc, char* argv[])
         {
             concurrent_hash_map_max_capacity = std::max<uint64_t>(concurrent_hash_map_min_capacity, std::bit_ceil(std::stoul(argv[6])));
         }
+        const auto parse_count = [](const char* text) -> uint32_t {
+            uint32_t value = 0;
+            const char* end = text + std::strlen(text);
+            const auto result = std::from_chars(text, end, value);
+            if (result.ec != std::errc{} || result.ptr != end)
+                throw std::invalid_argument("invalid count parameter");
+            return value;
+        };
         if (argc >= 8)
         {
-            filter_min = std::stoul(argv[7]);
+            filter_min = parse_count(argv[7]);
         }
         if (argc >= 9)
         {
-            count_max = std::stoul(argv[8]);
+            filter_max = parse_count(argv[8]);
+        }
+        if (argc >= 10)
+        {
+            count_max = parse_count(argv[9]);
         }
 
+        if (filter_min > filter_max)
+        {
+            std::cerr << "filter_min must be <= filter_max" << std::endl;
+            return 1;
+        }
         if (n_thread < 6)
         {
             std::cerr << "n_thread must be >= 6" << std::endl;
@@ -714,19 +806,20 @@ int main(int argc, char* argv[])
         std::cout << "  Memory limit (GB): " << memory_limit << std::endl;
         std::cout << "  Map capacity: " << concurrent_hash_map_max_capacity << std::endl;
         std::cout << "  Filter min: " << filter_min << std::endl;
+        std::cout << "  Filter max: " << filter_max << std::endl;
         std::cout << "  Count max: " << count_max << std::endl;
     }
     catch (const std::exception&)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [count_max]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255]" << std::endl;
         return 1;
     }
 
     if (concurrent_hash_map_max_capacity <= 1 || concurrent_hash_map_min_capacity > concurrent_hash_map_max_capacity || count_max == 0)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min] [count_max]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255]" << std::endl;
         return 1;
     }
 

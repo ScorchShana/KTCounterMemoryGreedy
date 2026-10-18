@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 // 系统头文件
 #include <sys/mman.h>
@@ -178,6 +179,10 @@ public:
     // 分配可变大小的块，失败时调用 std::exit(-1)
     void* allocate_large(size_t bytes);
 
+    // 指定 Arena 的连续页分配，地址和大小按 PAGE_SIZE 对齐。
+    // 不使用 TLS、空闲链表或其他 Arena。
+    void* allocate_large_from_numa(size_t bytes, int numa_node);
+
     // 释放一个之前分配的块
     void deallocate(void* ptr);
 
@@ -283,6 +288,7 @@ private:
 
     // 友元类
     friend struct ThreadLocalCache;
+    friend struct ConcurrentMemoryPoolTestAccess;
 };
 
 //==============================================================================
@@ -980,6 +986,22 @@ inline int ConcurrentMemoryPool::get_thread_arena_index() const
 inline ThreadLocalCache& ConcurrentMemoryPool::get_thread_local_cache()
 {
     return tls_cache_;
+}
+
+inline void* ConcurrentMemoryPool::allocate_large_from_numa(size_t bytes, int numa_node)
+{
+    if (!arenas_initialized_.load(std::memory_order_acquire) ||
+        numa_node < 0 || numa_node >= num_arenas_ || bytes == 0 ||
+        bytes > std::numeric_limits<size_t>::max() - (PAGE_SIZE - 1))
+    {
+        std::cerr << "allocate_large_from_numa invalid allocation or uninitialized arenas" << std::endl;
+        std::exit(-1);
+    }
+    if (char* ptr = bump_allocate_from_arena(arenas_[numa_node], bytes))
+        return ptr;
+
+    std::cerr << "allocate_large_from_numa out of memory on node " << numa_node << std::endl;
+    std::exit(-1);
 }
 
 inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)

@@ -229,6 +229,7 @@ public:
         {
             if (owner_contents[owner].length == 0)
             {
+                parser_classifier_ring_pool->consumer_enqueue(owner_contents[owner].data);
                 continue;
             }
             enqueue_content_to_classifier(owner);

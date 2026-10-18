@@ -328,8 +328,8 @@ public:
         release_spare_block();
     }
 
-    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>,
-        PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)>& kmer_block_for_copy,
+    template <size_t BlockCapacity>
+    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>, BlockCapacity>& kmer_block_for_copy,
         std::array<uint32_t, 1ULL << (2 * ROOT_BASES)>& kmer_prefix_counts,
         const std::array<uint32_t, 1ULL << (2 * ROOT_BASES)>& prefix_ordered_by_owner,
         const uint32_t cnt,
@@ -438,6 +438,71 @@ public:
         }
     }
 
+    // 向当前 Classifier 的一个本地 root 批量追加，不访问共享 root 的锁。
+    void main_add_kmers_to_local_root(const kmer<N>* kmers, uint64_t count,
+        const uint32_t prefix, node<N>* local_root_nodes)
+    {
+        constexpr uint32_t capacity = get_block_capacity();
+        node<N>* local_root = local_root_nodes + prefix;
+        auto queue_ptr = layer_queue_->get_queue(0);
+        uint32_t enqueued_count = 0;
+
+        while (count > 0)
+        {
+            kmer_block<N>* block = local_root->active_block;
+            if (block == nullptr || block->count == capacity)
+            {
+                if (local_root->count == MAX_KMER_BLOCK_NUM)
+                {
+                    Task<N> task{};
+                    task.current_node = root_nodes + prefix;
+                    task.depth = 0;
+                    task.kmer_blocks = local_root->kmer_blocks;
+                    task.count = local_root->count;
+#ifdef TEST_MODE
+                    const uint64_t start_cycles = __rdtsc();
+#endif
+                    if (queue_ptr->try_enqueue(task))
+                    {
+                        classifier_enqueue_spin_backoff.reset();
+                    }
+                    else
+                    {
+                        classifier_enqueue_spin_backoff.backoff();
+                        while (!queue_ptr->try_enqueue(task))
+                        {
+                            classifier_enqueue_spin_backoff.backoff();
+                        }
+                        classifier_enqueue_spin_backoff.decay();
+                    }
+#ifdef TEST_MODE
+                    classifier_wait_cycles += __rdtsc() - start_cycles;
+#endif
+                    ++enqueued_count;
+                    local_root->count = 0;
+                }
+
+                block = reinterpret_cast<kmer_block<N>*>(memory_pool->allocate());
+                block->count = 0;
+                local_root->active_block = block;
+                local_root->kmer_blocks[local_root->count++] = block;
+            }
+
+            const uint64_t copy_count = std::min<uint64_t>(capacity - block->count, count);
+            std::memcpy(block->k_mers.data() + block->count, kmers, copy_count * sizeof(kmer<N>));
+            block->count += copy_count;
+            kmers += copy_count;
+            count -= copy_count;
+#ifdef TEST_MODE
+            total_kmers_added.fetch_add(copy_count, std::memory_order_relaxed);
+#endif
+        }
+        if (enqueued_count > 0)
+        {
+            layer_queue_->increase_size(0, enqueued_count);
+        }
+    }
+
     // 线程池工作线程函数
     void thread_add_kmer(const Task<N>& current_task)
     {
@@ -512,18 +577,19 @@ private:
 
         uint64_t local_size_count = 0;
 
-        thread_local_counting_hash_map.clear();
+        auto& local_map = thread_local_counting_hash_map;
+        local_map.clear();
         for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
         {
             kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
-
-            for (uint64_t i = 0; i < input_kmer_block->count; ++i)
+            uint64_t kmer_count = input_kmer_block->count;
+            for (uint64_t i = 0; i < kmer_count; ++i)
             {
-                thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i]);
+                local_map.increment(input_kmer_block->k_mers[i]);
             }
         }
 
-        uint64_t hash_map_capacity = std::bit_ceil(thread_local_counting_hash_map.size() * 5 / 4);
+        uint64_t hash_map_capacity = std::bit_ceil(local_map.size() * 5 / 4);
         hash_map_capacity = std::max<uint64_t>(hash_map_capacity, concurrent_hash_map_min_capacity);
         hash_map_capacity = std::min<uint64_t>(hash_map_capacity, concurrent_hash_map_max_capacity);
         ConcurrentOpenAddressHashMap<N>* hash_map = ensure_hash_map(parent, hash_map_capacity);
@@ -586,7 +652,8 @@ private:
             for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
             {
                 kmer_block<N>* block_ptr = current_task.kmer_blocks[block_index];
-                for (uint64_t index = 0; index < block_ptr->count; index++)
+                const uint64_t kmer_count = block_ptr->count;
+                for (uint64_t index = 0; index < kmer_count; index++)
                 {
                     const uint64_t prefix = get_node_prefix(block_ptr->k_mers[index], depth);
                     thread_local_block_prefix_counts[prefix]++;
@@ -602,7 +669,8 @@ private:
             for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
             {
                 kmer_block<N>* block_ptr = current_task.kmer_blocks[block_index];
-                for (uint64_t index = 0; index < block_ptr->count; index++)
+                const uint64_t kmer_count = block_ptr->count;
+                for (uint64_t index = 0; index < kmer_count; index++)
                 {
                     const uint64_t prefix = get_node_prefix(block_ptr->k_mers[index], depth);
                     const uint64_t pos = thread_local_block_prefix_sums[prefix];
@@ -938,8 +1006,12 @@ public:
         dealing_root_index = root_node - root_nodes;
 #endif
 
-        std::vector<DrainFrame> node_stack;
-        std::vector<Task<N>> drain_stack;
+        static thread_local std::vector<DrainFrame> node_stack;
+        static thread_local std::vector<Task<N>> drain_stack;
+
+        // 清空上一根节点的内容，保留已经分配的容量。
+        node_stack.clear();
+        drain_stack.clear();
 
         node_stack.reserve(1024);
         drain_stack.reserve(1024);
@@ -1331,8 +1403,14 @@ private:
 
     void append_export_record(FinalDrainWriter<N>& writer, const kmer<N>& key, const uint32_t count)
     {
-        if (count + 1 < filter_min || count > filter_max)
+        if (count < filter_min)
         {
+            ++writer.local_filtered_below_min_count;
+            return;
+        }
+        if (count > filter_max)
+        {
+            ++writer.local_filtered_above_max_count;
             return;
         }
 
