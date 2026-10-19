@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstring>
 #include <utility>
+#include <vector>
+#include <algorithm>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -32,23 +34,23 @@
  * @tparam ValueType Counter type (default uint16_t)
  * @tparam MaxBytes Maximum memory usage (default 128 KB)
  */
-template <
-    uint32_t N,
-    typename ValueType = uint16_t>
+template <typename ValueType = uint16_t>
 class CountingHashMap
 {
 
 public:
-    using KeyType = kmer<N>;
 
-    CountingHashMap() = default;
+    CountingHashMap()
+        : bytes_(kmer_bytes()), RAW_CAPACITY(MAX_KMER_BLOCK_NUM * (4092 / bytes_)),
+          CAPACITY(std::max(GROUP_SIZE, std::bit_ceil((RAW_CAPACITY * 8 + 6) / 7))),
+          controls_(CAPACITY + GROUP_SIZE - 1), keys_(CAPACITY * bytes_), counts_(CAPACITY) {}
 
     /**
      * @brief Increment the count for a key, or insert with value 1 if not exists
      * @param key The key to increment
      * @return true if successful, false if table is full
      */
-    void increment(const KeyType& key);
+    void increment(const unsigned char* key);
 
     /**
      * @brief Iterate over all entries
@@ -75,7 +77,7 @@ public:
 
     // Status queries
     [[nodiscard]] size_t size() const { return size_; }
-    [[nodiscard]] constexpr size_t capacity() const { return CAPACITY; }
+    [[nodiscard]] size_t capacity() const { return CAPACITY; }
     [[nodiscard]] float load_factor() const
     {
         return static_cast<float>(size_) / CAPACITY;
@@ -94,19 +96,12 @@ private:
     static constexpr size_t GROUP_SIZE = 8;
 #endif
 
-    // Compile-time constants
-    static constexpr size_t ENTRY_SIZE = sizeof(KeyType) + sizeof(ValueType) + sizeof(uint8_t); // Key + Value + control byte
-    static constexpr size_t RAW_CAPACITY = MAX_KMER_BLOCK_NUM * KMER_BLOCK_SIZE / sizeof(KeyType); // Key + Value + control byte
-    static_assert(RAW_CAPACITY >= GROUP_SIZE, "MaxBytes too small for CountingHashMap");
-    static constexpr size_t CAPACITY = std::bit_ceil(RAW_CAPACITY * 8 / 7);
-    static constexpr double MAX_LOAD_FACTOR = 0.875; // recommended load factor
+    const size_t bytes_;
+    const size_t RAW_CAPACITY;
+    const size_t CAPACITY;
 
-    // Hash function
-    static uint64_t hash_key(const KeyType& key)
-    {
-        const uint64_t h = rapidhash(&key, sizeof(KeyType));
-        return h;
-    }
+    uint64_t hash_key(const unsigned char* key) const
+    { return rapidhash(key, bytes_); }
 
     // Extract fingerprint from hash (high 8 bits, ensure non-zero)
     static uint8_t fingerprint(const uint64_t h)
@@ -157,22 +152,22 @@ private:
 public:
     // Data members
     // Extra GROUP_SIZE-1 bytes for safe SIMD load at boundary (no branch needed)
-    alignas(32) uint8_t controls_[CAPACITY + GROUP_SIZE - 1] = {};
+    std::vector<uint8_t> controls_;
 
-    KeyType keys_[CAPACITY];
-    ValueType counts_[CAPACITY] = {};
+    std::vector<unsigned char> keys_;
+    std::vector<ValueType> counts_;
 
 
 };
 
 // Implementation
-template <uint32_t N, typename ValueType>
-void CountingHashMap<N, ValueType>::increment(const KeyType& key)
+template <typename ValueType>
+void CountingHashMap<ValueType>::increment(const unsigned char* key)
 {
 
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
-    constexpr size_t MOD = CAPACITY - 1;
+    const size_t MOD = CAPACITY - 1;
     size_t base = h & MOD;
     size_t offset = 0;
 
@@ -204,7 +199,7 @@ void CountingHashMap<N, ValueType>::increment(const KeyType& key)
         {
             int bit = __builtin_ctz(match_mask);
             size_t slot = (base + bit) & MOD;
-            if (keys_[slot] == key)
+            if (std::memcmp(keys_.data() + slot * bytes_, key, bytes_) == 0)
             {
                 counts_[slot]++;
                 return;
@@ -234,7 +229,7 @@ void CountingHashMap<N, ValueType>::increment(const KeyType& key)
             if (slot < GROUP_SIZE - 1) {
                 controls_[CAPACITY + slot] = fp;
             }
-            keys_[slot] = key;
+            std::memcpy(keys_.data() + slot * bytes_, key, bytes_);
             counts_[slot] = 1;
             ++size_;
             return;
@@ -248,16 +243,16 @@ void CountingHashMap<N, ValueType>::increment(const KeyType& key)
     }
 }
 
-template <uint32_t N, typename ValueType>
+template <typename ValueType>
 template <typename Func>
-void CountingHashMap<N, ValueType>::for_each(Func&& func)
+void CountingHashMap<ValueType>::for_each(Func&& func)
 {
 #if defined(__AVX2__)
     constexpr size_t WIDTH = 32;
     for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        const __m256i ctrl = _mm256_load_si256(
-            reinterpret_cast<const __m256i*>(controls_ + base));
+        const __m256i ctrl = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(controls_.data() + base));
         uint32_t occupied = ~static_cast<uint32_t>(_mm256_movemask_epi8(
             _mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256())));
 
@@ -265,7 +260,7 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func)
         {
             const unsigned lane = std::countr_zero(occupied);
             const size_t slot = base + lane;
-            func(keys_[slot], counts_[slot]);
+            func(keys_.data() + slot * bytes_, counts_[slot]);
             occupied &= occupied - 1;
         }
     }
@@ -274,8 +269,8 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func)
     constexpr size_t WIDTH = 16;
     for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        const __m128i ctrl = _mm_load_si128(
-            reinterpret_cast<const __m128i*>(controls_ + base));
+        const __m128i ctrl = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(controls_.data() + base));
         uint32_t occupied = ~static_cast<uint32_t>(_mm_movemask_epi8(
             _mm_cmpeq_epi8(ctrl, _mm_setzero_si128()))) & 0xffffU;
         
@@ -283,26 +278,26 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func)
         {
             const unsigned lane = std::countr_zero(occupied);
             const size_t slot = base + lane;
-            func(keys_[slot], counts_[slot]);
+            func(keys_.data() + slot * bytes_, counts_[slot]);
             occupied &= occupied - 1;
         }
     }
 #else
     for (size_t i = 0; i < CAPACITY; ++i)
-        if (controls_[i] != 0) func(keys_[i], counts_[i]);
+        if (controls_[i] != 0) func(keys_.data() + i * bytes_, counts_[i]);
 #endif
 }
 
-template <uint32_t N, typename ValueType>
+template <typename ValueType>
 template <typename Func>
-void CountingHashMap<N, ValueType>::for_each(Func&& func) const
+void CountingHashMap<ValueType>::for_each(Func&& func) const
 {
 #if defined(__AVX2__)
     constexpr size_t WIDTH = 32;
     for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        const __m256i ctrl = _mm256_load_si256(
-            reinterpret_cast<const __m256i*>(controls_ + base));
+        const __m256i ctrl = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(controls_.data() + base));
         uint32_t occupied = ~static_cast<uint32_t>(_mm256_movemask_epi8(
             _mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256())));
 
@@ -310,7 +305,7 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func) const
         {
             const unsigned lane = std::countr_zero(occupied);
             const size_t slot = base + lane;
-            func(keys_[slot], counts_[slot]);
+            func(keys_.data() + slot * bytes_, counts_[slot]);
             occupied &= occupied - 1;
         }
     }
@@ -319,8 +314,8 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func) const
     constexpr size_t WIDTH = 16;
     for (size_t base = 0; base < CAPACITY; base += WIDTH)
     {
-        const __m128i ctrl = _mm_load_si128(
-            reinterpret_cast<const __m128i*>(controls_ + base));
+        const __m128i ctrl = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(controls_.data() + base));
         uint32_t occupied = ~static_cast<uint32_t>(_mm_movemask_epi8(
             _mm_cmpeq_epi8(ctrl, _mm_setzero_si128()))) & 0xffffU;
 
@@ -328,20 +323,20 @@ void CountingHashMap<N, ValueType>::for_each(Func&& func) const
         {
             const unsigned lane = std::countr_zero(occupied);
             const size_t slot = base + lane;
-            func(keys_[slot], counts_[slot]);
+            func(keys_.data() + slot * bytes_, counts_[slot]);
             occupied &= occupied - 1;
         }
     }
 #else
     for (size_t i = 0; i < CAPACITY; ++i)
-        if (controls_[i] != 0) func(keys_[i], counts_[i]);
+        if (controls_[i] != 0) func(keys_.data() + i * bytes_, counts_[i]);
 #endif
 }
 
-template <uint32_t N, typename ValueType>
-void CountingHashMap<N, ValueType>::clear()
+template <typename ValueType>
+void CountingHashMap<ValueType>::clear()
 {
-    std::memset(controls_, 0, CAPACITY + GROUP_SIZE - 1);
+    std::memset(controls_.data(), 0, CAPACITY + GROUP_SIZE - 1);
     size_ = 0;
 }
 

@@ -154,75 +154,24 @@ constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 128KB/�
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 
-// 前置声明模板
+// Set once, before constructing pipeline objects or starting threads.
+inline uint32_t k_length = 0;
+inline size_t kmer_bytes() noexcept { return (k_length + 3) / 4; }
 
-template <uint32_t N>
-struct kmer;
-
-template <uint32_t N>
 struct kmer_block;
-
-template <uint32_t N>
 struct node;
 
-template <uint32_t N>
-union super_block_ptr;
-
-// 线程内部缓存桶
-template <uint32_t N>
-struct ThreadLocalBin
-{
-    std::array<kmer<N>, KMER_BIN_SIZE / sizeof(kmer<N>)> buffer;
-    uint64_t count = 0;
-};
-
-// 线程任务结构体
-template <uint32_t N>
 struct alignas(64) Task
 {
-    // constexpr static uint32_t MAX_KMER_BLOCK_NUM = (NODE_SIZE - CACHE_LINE_SIZE - sizeof(uint64_t)
-    // - sizeof(lock_type) - sizeof(kmer_block<N> *)) / sizeof(kmer_block<N> *);
-
-    node<N>* current_node = nullptr; // 需要下方的节点
-    uint64_t depth;                  // 需要下方的节点的深度，与LayerQueues的层级对应
+    node* current_node = nullptr;
+    uint64_t depth;
     uint64_t count;
-    std::array<kmer_block<N>*, MAX_KMER_BLOCK_NUM> kmer_blocks{};
-
-    Task() = default;
-    Task& operator=(const Task<N>& a) = default;
-    Task(const Task<N>& a) = default;
+    std::array<kmer_block*, MAX_KMER_BLOCK_NUM> kmer_blocks{};
 };
 
-template <uint32_t N>
-struct KmerBatch
+struct ExportBlock
 {
-    static constexpr uint64_t KMER_BATCH_CAPACITY = (KMER_BATCH_SIZE - sizeof(uint64_t) * 2) / sizeof(kmer<N>);
-    uint64_t k_mers_count = 0;
-    uint64_t prefix; // 用于路由的前缀信息
-    std::array<kmer<N>, KMER_BATCH_CAPACITY> k_mers;
-};
-
-template <uint32_t N>
-struct alignas(PAGE_SIZE) ExportBlock
-{
-    std::array<kmer<N>, EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> k_mers;
-};
-
-template <uint32_t N>
-struct concurrent_node
-{
-    static_assert(std::is_trivially_copyable_v<kmer<N>>, "kmer<N> must be trivially copyable");
-    kmer<N> k_mer;
-    concurrent_node* next{ nullptr };
-    std::atomic<uint32_t> count{ 0 };
-};
-
-// FinalDrain 导出使用的结构体
-template <uint32_t N>
-struct ExportRecord
-{
-    kmer<N> key;
-    uint32_t count;
+    std::array<unsigned char, EXPORT_RING_MEMORY_POOL_BLOCK_SIZE> k_mers;
 };
 
 // 写入k-mer计数

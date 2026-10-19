@@ -2,7 +2,7 @@
 #define PARTITION_HEADER
 
 #include "../src/definition.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <cerrno>
 #include <cstdint>

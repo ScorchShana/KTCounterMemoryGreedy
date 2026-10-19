@@ -21,14 +21,14 @@
 namespace
 {
 constexpr uint32_t kWords = 2;
-using Map = ConcurrentOpenAddressHashMap<kWords>;
-using Kmer = kmer<kWords>;
+using Map = ConcurrentOpenAddressHashMap;
+using Kmer = std::vector<unsigned char>;
 
 struct KmerLess
 {
     bool operator()(const Kmer& lhs, const Kmer& rhs) const noexcept
     {
-        return lhs.data < rhs.data;
+        return lhs < rhs;
     }
 };
 
@@ -78,9 +78,11 @@ private:
 
 Kmer make_kmer(uint64_t value)
 {
-    Kmer key{};
-    key.data[0] = value * 0x9e3779b97f4a7c15ULL + 0x85ebca77c2b2ae63ULL;
-    key.data[1] = (value ^ 0xd1b54a32d192ed03ULL) * 0xbf58476d1ce4e5b9ULL;
+    Kmer key(kmer_bytes());
+    for (size_t i = 0; i < key.size(); ++i) {
+        key[i] = static_cast<unsigned char>(value);
+        value = (value >> 8) ^ (value * 0x9e3779b97f4a7c15ULL);
+    }
     return key;
 }
 
@@ -132,14 +134,14 @@ Snapshot take_snapshot(const Map& map)
         });
 
     map.debug_visit_entries(
-        [&](uint64_t segment_index, const Kmer& key, uint32_t count)
+        [&](uint64_t segment_index, const unsigned char* bytes, uint32_t count)
         {
             if (snapshot.segments.size() <= segment_index)
             {
                 snapshot.segments.resize(static_cast<size_t>(segment_index + 1));
             }
             ++snapshot.segments[static_cast<size_t>(segment_index)].entries;
-            const auto [it, inserted] = snapshot.counts.emplace(key, count);
+            const auto [it, inserted] = snapshot.counts.emplace(Kmer(bytes, bytes + kmer_bytes()), count);
             if (!inserted)
             {
                 snapshot.duplicate_key = true;
@@ -244,7 +246,7 @@ std::vector<Kmer> find_keys_for_slot(uint64_t capacity,
     while (keys.size() < count && cursor < 100'000'000ULL)
     {
         Kmer key = make_kmer(cursor++);
-        if ((Map::hash_key(key) & (capacity - 1)) == slot)
+        if ((Map::hash_key(key.data()) & (capacity - 1)) == slot)
         {
             keys.push_back(key);
         }
@@ -257,7 +259,7 @@ bool insert_one(Map& map,
     uint64_t& local_count,
     Counts& expected)
 {
-    map.increment(op.key, op.value, local_count);
+    map.increment(op.key.data(), op.value, local_count);
     add_expected(expected, op);
     return true;
 }
@@ -283,7 +285,7 @@ long long run_parallel(Map& map,
                 const auto start = std::chrono::steady_clock::now();
                 for (const Operation& op : operations[thread_index])
                 {
-                    map.increment(op.key, op.value, local_counts[thread_index]);
+                    map.increment(op.key.data(), op.value, local_counts[thread_index]);
                 }
                 const auto end = std::chrono::steady_clock::now();
                 const long long elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -476,7 +478,7 @@ bool test_collision_and_fingerprint_boundaries()
     while (cursor < 100'000'000ULL)
     {
         Kmer candidate = make_kmer(cursor++);
-        if (Map::fingerprint(Map::hash_key(candidate)) == 0x80U)
+        if (Map::fingerprint(Map::hash_key(candidate.data())) == 0x80U)
         {
             fingerprint_80 = candidate;
             found_fingerprint = true;
@@ -489,13 +491,13 @@ bool test_collision_and_fingerprint_boundaries()
         return false;
     }
 
-    const uint8_t collision_fingerprint = Map::fingerprint(Map::hash_key(keys.front()));
+    const uint8_t collision_fingerprint = Map::fingerprint(Map::hash_key(keys.front().data()));
     Kmer same_fingerprint{};
     bool found_same_fingerprint = false;
     while (cursor < 100'000'000ULL)
     {
         Kmer candidate = make_kmer(cursor++);
-        if (Map::fingerprint(Map::hash_key(candidate)) == collision_fingerprint &&
+        if (Map::fingerprint(Map::hash_key(candidate.data())) == collision_fingerprint &&
             !(candidate == keys.front()))
         {
             same_fingerprint = candidate;
@@ -621,8 +623,9 @@ struct RaceController
 
 RaceController* active_race_controller = nullptr;
 
-void race_hook(Map::DebugEvent event, const Map*, const Kmer& key)
+void race_hook(Map::DebugEvent event, const Map*, const unsigned char* bytes)
 {
+    const Kmer key(bytes, bytes + kmer_bytes());
     if (active_race_controller != nullptr)
     {
         active_race_controller->on_event(event, key);
@@ -667,7 +670,7 @@ bool test_sealed_fast_path_race(ConcurrentMemoryPool& pool)
         {
             Map::set_memory_pool(&pool);
             hook_role = ROLE_READER;
-            map.increment(keys[5], 1, reader_local_count);
+            map.increment(keys[5].data(), 1, reader_local_count);
         });
 
     if (!controller.wait_for(&RaceController::reader_before_seen))
@@ -684,7 +687,7 @@ bool test_sealed_fast_path_race(ConcurrentMemoryPool& pool)
         {
             Map::set_memory_pool(&pool);
             hook_role = ROLE_PUBLISHER;
-            map.increment(keys[5], 1, publisher_local_count);
+            map.increment(keys[5].data(), 1, publisher_local_count);
         });
     if (!controller.wait_for(&RaceController::publisher_reserved_seen))
     {
@@ -701,7 +704,7 @@ bool test_sealed_fast_path_race(ConcurrentMemoryPool& pool)
         {
             Map::set_memory_pool(&pool);
             hook_role = ROLE_NONE;
-            map.increment(keys[6], 1, overflow_local_count);
+            map.increment(keys[6].data(), 1, overflow_local_count);
         });
     overflow.join();
 
@@ -786,7 +789,7 @@ bool test_post_cas_sealed_race(ConcurrentMemoryPool& pool)
         {
             Map::set_memory_pool(&pool);
             hook_role = ROLE_CANDIDATE;
-            map.increment(keys[6], 1, candidate_local_count);
+            map.increment(keys[6].data(), 1, candidate_local_count);
         });
     if (!controller.wait_for(&RaceController::candidate_before_cas_seen))
     {
@@ -800,7 +803,7 @@ bool test_post_cas_sealed_race(ConcurrentMemoryPool& pool)
 
     hook_role = ROLE_NONE;
     uint64_t overflow_local_count = 0;
-    map.increment(keys[7], 1, overflow_local_count);
+    map.increment(keys[7].data(), 1, overflow_local_count);
     {
         std::lock_guard<std::mutex> lock(controller.mutex);
         controller.release_candidate = true;
@@ -1020,6 +1023,7 @@ bool run_benchmark(ConcurrentMemoryPool& pool, const BenchmarkConfig& cfg)
 
 int main(int argc, char** argv)
 {
+    k_length = 33;
     count_max = std::numeric_limits<uint32_t>::max();
     ConcurrentMemoryPool pool(512ULL * 1024ULL * 1024ULL);
     pool.init_arenas();

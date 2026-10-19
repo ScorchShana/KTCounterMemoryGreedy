@@ -1,7 +1,7 @@
 #ifndef EXPORT_RECORD_RADIX_SORT_HEADER
 #define EXPORT_RECORD_RADIX_SORT_HEADER
 
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 #include "../src/definition.h"
 
 #include <cstring>
@@ -25,7 +25,7 @@ constexpr uint32_t IGNORE_PREFIX_BITS = 2 * (ROOT_BASES + (MAX_DEPTH - 1) * NODE
 constexpr uint32_t UINT64_BITS = 64;
 
 template <uint32_t N>
-static uint32_t extract_histogram_pos(const kmer<N>& k_mer, const uint32_t& kmer_index,
+static uint32_t extract_histogram_pos(const legacy_kmer<N>& k_mer, const uint32_t& kmer_index,
     const uint32_t& bit_offset)
 {
     // no across uint64_t boundary

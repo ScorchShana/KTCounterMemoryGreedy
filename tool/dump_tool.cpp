@@ -100,7 +100,7 @@ namespace
     };
 
     template <uint32_t N>
-    static char *kmer_to_buf(const kmer<N> &key, uint32_t k_len, char *buf)
+    static char *kmer_to_buf(const legacy_kmer<N> &key, uint32_t k_len, char *buf)
     {
         const uint32_t full_words = k_len / BASES_PER_U64T;
         const uint32_t tail_bases = k_len % BASES_PER_U64T;
@@ -248,7 +248,7 @@ namespace
         }
         ~LineWriter() { writer_->release_buffer(block_, static_cast<size_t>(cursor_ - block_)); }
 
-        void write_line(const kmer<N> &key, uint32_t count)
+        void write_line(const legacy_kmer<N> &key, uint32_t count)
         {
             // Reserve space: k_len bases + tab + count + newline + margin
             if (static_cast<size_t>(block_end_ - cursor_) < static_cast<size_t>(k_len_) + 22)
@@ -324,7 +324,7 @@ namespace
     };
 
     template <uint32_t N>
-    static inline uint8_t extract_base_at(const kmer<N> &key, uint32_t pos,
+    static inline uint8_t extract_base_at(const legacy_kmer<N> &key, uint32_t pos,
                                           uint32_t full_words, uint32_t tail_bases)
     {
         uint32_t word_idx, bit_shift;
@@ -343,7 +343,7 @@ namespace
     }
 
     template <typename KeyT, uint32_t N>
-    static KeyT make_sort_key(const kmer<N> &kmer, uint32_t k_len)
+    static KeyT make_sort_key(const legacy_kmer<N> &kmer, uint32_t k_len)
     {
         const uint32_t full_words = k_len / BASES_PER_U64T;
         const uint32_t tail_bases = k_len % BASES_PER_U64T;
@@ -781,7 +781,7 @@ namespace
             if (start >= end) return;
 
             LineWriter<N> line_writer(writer, k_len);
-            kmer<N> key{};
+            legacy_kmer<N> key{};
 
             for (uint64_t i = start; i < end; ++i) {
                 const char* record = mapped + i * packed_bytes;
@@ -860,7 +860,7 @@ namespace
             uint64_t end   = std::min(start + kmers_per_worker, total_kmers);
             if (start >= end) return;
             auto& local = high_results[tid];
-            kmer<N> key{};
+            legacy_kmer<N> key{};
 
             for (uint64_t i = start; i < end; ++i) {
                 const char* record = mapped + i * packed_bytes;
@@ -917,7 +917,7 @@ namespace
                                          uint32_t k_len)
     {
         LineWriter<N> line_writer(writer, k_len);
-        hash_map.for_each_entry([&](const kmer<N> &key, uint32_t count)
+        hash_map.for_each_entry([&](const legacy_kmer<N> &key, uint32_t count)
                                 {
         if (count > 0 && in_range(count, min_freq, max_freq))
             line_writer.write_line(key, count); });
@@ -929,7 +929,7 @@ namespace
                                               std::vector<ExportRecord<N>> &results,
                                               uint32_t min_freq, uint32_t max_freq)
     {
-        hash_map.for_each_entry([&](const kmer<N> &key, uint32_t count)
+        hash_map.for_each_entry([&](const legacy_kmer<N> &key, uint32_t count)
                                 {
         if (count > 0 && in_range(count, min_freq, max_freq))
             results.push_back({key, count}); });

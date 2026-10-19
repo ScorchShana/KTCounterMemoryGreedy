@@ -13,7 +13,7 @@ namespace
     constexpr uint64_t kBlockBytes = 512;
     constexpr uint32_t kWords = 2;
 
-    using Kmer = kmer<kWords>;
+    using Kmer = legacy_kmer<kWords>;
 
     Kmer make_kmer(uint64_t first, uint64_t second)
     {

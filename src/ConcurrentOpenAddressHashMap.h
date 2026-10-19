@@ -16,7 +16,6 @@
 #include <utility>
 #endif
 
-template <uint32_t N>
 class ConcurrentOpenAddressHashMap
 {
 
@@ -35,18 +34,16 @@ class ConcurrentOpenAddressHashMap
     constexpr static uint8_t INSERTING = 0x01;
     constexpr static double LOAD_FACTOR = 0.8;
 
-    static constexpr std::size_t MAP_SIZE = align_up(sizeof(ConcurrentOpenAddressHashMap<N>), CACHE_LINE_SIZE);
-    static constexpr std::size_t MAP_NUM_PER_BLOCK = KMER_BLOCK_SIZE / MAP_SIZE;
-
+    const size_t bytes_ = kmer_bytes();
     SizeCounter size;
     uint64_t segment_id;
     uint64_t capacity;
     std::atomic<uint8_t>* ctrls;
-    kmer<N>* keys;
+    unsigned char* keys;
     std::atomic<uint32_t>* counts;
     std::atomic<bool> sealed;
     std::atomic<bool> building_next;
-    std::atomic<ConcurrentOpenAddressHashMap<N>*> next_map;
+    std::atomic<ConcurrentOpenAddressHashMap*> next_map;
 
     inline static thread_local std::size_t map_num_in_block = 0;
     inline static thread_local char* map_mem_block = nullptr;
@@ -77,8 +74,8 @@ public:
     };
 
     using DebugHook = void (*)(DebugEvent,
-        const ConcurrentOpenAddressHashMap<N>*,
-        const kmer<N>&);
+        const ConcurrentOpenAddressHashMap*,
+        const unsigned char*);
 
     inline static std::atomic<DebugHook> debug_hook{ nullptr };
 
@@ -88,8 +85,8 @@ public:
     }
 
     static void notify_debug_hook(DebugEvent event,
-        const ConcurrentOpenAddressHashMap<N>* map,
-        const kmer<N>& key)
+        const ConcurrentOpenAddressHashMap* map,
+        const unsigned char* key)
     {
         DebugHook hook = debug_hook.load(std::memory_order_acquire);
         if (hook != nullptr)
@@ -105,8 +102,8 @@ public:
         size.value.store(0, std::memory_order_relaxed);
         char* mem_area = reinterpret_cast<char*>(pool->allocate_large(get_mem_size(capacity)));
         ctrls = reinterpret_cast<std::atomic<uint8_t>*>(mem_area);
-        keys = reinterpret_cast<kmer<N>*>(ctrls + capacity);
-        counts = reinterpret_cast<std::atomic<uint32_t>*>(keys + capacity);
+        keys = reinterpret_cast<unsigned char*>(ctrls + capacity);
+        counts = reinterpret_cast<std::atomic<uint32_t>*>(mem_area + counts_offset(capacity));
         for (uint64_t i = 0; i < capacity; ++i)
         {
             new (ctrls + i) std::atomic<uint8_t>(EMPTY);
@@ -117,14 +114,15 @@ public:
         // }
     }
 
-    static constexpr uint64_t get_mem_size(const uint64_t capacity) {
-        return capacity * sizeof(std::atomic<uint8_t>) + capacity * sizeof(kmer<N>) + capacity * sizeof(std::atomic<uint32_t>);
+    static size_t counts_offset(uint64_t capacity) noexcept {
+        return align_up(capacity * (sizeof(std::atomic<uint8_t>) + kmer_bytes()),
+            alignof(std::atomic<uint32_t>));
     }
-
-    static uint64_t hash_key(const kmer<N>& key)
-    {
-        const uint64_t h = rapidhash(&key, sizeof(kmer<N>));
-        return h;
+    static uint64_t get_mem_size(uint64_t capacity) noexcept {
+        return counts_offset(capacity) + capacity * sizeof(std::atomic<uint32_t>);
+    }
+    static uint64_t hash_key(const unsigned char* key) {
+        return rapidhash(key, kmer_bytes());
     }
 
     // Extract fingerprint from hash (high 7 bits, most significant bit is 1)
@@ -140,18 +138,18 @@ public:
         return capacity;
     }
 
-    ConcurrentOpenAddressHashMap<N>* get_next_map() const
+    ConcurrentOpenAddressHashMap* get_next_map() const
     {
         return next_map.load(std::memory_order_acquire);
     }
 
     // 遍历当前 map 及所有 next_map segment 中的条目。
-    // Visitor 签名为 void(const kmer<N>& key, uint32_t count)。
+    // Visitor 签名为 void(const unsigned char* key, uint32_t count)。
     // 调用方需保证所有写入已结束（如 final drain 阶段），期间不能并发修改。
     template <typename Visitor>
     void for_each_entry(Visitor&& visitor) const
     {
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         while (map != nullptr)
         {
             for (uint64_t i = 0; i < map->capacity; ++i)
@@ -159,7 +157,7 @@ public:
                 const uint8_t ctrl = map->ctrls[i].load(std::memory_order_acquire);
                 if ((ctrl & 0x80U) != 0) [[likely]]
                 {
-                    visitor(map->keys[i], map->counts[i].load(std::memory_order_relaxed));
+                    visitor(map->keys + i * map->bytes_, map->counts[i].load(std::memory_order_relaxed));
                 }
             }
             map = map->next_map.load(std::memory_order_acquire);
@@ -169,7 +167,7 @@ public:
 #ifdef TEST_MODE
     uint32_t get_segment_count()
     {
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         uint32_t cnt = 0;
         while (map != nullptr)
         {
@@ -181,7 +179,7 @@ public:
 
     void count_to_histogram()
     {
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         uint32_t cnt = 0;
         while (map != nullptr)
         {
@@ -196,7 +194,7 @@ public:
         uint64_t singleton_kmers = 0;
         uint64_t unique_kmers = 0;
 
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         while (map != nullptr)
         {
             for (uint64_t i = 0; i < map->capacity; ++i)
@@ -222,11 +220,14 @@ public:
     static void set_memory_pool(ConcurrentMemoryPool* memory_pool)
     {
         pool = memory_pool;
+        map_num_in_block = 0;
         map_mem_block = reinterpret_cast<char*>(pool->allocate());
     }
 
     static char* get_map_metadata_mem()
     {
+        constexpr size_t MAP_SIZE = align_up(sizeof(ConcurrentOpenAddressHashMap), CACHE_LINE_SIZE);
+        constexpr size_t MAP_NUM_PER_BLOCK = KMER_BLOCK_SIZE / MAP_SIZE;
         if (map_num_in_block >= MAP_NUM_PER_BLOCK)
         {
             map_mem_block = reinterpret_cast<char*>(pool->allocate());
@@ -239,7 +240,7 @@ public:
 
     InsertResult try_increment(
         uint64_t h,
-        const kmer<N>& key,
+        const unsigned char* key,
         const uint8_t fp,
         const uint32_t value,
         uint64_t& local_count)
@@ -305,7 +306,7 @@ public:
 #ifdef CONCURRENT_OPEN_ADDRESS_HASH_MAP_TESTING
                         notify_debug_hook(DebugEvent::AFTER_SIZE_RESERVED_BEFORE_PUBLISH, this, key);
 #endif
-                        keys[index] = key;
+                        std::memcpy(keys + index * bytes_, key, bytes_);
                         const uint32_t corrected_value = std::min<uint32_t>(value, count_max);
                         new (counts + index) std::atomic<uint32_t>(corrected_value);
                         ctrls[index].store(fp, std::memory_order_release); // Set the fingerprint
@@ -321,7 +322,7 @@ public:
             }
             else if (ctrl == fp)
             {
-                if (keys[index] == key) [[likely]]
+                if (std::memcmp(keys + index * bytes_, key, bytes_) == 0) [[likely]]
                 {
                     const uint32_t cur = counts[index].load(std::memory_order_relaxed);
                     if (cur < count_max)
@@ -350,11 +351,11 @@ public:
         }
     }
 
-    void increment(const kmer<N>& key, const uint32_t& value, uint64_t& local_count) {
+    void increment(const unsigned char* key, const uint32_t& value, uint64_t& local_count) {
         const uint64_t h = hash_key(key);
         const uint8_t fp = fingerprint(h);
 
-        ConcurrentOpenAddressHashMap<N>* map_ptr = this;
+        ConcurrentOpenAddressHashMap* map_ptr = this;
 
 #ifdef TEST_MODE
         ++segment_probe_time;
@@ -381,7 +382,7 @@ public:
     template <typename Visitor>
     void debug_visit_entries(Visitor&& visitor) const
     {
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         uint64_t segment_index = 0;
         while (map != nullptr)
         {
@@ -391,7 +392,7 @@ public:
                 if ((ctrl & 0x80U) != 0)
                 {
                     visitor(segment_index,
-                        map->keys[i],
+                        map->keys + i * map->bytes_,
                         map->counts[i].load(std::memory_order_relaxed));
                 }
             }
@@ -403,7 +404,7 @@ public:
     template <typename Visitor>
     void debug_visit_segments(Visitor&& visitor) const
     {
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         uint64_t segment_index = 0;
         while (map != nullptr)
         {
@@ -419,7 +420,7 @@ public:
     uint64_t debug_inserting_slot_count() const
     {
         uint64_t inserting_count = 0;
-        const ConcurrentOpenAddressHashMap<N>* map = this;
+        const ConcurrentOpenAddressHashMap* map = this;
         while (map != nullptr)
         {
             for (uint64_t i = 0; i < map->capacity; ++i)
@@ -435,8 +436,8 @@ public:
     }
 #endif
 
-    ConcurrentOpenAddressHashMap<N>* ensure_next_map() {
-        ConcurrentOpenAddressHashMap<N>* next_map_ptr = next_map.load(std::memory_order_acquire);
+    ConcurrentOpenAddressHashMap* ensure_next_map() {
+        ConcurrentOpenAddressHashMap* next_map_ptr = next_map.load(std::memory_order_acquire);
         if (next_map_ptr == nullptr) [[unlikely]]
         {
             if (building_next.load(std::memory_order_acquire))
@@ -469,10 +470,10 @@ public:
                     {
                         // Build the next map
                         uint32_t cur_segment_id = this->segment_id + 1;
-                        ConcurrentOpenAddressHashMap<N>* new_map = reinterpret_cast<ConcurrentOpenAddressHashMap<N>*>(get_map_metadata_mem());
+                        ConcurrentOpenAddressHashMap* new_map = reinterpret_cast<ConcurrentOpenAddressHashMap*>(get_map_metadata_mem());
                         uint64_t new_capacity = cur_segment_id > SEGMENT_WATERMARK ? capacity * 4 : capacity * 2;
                         new_capacity = std::min<uint64_t>(new_capacity, concurrent_hash_map_max_capacity); // Double the capacity for the next map
-                        new(new_map) ConcurrentOpenAddressHashMap<N>(new_capacity);
+                        new(new_map) ConcurrentOpenAddressHashMap(new_capacity);
                         new_map->segment_id = cur_segment_id;
                         next_map.store(new_map, std::memory_order_release);
                         building_next.store(false, std::memory_order_release);

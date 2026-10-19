@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -46,7 +46,7 @@ struct RecordLayout
 };
 
 template <uint32_t N>
-inline void unpack_key(const char* record, const RecordLayout& layout, kmer<N>& key) noexcept
+inline void unpack_key(const char* record, const RecordLayout& layout, legacy_kmer<N>& key) noexcept
 {
     const size_t full_bytes = layout.full_words * sizeof(uint64_t);
     std::memcpy(key.data.data(), record, full_bytes);

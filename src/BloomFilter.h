@@ -2,7 +2,6 @@
 #define BLOOM_FILTER_HEADER
 
 #include "kmer.h"
-#include "HashFunction.h"
 #include "../include/xxh3.h"
 #include "ConcurrentMemoryPool.h"
 
@@ -13,7 +12,6 @@
 #include <cstring>
 #include <memory>
 
-template <uint32_t N>
 class BloomFilter
 {
 
@@ -86,9 +84,9 @@ public:
         filter_bins = nullptr;
     }
 
-    InsertProbe prepare_insert(const kmer<N>& k_mer) const noexcept
+    InsertProbe prepare_insert(const unsigned char* k_mer) const noexcept
     {
-        const auto hash_res = XXH3_128bits(&k_mer, sizeof(k_mer));
+        const auto hash_res = XXH3_128bits(k_mer, kmer_bytes());
         const uint64_t h1 = hash_res.low64;
         const uint64_t h2 = (hash_res.high64 | 1ULL);
 
@@ -112,7 +110,7 @@ public:
         return (old_val & probe.insert_num) != probe.insert_num; // kmer not exists in first filters
     }
 
-    bool insert(const kmer<N>& k_mer) noexcept
+    bool insert(const unsigned char* k_mer) noexcept
     {
         const InsertProbe probe = prepare_insert(k_mer);
         return insert_prepared(probe);
@@ -144,7 +142,6 @@ enum class Occurrence : uint8_t
     REPEAT = 1,
 };
 
-template <uint32_t N>
 class ConcurrentBloomFilter
 {
 
@@ -212,9 +209,9 @@ public:
     {
     }
 
-    InsertProbe prepare_insert(const kmer<N>& k_mer) const noexcept
+    InsertProbe prepare_insert(const unsigned char* k_mer) const noexcept
     {
-        const auto hash_res = XXH3_128bits(&k_mer, sizeof(k_mer));
+        const auto hash_res = XXH3_128bits(k_mer, kmer_bytes());
         const uint64_t h1 = hash_res.low64;
         const uint64_t h2 = hash_res.high64;
 
@@ -250,7 +247,7 @@ public:
         return Occurrence::REPEAT;
     }
 
-    Occurrence insert(const kmer<N>& k_mer) noexcept
+    Occurrence insert(const unsigned char* k_mer) noexcept
     {
         const InsertProbe probe = prepare_insert(k_mer);
         return insert_prepared(probe);
@@ -271,7 +268,7 @@ public:
         return (word & probe.insert_num) == probe.insert_num;
     }
 
-    bool contains_repeat(const kmer<N>& key) const noexcept
+    bool contains_repeat(const unsigned char* key) const noexcept
     {
         return contains_repeat_prepared(prepare_insert(key));
     }

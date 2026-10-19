@@ -25,9 +25,9 @@ namespace
     constexpr uint32_t bench_count_max = 255;
     using Pool = SPMCRingMemoryPool<ring_capacity>;
 
-    kmer<2> key_for(uint64_t id)
+    legacy_kmer<2> key_for(uint64_t id)
     {
-        kmer<2> key{};
+        legacy_kmer<2> key{};
         key.data[0] = id * 0x9e3779b97f4a7c15ULL;
         key.data[1] = ((id ^ (id >> 16) ^ 0xabcde) & 0x3ffff) << 46;
         return key;

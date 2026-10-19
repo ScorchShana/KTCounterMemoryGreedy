@@ -20,7 +20,7 @@ enum Distribution : uint8_t { SEQUENTIAL, RANDOM, REVERSED };
 
 // -------------------- 辅助函数：限制 kmer 长度（保留高 2*k 位，低位清零，保证前20位为0） --------------------
 template <uint32_t N>
-void limit_kmer(kmer<N>& km, uint32_t k) {
+void limit_kmer(legacy_kmer<N>& km, uint32_t k) {
     constexpr uint32_t total_bits = N * 64;
     const uint32_t keep_bits = 2 * k;          // 需要保留的位数
     if (keep_bits >= total_bits) return;       // 全部保留
@@ -61,11 +61,11 @@ void generate_unique_records(std::vector<ExportRecord<N>>& records,
     std::uniform_int_distribution<uint64_t> dist(0, ~0ULL);
 
     // 用 std::set 去重（kmer 支持 operator<）
-    std::set<kmer<N>> unique_set;
+    std::set<legacy_kmer<N>> unique_set;
 
     // 生成足够多的随机 kmer 直至达到数量 num
     while (unique_set.size() < num) {
-        kmer<N> km;
+        legacy_kmer<N> km;
         for (uint32_t i = 0; i < N; ++i) {
             km.data[i] = dist(gen);
         }

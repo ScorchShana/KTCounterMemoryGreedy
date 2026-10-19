@@ -1,5 +1,5 @@
 #include "../tool/FinalDrainReader.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <chrono>
 #include <iostream>

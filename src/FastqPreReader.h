@@ -23,7 +23,6 @@
 #include <thread>
 #include <atomic>
 
-template <uint32_t N>
 class FastqPreReader
 {
 
@@ -68,12 +67,11 @@ class FastqPreReader
 public:
     int k;
 
-    explicit FastqPreReader(const std::vector<std::string>& filenames, const int in_k, uint64_t chunk_size, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
+    explicit FastqPreReader(const std::vector<std::string>& filenames, uint64_t chunk_size, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
         : filenames_(filenames), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
-        k(in_k), chunk_size_(chunk_size)
+        k(k_length), chunk_size_(chunk_size)
     {
         assert(ring_memory_pool_ptr_ != nullptr);
-        assert(k > 0 && k < 128);
         assert(ring_memory_pool_ptr_->blockSize() > 1024);
         if (filenames_.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
 
