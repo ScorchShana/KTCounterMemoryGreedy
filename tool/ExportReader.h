@@ -2,7 +2,7 @@
 #define EXPORT_READER_HEADER
 
 #include "../src/definition.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <algorithm>
 #include <array>
@@ -228,7 +228,7 @@ public:
     }
 
 
-    uint64_t read_kmers(kmer<N>* out_buffer, uint64_t max_kmers_to_read)
+    uint64_t read_kmers(legacy_kmer<N>* out_buffer, uint64_t max_kmers_to_read)
     {
         if (finished()) [[unlikely]]
         {
@@ -352,9 +352,9 @@ private:
         cbs_active[buffer_index] = false;
     }
 
-    void unpack_kmers_from_buffer(const char* src, kmer<N>* output, uint64_t count) const
+    void unpack_kmers_from_buffer(const char* src, legacy_kmer<N>* output, uint64_t count) const
     {
-        // std::memset(output, 0, sizeof(kmer<N>) * count);
+        // std::memset(output, 0, sizeof(legacy_kmer<N>) * count);
 
         for (uint64_t i = 0; i < count; ++i)
         {

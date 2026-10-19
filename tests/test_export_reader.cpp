@@ -9,14 +9,12 @@
 #include <string>
 #include <vector>
 
-#include "../src/ExportWriter.h"
-#include "../src/RingMemoryPool.h"
 #include "../tool/ExportReader.h"
 
 namespace
 {
     constexpr uint32_t kWords = 2;
-    using Kmer = kmer<kWords>;
+    using Kmer = legacy_kmer<kWords>;
 
     Kmer make_kmer(uint64_t first, uint64_t second)
     {
@@ -68,31 +66,17 @@ namespace
     {
         set_test_temp_dir(name);
 
-        RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> pool(
-            EXPORT_RING_MEMORY_POOL_BLOCK_SIZE,
-            1);
-        ExportWriter<kWords> writer(k, &pool);
-
-        size_t offset = 0;
-        while (offset < records.size())
-        {
-            char* block_ptr = nullptr;
-            pool.producer_dequeue(block_ptr);
-
-            auto* export_block = reinterpret_cast<ExportBlock<kWords>*>(block_ptr);
-            const size_t count = std::min(export_block->k_mers.size(), records.size() - offset);
-            for (size_t i = 0; i < count; ++i)
-            {
-                export_block->k_mers[i] = records[offset + i];
-            }
-
-            pool.producer_enqueue(content_type{block_ptr, count});
-            offset += count;
+        // The tools still read the legacy layout; build that fixture directly.
+        std::ofstream output(temp_dir + "low.bin", std::ios::binary);
+        const size_t full = k / 32;
+        const size_t tail = ((k % 32) + 3) / 4;
+        for (const auto& record : records) {
+            const auto key = expected_after_writer_pack(record, k);
+            output.write(reinterpret_cast<const char*>(key.data.data()), full * 8);
+            if (tail != 0)
+                output.write(reinterpret_cast<const char*>(&key.data[full]) + 8 - tail, tail);
         }
-
-        pool.producer_set_finished();
-        writer.start();
-        writer.join();
+        if (!output) throw std::runtime_error("failed to write legacy fixture");
     }
 
     std::vector<char> read_low_bin_bytes()

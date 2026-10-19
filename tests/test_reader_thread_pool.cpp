@@ -67,7 +67,8 @@ namespace
         }
 
         ReaderPool pool(output_block_size, 1);
-        ReaderThreadPool<kWords> reader(filenames, kLength, input_chunk_size, 1, &pool);
+        k_length = kLength;
+        ReaderThreadPool reader(filenames, input_chunk_size, 1, &pool);
 
         reader.start();
         reader.join();

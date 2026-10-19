@@ -2,7 +2,7 @@
 #define FINAL_DRAIN_READER_HEADER
 
 #include "../src/definition.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <algorithm>
 #include <array>

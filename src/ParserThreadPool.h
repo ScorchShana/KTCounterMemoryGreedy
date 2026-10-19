@@ -19,11 +19,9 @@
 #include <utility>
 #include <chrono>
 
-template <uint32_t N>
 class ParserThreadPool
 {
 
-    int k;
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
     ConcurrentMemoryPool* pool = nullptr;
@@ -43,14 +41,12 @@ public:
     std::atomic<uint64_t> total_queue_wait_cycles{ 0 };
 #endif
 
-    explicit ParserThreadPool(const int in_k,
-        std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
+    explicit ParserThreadPool(std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         ConcurrentMemoryPool* pool_ptr,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool_ptr,
         uint32_t in_parser_count)
-        : k(in_k),
-        classifier_task_queues(in_classifier_task_queues),
+        :         classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue),
         pool(pool_ptr),
         parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
@@ -66,7 +62,7 @@ public:
             threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
                 {
                     std::this_thread::sleep_for(std::chrono::nanoseconds(20));
-                    FastqParser<N> parser(k, classifier_task_queues, global_classifier_task_queue, &reads, parser_classifier_ring_pool);
+                    FastqParser parser( classifier_task_queues, global_classifier_task_queue, &reads, parser_classifier_ring_pool);
                     parser.parse_and_push();
                     total_read_kmer += parser.get_total_read_kmer();
                     parser_classifier_ring_pool->producer_set_finished();
@@ -94,7 +90,7 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
                 {
-                    LowFrequencyParser<N> parser(k, classifier_task_queues, global_classifier_task_queue);
+                    LowFrequencyParser parser(classifier_task_queues, global_classifier_task_queue);
                     parser.parse_and_push(reads, *parser_classifier_ring_pool);
                     parser_classifier_ring_pool->producer_set_finished();
                 }));

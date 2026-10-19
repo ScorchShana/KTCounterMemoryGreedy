@@ -25,7 +25,6 @@
 #include <atomic>
 #include <algorithm>
 
-template <uint32_t N>
 class FastqReader
 {
 
@@ -72,12 +71,11 @@ public:
 
     int k;
 
-    explicit FastqReader(const std::vector<std::string>& filenames, const int in_k, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
+    explicit FastqReader(const std::vector<std::string>& filenames, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
         : acbs_index(0), filenames_(filenames), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
-        k(in_k), chunk_size_(chunk_size)
+        k(k_length), chunk_size_(chunk_size)
     {
         assert(ring_memory_pool_ptr_ != nullptr);
-        assert(k > 0 && k < 128);
         assert(ring_memory_pool_ptr_->blockSize() > 1024);
         if (filenames_.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
 
@@ -338,7 +336,6 @@ private:
     }
 };
 
-template <uint32_t N>
 class ReaderThreadPool
 {
     using content_type = std::pair<char*, uint64_t>;
@@ -380,14 +377,12 @@ public:
 
     explicit ReaderThreadPool(
         const std::vector<std::string>& filenames,
-        int in_k,
         uint64_t chunk_size,
         uint32_t reader_count,
         RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* pool_ptr)
-        : k_(in_k), base_chunk_size_(chunk_size), reader_count_(reader_count), ring_pool_ptr_(pool_ptr)
+        : k_(k_length), base_chunk_size_(chunk_size), reader_count_(reader_count), ring_pool_ptr_(pool_ptr)
     {
         assert(ring_pool_ptr_ != nullptr);
-        assert(k_ > 0 && k_ < 128);
         assert(ring_pool_ptr_->blockSize() > 1024);
         if (filenames.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
 

@@ -29,7 +29,6 @@
 #include <x86intrin.h>
 #endif
 
-template <uint32_t N>
 class FastqParser
 {
     // 自旋参数
@@ -37,7 +36,6 @@ class FastqParser
     static constexpr int YIELD_THRESHOLD = 128;
     static constexpr int MAX_BACKOFF = 64;
 
-    int k_len;
 
     uint32_t owner_start = 0;
     uint64_t total_read_kmer = 0;
@@ -55,10 +53,10 @@ class FastqParser
     alignas(CACHE_LINE_SIZE) std::vector<uint32_t> local_block_owner_sums{};
     std::vector<content_type> owner_contents{};
 
-    std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_for_copy{};
-    std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> kmer_buffer{};
+    std::array<unsigned char, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE> local_block_for_copy{};
+    std::array<unsigned char, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE> kmer_buffer{};
 
-    GetKmer<N> get_kmer;
+    GetKmer get_kmer;
 
     SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_to_classifier_backoff;
     SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_from_classifier_backoff;
@@ -79,13 +77,12 @@ public:
     uint64_t queue_wait_cycles = 0;
 #endif
 
-    explicit FastqParser(uint32_t in_k_len,
-        std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
+    explicit FastqParser(std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool)
-        : k_len(in_k_len), classifier_task_queues(in_classifier_task_queues),
-        global_classifier_task_queue(in_global_classifier_task_queue), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), get_kmer(in_k_len)
+        : classifier_task_queues(in_classifier_task_queues),
+        global_classifier_task_queue(in_global_classifier_task_queue), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), get_kmer()
     {
         local_prefix_owners = prefix_owners;
         kmer_buffer_count = 0;
@@ -253,6 +250,8 @@ private:
 #endif
 
         get_kmer.clear();
+        const size_t record_bytes = kmer_bytes();
+        const uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / record_bytes;
 
 #if defined(__AVX2__)
         const __m256i MASK_UPPER = _mm256_set1_epi8(0xDF);
@@ -322,15 +321,7 @@ private:
                         ? static_cast<uint32_t>(__builtin_ctz(inverted_run_bits))
                         : 32u;
 
-                    // 将此运行中的所有碱基编码打包为一个 uint64_t
-                    uint64_t packed = 0;
-                    for (uint32_t i = 0; i < run_len; ++i)
-                    {
-                        packed = (packed << 2) | codes[idx + i];
-                    }
-
                     // 批次插入前确保缓冲区有足够空间（一次最多写入 run_len 个 k-mer）
-                    constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
                     if (kmer_buffer_count + static_cast<uint64_t>(run_len) > KMER_BUF_CAP) [[unlikely]]
                     {
 #ifdef TEST_MODE
@@ -344,8 +335,8 @@ private:
                     }
 
                     // 批次插入：一次更新 k-mer 状态，同时拿到新完成的 k-mer
-                    uint32_t new_kmers = get_kmer.batch_insert(packed, run_len,
-                        &kmer_buffer[kmer_buffer_count]);
+                    uint32_t new_kmers = get_kmer.batch_insert(codes + idx, run_len,
+                        (kmer_buffer.data() + (kmer_buffer_count) * record_bytes));
                     kmer_buffer_count += new_kmers;
 
                     const uint32_t clear_mask = static_cast<uint32_t>(
@@ -362,26 +353,15 @@ private:
             ptr += chunk;
         }
 
-        constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
         while (ptr < end)
         {
             const char c = *ptr;
             ptr++;
-            if (get_kmer.get_next_one(c))
-            {
-                if (kmer_buffer_count + 1 > KMER_BUF_CAP) [[unlikely]]
-                {
-#ifdef TEST_MODE
-                    uint64_t flush_start = __rdtsc();
-#endif
-                    flush_kmer_buffer();
-#ifdef TEST_MODE
-                    uint64_t flush_end = __rdtsc();
-                    flush_cycles += (flush_end - flush_start);
-#endif
-                }
-                kmer_buffer[kmer_buffer_count++] = get_kmer.canonical_kmer;
+            if (kmer_buffer_count == KMER_BUF_CAP) {
+                flush_kmer_buffer();
             }
+            if (get_kmer.get_next_one(c, kmer_buffer.data() + kmer_buffer_count * record_bytes))
+                ++kmer_buffer_count;
         }
 
 #elif defined(__SSE4_2__)
@@ -429,13 +409,6 @@ private:
                         ? static_cast<uint32_t>(__builtin_ctz(inverted_run_bits))
                         : 16u;
 
-                    uint32_t packed = 0;
-                    for (uint32_t i = 0; i < run_len; ++i)
-                    {
-                        packed = (packed << 2) | codes[idx + i];
-                    }
-
-                    constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
                     if (kmer_buffer_count + static_cast<uint64_t>(run_len) > KMER_BUF_CAP) [[unlikely]]
                     {
 #ifdef TEST_MODE
@@ -448,8 +421,8 @@ private:
 #endif
                     }
 
-                    uint32_t new_kmers = get_kmer.batch_insert(packed, run_len,
-                        &kmer_buffer[kmer_buffer_count]);
+                    uint32_t new_kmers = get_kmer.batch_insert(codes + idx, run_len,
+                        (kmer_buffer.data() + (kmer_buffer_count) * record_bytes));
                     kmer_buffer_count += new_kmers;
 
                     const uint16_t clear_mask = static_cast<uint16_t>(
@@ -465,46 +438,25 @@ private:
             ptr += chunk;
         }
 
-        constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
         while (ptr < end)
         {
             const char c = *ptr;
             ptr++;
-            if (get_kmer.get_next_one(c))
-            {
-                if (kmer_buffer_count + 1 > KMER_BUF_CAP) [[unlikely]]
-                {
-#ifdef TEST_MODE
-                    uint64_t flush_start = __rdtsc();
-#endif
-                    flush_kmer_buffer();
-#ifdef TEST_MODE
-                    uint64_t flush_end = __rdtsc();
-                    flush_cycles += (flush_end - flush_start);
-#endif
-                }
-                kmer_buffer[kmer_buffer_count++] = get_kmer.canonical_kmer;
+            if (kmer_buffer_count == KMER_BUF_CAP) {
+                flush_kmer_buffer();
             }
+            if (get_kmer.get_next_one(c, kmer_buffer.data() + kmer_buffer_count * record_bytes))
+                ++kmer_buffer_count;
         }
 #else
         for (int i = 0; i < length; ++i)
         {
             const char c = data_ptr[i];
-            if (get_kmer.get_next_one(c))
-            {
-                kmer_buffer[kmer_buffer_count++] = get_kmer.canonical_kmer;
-                if (kmer_buffer_count >= (PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>))) [[unlikely]]
-                {
-#ifdef TEST_MODE
-                    uint64_t flush_start = __rdtsc();
-#endif
-                    flush_kmer_buffer();
-#ifdef TEST_MODE
-                    uint64_t flush_end = __rdtsc();
-                    flush_cycles += (flush_end - flush_start);
-#endif
-                }
+            if (kmer_buffer_count == KMER_BUF_CAP) {
+                flush_kmer_buffer();
             }
+            if (get_kmer.get_next_one(c, kmer_buffer.data() + kmer_buffer_count * record_bytes))
+                ++kmer_buffer_count;
         }
 #endif
 
@@ -516,13 +468,12 @@ private:
     }
 
 private:
-    uint64_t get_classifier_owner(const kmer<N>& k_mer) const
+    uint64_t get_classifier_owner(const unsigned char* k_mer) const
     {
-        constexpr uint32_t shift_bits = 64 - (ROOT_BASES * 2);
-        return local_prefix_owners[k_mer.data[0] >> shift_bits];
+        return local_prefix_owners[k_mer[0]];
     }
 
-    void calculate_block_owner_counts(kmer<N>* kmer_data, const uint64_t kmer_count)
+    void calculate_block_owner_counts(const unsigned char* kmer_data, const uint64_t kmer_count)
     {
 
         memset(local_block_owner_counts.data(), 0, local_block_owner_counts.size() * sizeof(uint32_t));
@@ -530,7 +481,7 @@ private:
         // 可以考虑simd加速
         for (uint64_t i = 0; i < kmer_count; ++i)
         {
-            const uint64_t owner = get_classifier_owner(kmer_data[i]);
+            const uint64_t owner = get_classifier_owner((kmer_data + (i) * kmer_bytes()));
             local_block_owner_counts[owner]++;
         }
 
@@ -541,20 +492,20 @@ private:
         }
     }
 
-    void push_kmers_into_local_block_for_copy(kmer<N>* kmer_data, const uint64_t kmer_count)
+    void push_kmers_into_local_block_for_copy(const unsigned char* kmer_data, const uint64_t kmer_count)
     {
         for (uint64_t index = 0; index < kmer_count; index++)
         {
-            const uint64_t owner = get_classifier_owner(kmer_data[index]);
+            const uint64_t owner = get_classifier_owner((kmer_data + (index) * kmer_bytes()));
             const uint64_t pos = local_block_owner_sums[owner];
-            local_block_for_copy[pos] = kmer_data[index];
+            std::memcpy((local_block_for_copy.data() + (pos) * kmer_bytes()), (kmer_data + (index) * kmer_bytes()), kmer_bytes());
             local_block_owner_sums[owner]++;
         }
     }
 
     void divide_kmers_into_owner_contents()
     {
-        constexpr uint32_t max_kmers_per_block = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+        const uint32_t max_kmers_per_block = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
 
         owner_start = rng() % owner_contents.size();
 
@@ -567,7 +518,7 @@ private:
             if (owner_contents[owner].length + remaining_count > max_kmers_per_block)
             {
                 const uint32_t copy_count = (max_kmers_per_block - owner_contents[owner].length);
-                std::memcpy(owner_contents[owner].data + owner_contents[owner].length * sizeof(kmer<N>), local_block_for_copy.data() + read_offset, copy_count * sizeof(kmer<N>));
+                std::memcpy(owner_contents[owner].data + owner_contents[owner].length * kmer_bytes(), local_block_for_copy.data() + read_offset * kmer_bytes(), copy_count * kmer_bytes());
                 owner_contents[owner].length += copy_count;
 
 #ifdef TEST_MODE
@@ -594,20 +545,20 @@ private:
                 remaining_count -= copy_count;
             }
 
-            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * sizeof(kmer<N>), local_block_for_copy.data() + read_offset, remaining_count * sizeof(kmer<N>));
+            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * kmer_bytes(), local_block_for_copy.data() + read_offset * kmer_bytes(), remaining_count * kmer_bytes());
             owner_contents[owner].length += remaining_count;
             read_offset += remaining_count;
         }
 
     }
 
-    void divide_kmer_buffer_into_owner_contents(kmer<N>* kmer_data, const uint64_t kmer_count)
+    void divide_kmer_buffer_into_owner_contents(const unsigned char* kmer_data, const uint64_t kmer_count)
     {
-        constexpr uint32_t max_kmers_per_block = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+        const uint32_t max_kmers_per_block = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
 
         for (uint64_t i = 0; i < kmer_count; i++)
         {
-            const uint64_t owner = get_classifier_owner(kmer_data[i]);
+            const uint64_t owner = get_classifier_owner((kmer_data + (i) * kmer_bytes()));
             if (owner_contents[owner].length >= max_kmers_per_block) [[unlikely]]
             {
 #ifdef TEST_MODE
@@ -630,8 +581,8 @@ private:
                 queue_wait_cycles += queue_wait_end - queue_wait_start;
 #endif
             }
-            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * sizeof(kmer<N>),
-                kmer_data[i].data.data(), sizeof(kmer<N>));
+            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * kmer_bytes(),
+                (kmer_data + (i) * kmer_bytes()), kmer_bytes());
             ++owner_contents[owner].length;
         }
     }
@@ -748,7 +699,6 @@ private:
     }
 };
 
-template<uint32_t N>
-alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> FastqParser<N>::rng_seed{ 0 };
+alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> FastqParser::rng_seed{ 0 };
 
 #endif

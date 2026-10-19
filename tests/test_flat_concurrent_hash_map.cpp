@@ -17,7 +17,7 @@
 namespace
 {
     constexpr uint32_t kWords = 2;
-    using Kmer = kmer<kWords>;
+    using Kmer = legacy_kmer<kWords>;
 
     Kmer make_kmer(uint64_t value)
     {
@@ -336,9 +336,9 @@ namespace
     }
 
     template <uint32_t N>
-    kmer<N> make_compact_key(uint32_t k, uint64_t id)
+    legacy_kmer<N> make_compact_key(uint32_t k, uint64_t id)
     {
-        kmer<N> key{};
+        legacy_kmer<N> key{};
         for (uint32_t base = 0; base < k; ++base)
         {
             uint64_t digits = id ^ ((base / 32) * 0x9e3779b97f4a7c15ULL);
@@ -361,7 +361,7 @@ namespace
         {
             const uint32_t records = k == 1 ? 2 : 128;
             Map map(records, 4, k);
-            std::vector<kmer<N>> keys;
+            std::vector<legacy_kmer<N>> keys;
             for (uint32_t i = 0; i < records; ++i) keys.push_back(make_compact_key<N>(k, i));
             std::atomic<bool> ok{true};
             std::vector<std::thread> threads;
@@ -388,7 +388,7 @@ namespace
                 });
             for (auto& thread : threads) thread.join();
             std::vector<bool> seen(records, false);
-            map.for_each_entry([&](const kmer<N>& key, uint32_t count) {
+            map.for_each_entry([&](const legacy_kmer<N>& key, uint32_t count) {
                 if (!count || count > records || seen[count - 1] || !(key == keys[count - 1]))
                     ok.store(false);
                 else seen[count - 1] = true;
@@ -426,8 +426,8 @@ namespace
         const uint32_t full = bytes & ~7U;
         const uint32_t tail = bytes & 7U;
         Map map(24, 2, k);
-        std::array<kmer<N>, 24> keys;
-        std::array<std::array<char, sizeof(kmer<N>)>, 24> packed{};
+        std::array<legacy_kmer<N>, 24> keys;
+        std::array<std::array<char, sizeof(legacy_kmer<N>)>, 24> packed{};
         const uint32_t records = k == 1 ? 2 : k == 2 ? 12 : keys.size();
         for (uint32_t i = 0; i < records; ++i)
         {
@@ -590,7 +590,7 @@ namespace
             const Map map(expected_unique);
             const uint64_t capacity = map.capacity();
             const uint64_t ctrl_payload_bytes = capacity + Map::GROUP_SIZE - 1;
-            const uint64_t kmer_payload_bytes = capacity * sizeof(kmer<kWords>);
+            const uint64_t kmer_payload_bytes = capacity * sizeof(legacy_kmer<kWords>);
             const uint64_t count_payload_bytes = capacity * sizeof(uint32_t);
             const uint64_t payload_bytes = ctrl_payload_bytes + kmer_payload_bytes + count_payload_bytes;
             const uint64_t expected_mmap_bytes =

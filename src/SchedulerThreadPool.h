@@ -22,7 +22,6 @@
 #include <cmath>
 
 
-template <uint32_t N>
 class SchedulerThreadPool final
 {
 
@@ -73,8 +72,8 @@ class SchedulerThreadPool final
     alignas(CACHE_LINE_SIZE) std::atomic<bool> stop_requested_{ false };
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> active_producer{ 0 };
 
-    KmerTree<N>* tree_ptr_ = nullptr;
-    LayerQueues<N>* layer_queues_ptr_ = nullptr;
+    KmerTree* tree_ptr_ = nullptr;
+    LayerQueues* layer_queues_ptr_ = nullptr;
     std::thread scheduler_thread_;
     std::vector<std::unique_ptr<std::thread>> worker_threads_ptr_;
     std::vector<std::thread> extra_drain_threads_;
@@ -124,7 +123,7 @@ public:
 #endif
 
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, uint32_t extra_drain_thread_count,
-        KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
+        KmerTree* tree_ptr, LayerQueues* layer_queues_ptr)
         : thread_count_(thread_count > 1 ? thread_count : 2), extra_drain_thread_count_(extra_drain_thread_count),
         active_producer(producer_count), tree_ptr_(tree_ptr),
         layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count_ - 1), worker_infos(thread_count_ - 1),
@@ -252,7 +251,7 @@ private:
 
     void drain_all(const uint32_t start_depth)
     {
-        Task<N> task;
+        Task task;
         uint32_t stable_empty_rounds = 0;
 
         while (stable_empty_rounds < DRAIN_EMPTY_CONFIRM_ROUNDS)
@@ -292,7 +291,7 @@ private:
     uint32_t process_batch_at_depth(const uint32_t depth,
         const uint32_t max_process_tasks = MAX_PROCESS_TASKS)
     {
-        Task<N> task;
+        Task task;
         auto queue = layer_queues_ptr_->get_queue(depth);
         uint32_t processed = 0;
         while (processed < max_process_tasks && queue->try_dequeue(task))
@@ -319,7 +318,7 @@ private:
         for (int steal_depth = MAX_DEPTH - 1; steal_depth >= 0; --steal_depth)
         {
             auto queue = layer_queues_ptr_->get_queue(steal_depth);
-            Task<N> task;
+            Task task;
             if (queue->try_dequeue(task))
             {
                 tree_ptr_->thread_add_kmer(task);
@@ -475,7 +474,8 @@ private:
 #if HAS_LIBNUMA
         numa_run_on_node(numa_nodes[(worker_id + 1) % numa_nodes.size()]);
 #endif
-        ConcurrentOpenAddressHashMap<N>::set_memory_pool(tree_ptr_->get_memory_pool());
+        ConcurrentOpenAddressHashMap::set_memory_pool(tree_ptr_->get_memory_pool());
+        KmerTree::initialize_worker();
         uint32_t loop_round = 0;
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
@@ -506,8 +506,8 @@ private:
             total_depth_steal_tasks[d].fetch_add(depth_steal_tasks[d], std::memory_order_relaxed);
             total_depth_home_tasks[d].fetch_add(depth_home_tasks[d], std::memory_order_relaxed);
         }
-        total_segment_probe.fetch_add(ConcurrentOpenAddressHashMap<N>::segment_probe, std::memory_order_relaxed);
-        total_segment_probe_time.fetch_add(ConcurrentOpenAddressHashMap<N>::segment_probe_time, std::memory_order_relaxed);
+        total_segment_probe.fetch_add(ConcurrentOpenAddressHashMap::segment_probe, std::memory_order_relaxed);
+        total_segment_probe_time.fetch_add(ConcurrentOpenAddressHashMap::segment_probe_time, std::memory_order_relaxed);
 #endif
 
         const uint32_t total_workers = thread_count_ - 1;
@@ -526,14 +526,14 @@ private:
 #if HAS_LIBNUMA
                             numa_run_on_node(numa_nodes[(extra_id + 1) % numa_nodes.size()]);
 #endif
-                            ConcurrentOpenAddressHashMap<N>::set_memory_pool(tree_ptr_->get_memory_pool());
+                            ConcurrentOpenAddressHashMap::set_memory_pool(tree_ptr_->get_memory_pool());
+                            KmerTree::initialize_worker();
                             drain_all(extra_id % MAX_DEPTH);
                             drain_all_done_barrier.arrive_and_wait();
 
-                            FinalDrainWriter<N> writer(tree_ptr_->get_k_length(),
-                                drain_writer_thread_.pool());
+                            FinalDrainWriter writer(drain_writer_thread_.pool());
                             auto fq = layer_queues_ptr_->get_final_drain_queue();
-                            Task<N> task;
+                            Task task;
                             while (fq->try_dequeue(task))
                                 tree_ptr_->final_drain_root(task.current_node, writer);
 
@@ -544,7 +544,7 @@ private:
                             final_drain_writer_producer_dequeue_spin_time.fetch_add(writer.producer_dequeue_spin_time, std::memory_order_relaxed);
                             {
                                 std::lock_guard<std::mutex> lock(segment_histogram_lock);
-                                for (auto p : ConcurrentOpenAddressHashMap<N>::get_segment_histogram()) {
+                                for (auto p : ConcurrentOpenAddressHashMap::get_segment_histogram()) {
                                     segment_histogram[p.first] += p.second;
                                 }
                             }
@@ -558,11 +558,10 @@ private:
         drain_all_done_barrier.arrive_and_wait();
 
         {
-            FinalDrainWriter<N> writer(tree_ptr_->get_k_length(),
-                drain_writer_thread_.pool());
+            FinalDrainWriter writer(drain_writer_thread_.pool());
 
             auto fq = layer_queues_ptr_->get_final_drain_queue();
-            Task<N> task;
+            Task task;
             while (fq->try_dequeue(task))
                 tree_ptr_->final_drain_root(task.current_node, writer);
 
@@ -573,7 +572,7 @@ private:
             final_drain_writer_producer_dequeue_spin_time.fetch_add(writer.producer_dequeue_spin_time, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lock(segment_histogram_lock);
-                for (auto p : ConcurrentOpenAddressHashMap<N>::get_segment_histogram()) {
+                for (auto p : ConcurrentOpenAddressHashMap::get_segment_histogram()) {
                     segment_histogram[p.first] += p.second;
                 }
             }

@@ -2,7 +2,7 @@
 #define FLAT_CONCURRENT_HASH_MAP_HEADER
 
 #include "../src/definition.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 #include "../include/xxh3.h"
 
 #include <atomic>
@@ -90,7 +90,7 @@ public:
     FlatConcurrentHashMap(FlatConcurrentHashMap&&) = delete;
     FlatConcurrentHashMap& operator=(FlatConcurrentHashMap&&) = delete;
 
-    bool insert_unique(const kmer<N>& key, uint32_t count) noexcept
+    bool insert_unique(const legacy_kmer<N>& key, uint32_t count) noexcept
     {
         if (key_bytes_ == sizeof(key))
             return insert_unique(reinterpret_cast<const char*>(&key), count);
@@ -153,13 +153,13 @@ public:
         sealed_.store(true, std::memory_order_release);
     }
 
-    bool find(const kmer<N>& key, uint32_t& out_count) const noexcept
+    bool find(const legacy_kmer<N>& key, uint32_t& out_count) const noexcept
     {
         const PreparedLookup lookup = prepare_lookup(key);
         return find_prepared(key, lookup, out_count);
     }
 
-    [[nodiscard]] PreparedLookup prepare_lookup(const kmer<N>& key) const noexcept
+    [[nodiscard]] PreparedLookup prepare_lookup(const legacy_kmer<N>& key) const noexcept
     {
         if (key_bytes_ == sizeof(key))
             return prepare_lookup(reinterpret_cast<const char*>(&key));
@@ -192,7 +192,7 @@ public:
 #endif
     }
 
-    bool find_prepared(const kmer<N>& key, const PreparedLookup& lookup, uint32_t& out_count) const noexcept
+    bool find_prepared(const legacy_kmer<N>& key, const PreparedLookup& lookup, uint32_t& out_count) const noexcept
     {
         uint64_t slot;
         return find_prepared_slot(key, lookup, out_count, slot);
@@ -204,7 +204,7 @@ public:
         return find_prepared_slot(packed_key, lookup, out_count, slot);
     }
 
-    bool find_prepared_slot(const kmer<N>& key, const PreparedLookup& lookup,
+    bool find_prepared_slot(const legacy_kmer<N>& key, const PreparedLookup& lookup,
                             uint32_t& out_count, uint64_t& out_slot) const noexcept
     {
         if (key_bytes_ == sizeof(key))
@@ -249,7 +249,7 @@ public:
         return false;
     }
 
-    bool contains(const kmer<N>& key) const noexcept
+    bool contains(const legacy_kmer<N>& key) const noexcept
     {
         uint32_t ignored = 0;
         return find(key, ignored);
@@ -273,7 +273,7 @@ public:
             if (ctrl_[i] != 0)
             {
                 // Legacy callbacks borrow a reconstructed key only for this call.
-                kmer<N> key{};
+                legacy_kmer<N> key{};
                 const char* stored = packed_keys_ + i * key_bytes_;
                 const uint32_t full_bytes = key_bytes_ & ~7U;
                 const uint32_t tail_bytes = key_bytes_ & 7U;

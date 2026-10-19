@@ -23,24 +23,23 @@
 #include <latch>
 #include <semaphore>
 
-template <uint32_t N>
 class ClassifierThreadPool
 {
 
-    int k_len;
     const uint32_t classifier_count;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
-    SchedulerThreadPool<N>* task_thread_pool;
+    SchedulerThreadPool* task_thread_pool;
     ConcurrentMemoryPool* memory_pool;
-    KmerTree<N>* tree;
+    KmerTree* tree;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
     std::shared_ptr<std::barrier<>> start_barrier;
     std::shared_ptr<std::barrier<>> finish_barrier;
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> deal_kmer_counts{};
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_scanned_counts{};
     std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> low_recovered_counts{};
+    std::array<uint64_t, 1ULL << (2 * ROOT_BASES)> first_drain_singleton_counts{};
     struct FirstRingGroup
     {
         uint32_t producer_count = 0;
@@ -55,6 +54,7 @@ class ClassifierThreadPool
 public:
     uint64_t low_records_scanned = 0;
     uint64_t low_records_recovered = 0;
+    uint64_t first_drain_singletons = 0;
 #ifdef TEST_MODE
     std::atomic<uint64_t> producer_enqueue_spin_time{ 0 };
     std::atomic<uint64_t> producer_dequeue_spin_time{ 0 };
@@ -71,15 +71,14 @@ public:
     std::atomic<uint64_t> total_recovered_firsts{ 0 };
 #endif
 
-    explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
+    explicit ClassifierThreadPool(KmerTree* tree_ptr,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool_ptr,
         std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
-        SchedulerThreadPool<N>* task_thread_pool_ptr,
+        SchedulerThreadPool* task_thread_pool_ptr,
         ConcurrentMemoryPool* in_memory_pool_ptr,
         uint32_t in_classifier_count)
-        : k_len(in_k),
-        tree(tree_ptr),
+        :         tree(tree_ptr),
         parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
         classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue),
@@ -132,7 +131,7 @@ public:
                     }
                     start_barrier->arrive_and_wait();
                     std::this_thread::sleep_for(std::chrono::nanoseconds(40));
-                    FastqClassifier<N> classifier(k_len, i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, group.ring, rank);
+                    FastqClassifier classifier( i, parser_classifier_ring_pool, classifier_task_queues[i].get(), global_classifier_task_queue, tree, memory_pool, *start_barrier, group.ring, rank);
                     classifier.classify_first_pass();
                     first_pass_done.count_down();
                     low_pass_start.acquire();
@@ -147,6 +146,7 @@ public:
                     // Each Classifier owns one result slot; aggregate after join.
                     low_scanned_counts[i] = classifier.low_records_scanned;
                     low_recovered_counts[i] = classifier.low_records_recovered;
+                    first_drain_singleton_counts[i] = classifier.first_drain_singletons;
 #ifdef TEST_MODE
                     consumer_enqueue_spin_time.fetch_add(classifier.consumer_enqueue_spin_time, std::memory_order_relaxed);
                     consumer_dequeue_spin_time.fetch_add(classifier.consumer_dequeue_spin_time, std::memory_order_relaxed);
@@ -182,6 +182,7 @@ public:
         for (uint32_t i = 0; i < classifier_count; ++i) {
             low_records_scanned += low_scanned_counts[i];
             low_records_recovered += low_recovered_counts[i];
+            first_drain_singletons += first_drain_singleton_counts[i];
         }
 #ifdef TEST_MODE
         for (uint32_t i = 0; i < classifier_count; i++)

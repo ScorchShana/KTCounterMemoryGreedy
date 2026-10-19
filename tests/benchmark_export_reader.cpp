@@ -1,5 +1,5 @@
 #include "../tool/ExportReader.h"
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <chrono>
 #include <iostream>
@@ -14,12 +14,12 @@ int main(int argc, char** argv)
 
     ExportReader<2> reader(41);
     reader.open(argv[1]);
-    kmer<2> k_mers[32 * 1024 / sizeof(kmer<2>)];
+    legacy_kmer<2> k_mers[32 * 1024 / sizeof(legacy_kmer<2>)];
 
     auto start = std::chrono::high_resolution_clock::now();
     while (!reader.finished())
     {
-        reader.read_kmers(reinterpret_cast<kmer<2>*>(k_mers), 32 * 1024 / sizeof(kmer<2>));
+        reader.read_kmers(reinterpret_cast<legacy_kmer<2>*>(k_mers), 32 * 1024 / sizeof(legacy_kmer<2>));
     }
     auto end = std::chrono::high_resolution_clock::now();
     std::cout << "Total k-mers read: " << reader.get_kmer_amount() << std::endl;

@@ -1,7 +1,7 @@
 #ifndef TREE_EXPORT_RECORD_RADIX_SORT_12_HEADER
 #define TREE_EXPORT_RECORD_RADIX_SORT_12_HEADER
 
-#include "../src/kmer.h"
+#include "../tool/LegacyKmer.h"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +45,7 @@ struct PassDescriptor
 };
 
 template <uint32_t N>
-inline bool padding_is_zero(const kmer<N>& key, uint32_t low_padding_bits) noexcept
+inline bool padding_is_zero(const legacy_kmer<N>& key, uint32_t low_padding_bits) noexcept
 {
     uint32_t remaining = low_padding_bits;
     for (uint32_t word = N; word-- > 0 && remaining > 0;)
@@ -62,7 +62,7 @@ inline bool padding_is_zero(const kmer<N>& key, uint32_t low_padding_bits) noexc
 }
 
 template <uint32_t N, uint32_t CommonPrefixBases>
-inline uint64_t common_prefix(const kmer<N>& key) noexcept
+inline uint64_t common_prefix(const legacy_kmer<N>& key) noexcept
 {
     static_assert(CommonPrefixBases <= 32, "The debug prefix check expects the common prefix in data[0]");
     if constexpr (CommonPrefixBases == 0)
@@ -444,7 +444,7 @@ inline void dispatch_pipeline_scatter(
 template <uint32_t N, uint32_t CommonPrefixBases>
 inline auto build_passes(uint32_t k_length)
 {
-    static_assert(N > 0, "kmer<N> requires N > 0");
+    static_assert(N > 0, "legacy_kmer<N> requires N > 0");
     static_assert(CommonPrefixBases <= 32, "The common prefix must fit in data[0]");
     constexpr uint32_t max_passes = (64U * N + RADIX_BITS - 1U) / RADIX_BITS;
 

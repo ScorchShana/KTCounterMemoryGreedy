@@ -22,8 +22,8 @@ class LowFrequencyReader
     uint64_t read_records = 0;
 
 public:
-    LowFrequencyReader(uint32_t k, SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY>& in_blocks)
-        : packed_bytes((k + 3) / 4), blocks(in_blocks) {}
+    LowFrequencyReader( SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY>& in_blocks)
+        : packed_bytes(kmer_bytes()), blocks(in_blocks) {}
 
     void start(const std::string& filename)
     {
