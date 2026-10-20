@@ -18,11 +18,14 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <utility>
 
 // 系统头文件
 #include <sys/mman.h>
+#include <sys/statvfs.h>
 #include <sched.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 
 
@@ -48,6 +51,9 @@ constexpr size_t REMOTE_LIST_CAPACITY = 32;
 
 // 大页大小（2MB）
 constexpr size_t HUGE_PAGE_SIZE = 2ULL * 1024 * 1024;
+
+// 文件映射 Arena 每次扩大的块大小，也是“磁盘不足”的检测粒度
+constexpr size_t FILE_ARENA_CHUNK_BYTES = 64ULL << 20;
 
 //==============================================================================
 // 辅助工具
@@ -201,6 +207,9 @@ public:
     // 获取线程本地缓存
     static ThreadLocalCache& get_thread_local_cache();
 
+    // 已经映射的文件后备内存字节数（未触发时为 0）
+    uint64_t spill_bytes() const noexcept { return spill_.bytes; }
+
 private:
     //--------------------------------------------------------------------------
     // 内部辅助函数
@@ -235,11 +244,49 @@ private:
     inline void apply_arena_mbind();
 
     //----------------------------------------------------------------------
+    // 文件映射 Arena：匿名 Arena 用尽后的后备内存
+    //----------------------------------------------------------------------
+
+    struct SpillArena
+    {
+        std::mutex mutex;          // 保护以下所有字段
+        int fd = -1;               // mkstemp 后立即 unlink，仅保留 fd
+        off_t offset = 0;          // 下一个映射在文件中的偏移
+        char* chunk = nullptr;     // 当前 4KB 块来源
+        size_t chunk_size = 0;
+        size_t chunk_used = 0;
+        FreeBlock* free_blocks = nullptr; // 已释放 4KB 块
+        std::vector<std::pair<void*, size_t>> mappings; // 析构时 munmap
+        uint64_t bytes = 0;        // 已映射字节数
+    };
+
+    // 首次触发时在 temp_dir 创建并 unlink 溢写文件
+    void open_spill_file();
+
+    // 先 posix_fallocate 占盘，再 mmap；调用时需持有 spill_.mutex
+    void* spill_map(size_t bytes);
+
+    // 批量获取 4KB 块（优先复用空闲块，其次从文件 chunk bump）
+    size_t spill_allocate_batch(FreeBlock** out_head, FreeBlock** out_tail, size_t count);
+
+    // 大块分配：每次独立映射，天然连续
+    void* spill_allocate_large(size_t bytes);
+
+    // 归还 4KB 块到文件映射 Arena
+    void spill_deallocate(void* ptr);
+
+    // 磁盘不足或映射失败时统一报错并退出
+    [[noreturn]] static void spill_fatal(const char* op, int err);
+
+    //----------------------------------------------------------------------
     // 成员变量
     //--------------------------------------------------------------------------
 
     // Arena 数组
     alignas(CACHE_LINE_SIZE) Arena arenas_[MAX_NUMA_NODES];
+
+    // 匿名内存用尽后的文件映射后备
+    SpillArena spill_;
 
     // 实际使用的 Arena 数量
     int num_arenas_;
@@ -400,6 +447,18 @@ inline ConcurrentMemoryPool::~ConcurrentMemoryPool()
     {
         munmap(mmap_base_, mmap_size_);
         mmap_base_ = nullptr;
+    }
+
+    // 释放文件映射 Arena
+    for (auto& mapping : spill_.mappings)
+    {
+        ::munmap(mapping.first, mapping.second);
+    }
+    spill_.mappings.clear();
+    if (spill_.fd >= 0)
+    {
+        ::close(spill_.fd);
+        spill_.fd = -1;
     }
 }
 
@@ -988,6 +1047,149 @@ inline ThreadLocalCache& ConcurrentMemoryPool::get_thread_local_cache()
     return tls_cache_;
 }
 
+//==============================================================================
+// 文件映射 Arena 实现
+//==============================================================================
+
+inline void ConcurrentMemoryPool::open_spill_file()
+{
+    if (spill_.fd >= 0)
+        return;
+
+    std::string path = temp_dir + "spill.arena.XXXXXX";
+    const int fd = ::mkstemp(path.data());
+    if (fd < 0)
+        spill_fatal("mkstemp", errno);
+
+    if (::unlink(path.c_str()) != 0)
+    {
+        const int saved_errno = errno;
+        ::close(fd);
+        spill_fatal("unlink", saved_errno);
+    }
+
+    spill_.fd = fd;
+    std::cerr << "Memory limit reached; using file-backed arena in " << temp_dir
+        << " (grows until disk is full)" << std::endl;
+}
+
+inline void* ConcurrentMemoryPool::spill_map(size_t bytes)
+{
+    // 先真正分配磁盘，再让地址可访问，避免缺页时触发 SIGBUS。
+    int err = 0;
+    do
+    {
+        err = ::posix_fallocate(spill_.fd, spill_.offset, static_cast<off_t>(bytes));
+    } while (err == EINTR);
+    if (err != 0)
+        spill_fatal("posix_fallocate", err);
+
+    void* const ptr = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+        MAP_SHARED, spill_.fd, spill_.offset);
+    if (ptr == MAP_FAILED)
+        spill_fatal("mmap", errno);
+
+    spill_.offset += static_cast<off_t>(bytes);
+    spill_.mappings.emplace_back(ptr, bytes);
+    spill_.bytes += bytes;
+    return ptr;
+}
+
+inline size_t ConcurrentMemoryPool::spill_allocate_batch(
+    FreeBlock** out_head, FreeBlock** out_tail, size_t count)
+{
+    std::lock_guard<std::mutex> lock(spill_.mutex);
+    open_spill_file();
+
+    FreeBlock* head = nullptr;
+    FreeBlock* tail = nullptr;
+    size_t fetched = 0;
+
+    auto append = [&](FreeBlock* block) {
+        block->next = nullptr;
+        if (tail)
+            tail->next = block;
+        else
+            head = block;
+        tail = block;
+        ++fetched;
+        };
+
+    // 优先复用已释放的块
+    while (fetched < count && spill_.free_blocks)
+    {
+        FreeBlock* block = spill_.free_blocks;
+        spill_.free_blocks = block->next;
+        append(block);
+    }
+
+    // 不足部分从文件映射 chunk 中 bump
+    while (fetched < count)
+    {
+        if (spill_.chunk_used == spill_.chunk_size)
+        {
+            size_t want = FILE_ARENA_CHUNK_BYTES;
+            struct statvfs vfs
+            {
+            };
+            if (::fstatvfs(spill_.fd, &vfs) == 0)
+            {
+                const uint64_t fs_block = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                const uint64_t avail = static_cast<uint64_t>(vfs.f_bavail) * fs_block;
+                if (avail < want)
+                    want = static_cast<size_t>(avail / BLOCK_SIZE * BLOCK_SIZE);
+            }
+            if (want < BLOCK_SIZE)
+                spill_fatal("no space left for file-backed arena", ENOSPC);
+
+            spill_.chunk = static_cast<char*>(spill_map(want));
+            spill_.chunk_size = want;
+            spill_.chunk_used = 0;
+        }
+
+        FreeBlock* block = reinterpret_cast<FreeBlock*>(spill_.chunk + spill_.chunk_used);
+        spill_.chunk_used += BLOCK_SIZE;
+        append(block);
+    }
+
+    *out_head = head;
+    *out_tail = tail;
+    return fetched;
+}
+
+inline void* ConcurrentMemoryPool::spill_allocate_large(size_t bytes)
+{
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - (PAGE_SIZE - 1))
+        spill_fatal("invalid file-backed allocation size", EINVAL);
+
+    const size_t aligned_bytes = align_up(bytes, PAGE_SIZE);
+    std::lock_guard<std::mutex> lock(spill_.mutex);
+    open_spill_file();
+    return spill_map(aligned_bytes);
+}
+
+inline void ConcurrentMemoryPool::spill_deallocate(void* ptr)
+{
+    if (!ptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(spill_.mutex);
+    if (spill_.fd < 0)
+        return;
+
+    FreeBlock* block = reinterpret_cast<FreeBlock*>(ptr);
+    block->next = spill_.free_blocks;
+    spill_.free_blocks = block;
+}
+
+inline void ConcurrentMemoryPool::spill_fatal(const char* op, int err)
+{
+    std::cerr << "File-backed arena " << op << " failed in " << temp_dir
+        << ": " << std::strerror(err)
+        << " (errno=" << err << ")" << std::endl;
+    std::exit(-1);
+}
+
 inline void* ConcurrentMemoryPool::allocate_large_from_numa(size_t bytes, int numa_node)
 {
     if (!arenas_initialized_.load(std::memory_order_acquire) ||
@@ -1000,8 +1202,8 @@ inline void* ConcurrentMemoryPool::allocate_large_from_numa(size_t bytes, int nu
     if (char* ptr = bump_allocate_from_arena(arenas_[numa_node], bytes))
         return ptr;
 
-    std::cerr << "allocate_large_from_numa out of memory on node " << numa_node << std::endl;
-    std::exit(-1);
+    // 匿名 Arena 已用尽，改从文件映射 Arena 分配
+    return spill_allocate_large(bytes);
 }
 
 inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
@@ -1043,8 +1245,8 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
         }
     }
 
-    std::cerr << "std::bad_alloc" << std::endl;
-    std::exit(-1);
+    // 匿名 Arena 已用尽，改从文件映射 Arena 分配
+    return spill_allocate_large(bytes);
 }
 
 inline void* ConcurrentMemoryPool::allocate()
@@ -1117,7 +1319,18 @@ inline void* ConcurrentMemoryPool::allocate()
         }
     }
 
-    // 4. 所有 Arena 都为空
+    // 4. 匿名 Arena 全部用尽，改用文件映射 Arena
+    fetched = spill_allocate_batch(&head, &tail, BATCH_SIZE);
+    if (fetched > 0)
+    {
+        FreeBlock* result = head;
+        tls.local_free_stack = head->next;
+        result->next = nullptr;
+        tls.local_free_count = fetched - 1;
+        return result;
+    }
+
+    // 5. 文件映射也失败（磁盘不足时 spill_allocate_batch 已退出）
     std::cerr << "std::bad_alloc" << std::endl;
     std::exit(-1);
 }
@@ -1149,7 +1362,9 @@ inline void ConcurrentMemoryPool::deallocate(void* ptr)
     int arena_idx = find_arena_index(ptr);
     if (arena_idx < 0) [[unlikely]]
     {
-        // 不属于任何 Arena，可能是无效指针
+        // 不在匿名 Arena 中：来自文件映射 Arena 的 4KB 块。
+        // 按现有约定，allocate_large 的大块从不 deallocate。
+        spill_deallocate(ptr);
         return;
     }
 
