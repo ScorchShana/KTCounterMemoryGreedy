@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -47,7 +48,7 @@ public:
         if (fd_ < 0)
         {
             std::cerr << "GzipStreamer: open failed: " << ::strerror(errno) << std::endl;
-            std::exit(-1);
+            throw std::runtime_error("input I/O failed");
         }
 
         // 告诉内核我们会顺序访问整个文件（增大 readahead 窗口）
@@ -65,7 +66,7 @@ public:
             std::cerr << "GzipStreamer: inflateInit2 failed" << std::endl;
             ::close(fd_);
             fd_ = -1;
-            std::exit(-1);
+            throw std::runtime_error("input I/O failed");
         }
 
         stream_initialized_ = true;
@@ -120,7 +121,7 @@ public:
                 {
                     if (errno == EINTR) continue;  // 被信号打断，重试
                     std::cerr << "GzipStreamer: read failed: " << strerror(errno) << std::endl;
-                    std::exit(-1);
+                    throw std::runtime_error("input I/O failed");
                 }
                 if (n == 0)
                 {
@@ -143,7 +144,7 @@ public:
                     if (inflateReset(&stream_) != Z_OK)
                     {
                         std::cerr << "GzipStreamer: inflateReset failed" << std::endl;
-                        std::exit(-1);
+                        throw std::runtime_error("input I/O failed");
                     }
                     continue;
                 }
@@ -154,7 +155,7 @@ public:
             if (ret != Z_OK && ret != Z_BUF_ERROR)
             {
                 std::cerr << "GzipStreamer: inflate error code: " << ret << std::endl;
-                std::exit(-1);
+                throw std::runtime_error("input I/O failed");
             }
 
             // 输出缓冲区满了，返回给调用者
@@ -187,14 +188,14 @@ private:
         if (posix_memalign(reinterpret_cast<void**>(&compressed_buf_),
             CACHE_LINE_SIZE, COMPRESSED_CHUNK_SIZE) != 0) {
             std::cerr << "GzipStreamer: posix_memalign(compressed_buf) failed" << std::endl;
-            std::exit(-1);
+            throw std::runtime_error("input I/O failed");
         }
         if (posix_memalign(reinterpret_cast<void**>(&decompressed_buf_),
             CACHE_LINE_SIZE, DECOMPRESSED_BUF_SIZE) != 0) {
             free(compressed_buf_);
             compressed_buf_ = nullptr;
             std::cerr << "GzipStreamer: posix_memalign(decompressed_buf) failed" << std::endl;
-            std::exit(-1);
+            throw std::runtime_error("input I/O failed");
         }
     }
 

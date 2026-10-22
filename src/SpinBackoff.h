@@ -2,6 +2,7 @@
 #define SPIN_BACKOFF_HEADER
 
 #include "definition.h"
+#include "RunState.h"
 
 #include <chrono>
 #include <thread>
@@ -12,6 +13,7 @@ class SpinBackoff {
 public:
     void backoff()
     {
+        RunState::check_active();
         if (count_ < YIELD_THRESHOLD)
         {
             // 动态自旋：执行 backoff_ 次 cpu_relax

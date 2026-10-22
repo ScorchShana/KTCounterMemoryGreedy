@@ -3,293 +3,258 @@
 
 #include "definition.h"
 #include "RingMemoryPool.h"
-#include "kmer.h"
+#include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <iostream>
-#include <stdexcept>
-#include <vector>
-#include <array>
-#include <thread>
-#include <atomic>
-#include <unordered_map>
-#include <algorithm>
-
+#include <aio.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <errno.h>
-#include <aio.h>
-
-
-
-
-
+#include <array>
+#include <cstring>
+#include <thread>
+#include <system_error>
 
 class ExportWriter
 {
+public:
+    enum class OutputKind { Pending, FinalLow };
 
-    constexpr static uint64_t RAW_BUFFER_SIZE = 2ULL * 1024 * 1024; // 1MB 原始数据块大小
-    // constexpr static uint64_t RAW_BUFFER_SIZE = 512 * 1024;
-    constexpr static uint32_t NUM_AIO_BUFFERS = 2;
-    static_assert(RAW_BUFFER_SIZE >= EXPORT_RING_MEMORY_POOL_BLOCK_SIZE, "RAW_BUFFER_SIZE must be greater than or equal to EXPORT_RING_MEMORY_POOL_BLOCK_SIZE");
-
+    // System calls are injectable for deterministic short-write/error tests.
+    struct IoOps
+    {
+        int (*submit)(aiocb*) = ::aio_write;
+        int (*error)(const aiocb*) = ::aio_error;
+        ssize_t (*result)(aiocb*) = ::aio_return;
+        int (*suspend)(const aiocb* const[], int, const timespec*) = ::aio_suspend;
+        int (*close)(int) = ::close;
+    };
 private:
-    // 连接到 FastqParser，用于获取含有低频 k-mer 的数据块
+    static constexpr size_t RAW_BUFFER_SIZE = 2ULL << 20;
+    static constexpr size_t NUM_AIO_BUFFERS = 2;
     const size_t record_bytes = kmer_bytes();
-    RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool = nullptr;
+    RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool;
+    ConcurrentMemoryPool* memory_pool_;
+    RunState local_state_;
+    RunState* state_;
+    const IoOps io_;
+    const std::string filename_;
+    const OutputKind output_kind_;
+    uint64_t shard_count_ = 1;
+    int fd = -1;
+    std::array<aiocb, NUM_AIO_BUFFERS> cbs{};
+    std::array<bool, NUM_AIO_BUFFERS> active{};
+    std::array<char*, NUM_AIO_BUFFERS> buffers{};
+    std::array<size_t, NUM_AIO_BUFFERS> used{};
+    size_t current = 0;
+    off_t file_offset = 0;
+    std::thread worker;
+    std::array<FirstSegmentRef, MAX_NUMA_NODES> spills_{};
+    std::array<FirstSegmentDescriptor*, MAX_NUMA_NODES> spilling_{};
+    std::array<size_t, MAX_NUMA_NODES> spill_offsets_{};
+    int next_arena_ = 0;
 
-    struct aiocb cbs[NUM_AIO_BUFFERS];
-    int fd;
-    bool cbs_active[NUM_AIO_BUFFERS];
-    std::array<char*, NUM_AIO_BUFFERS> buffer{};
-    std::array<uint64_t, NUM_AIO_BUFFERS> buffer_count; // 当前缓冲区中 k-mer 的数量
-    uint32_t current_buffer_index = 0;
-    uint64_t file_offset = 0; // 已经写入文件的字节数
-
-    // 专门执行落盘操作的单线程
-    std::thread worker_thread;
-    std::atomic<bool> is_running{ false };
+    [[noreturn]] static void io_error(const char* operation)
+    { throw std::system_error(errno ? errno : EIO, std::generic_category(), operation); }
 
 public:
-    ExportWriter() = delete;
+    explicit ExportWriter(RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* pool,
+        const std::string& filename, OutputKind kind,
+        ConcurrentMemoryPool* memory = nullptr, const IoOps* ops = nullptr)
+        : ring_memory_pool(pool), memory_pool_(memory),
+          state_(memory ? &memory->run_state() : RunState::active ? RunState::active : &local_state_),
+          io_(ops ? *ops : IoOps{}), filename_(filename), output_kind_(kind)
+    {
+        const std::string path = kind == OutputKind::Pending ? filename + ".0" : filename;
+        fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) io_error("open pending output");
+    }
     ExportWriter(const ExportWriter&) = delete;
     ExportWriter& operator=(const ExportWriter&) = delete;
-    ExportWriter(ExportWriter&&) = delete;
-    ExportWriter& operator=(ExportWriter&&) = delete;
-
-    explicit ExportWriter(RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* pool,
-        const std::string& filename = temp_dir + "low.bin")
-        : ring_memory_pool(pool), fd(-1)
-    {
-        fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) [[unlikely]]
-        {
-            std::cerr << "Failed to open export file: " << filename << std::endl;
-            std::exit(-1);
-        }
-
-        for (int i = 0; i < NUM_AIO_BUFFERS; ++i)
-        {
-            std::memset(&cbs[i], 0, sizeof(struct aiocb));
-            buffer[i] = nullptr;
-            buffer_count[i] = 0;
-            cbs_active[i] = false;
-        }
-    }
-
-    void join()
-    {
-        if (is_running && worker_thread.joinable())
-        {
-            worker_thread.join();
-            is_running = false;
-        }
-
-        const std::string filename = temp_dir + "low.bin";
-
-        if (fd >= 0)
-        {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-
-    ~ExportWriter()
-    {
-        if (fd >= 0)
-        {
-            ::close(fd);
-            fd = -1;
-        }
-        for (auto& buf : buffer) {
-            if (buf != nullptr)
-            {
-                ::free(buf);
-                buf = nullptr;
-            }
-        }
-    }
 
     void start()
     {
-        is_running = true;
-        worker_thread = std::thread(&ExportWriter::writer_loop, this);
+        // A successful start guarantees that both transport buffers exist before
+        // any Classifier is permitted to depend on reclamation.
+        for (auto& buffer : buffers) {
+            void* storage = nullptr;
+            if (posix_memalign(&storage, PAGE_SIZE, RAW_BUFFER_SIZE)) throw std::bad_alloc();
+            buffer = static_cast<char*>(storage);
+        }
+        if (memory_pool_) memory_pool_->set_spill_service(true);
+        try { worker = std::thread(&ExportWriter::writer_entry, this); }
+        catch (...) {
+            if (memory_pool_) memory_pool_->set_spill_service(false);
+            throw;
+        }
     }
-
+    void join()
+    {
+        if (worker.joinable()) worker.join();
+        close_file();
+        state_->check();
+    }
+    // The writer thread owns this count until join() succeeds.
+    uint64_t shard_count() const noexcept { return shard_count_; }
+    ~ExportWriter()
+    {
+        if (std::uncaught_exceptions() && !state_->failed())
+            state_->fail(std::make_exception_ptr(std::runtime_error("pipeline unwound")), "main");
+        if (worker.joinable()) worker.join();
+        cleanup_aio();
+        try { close_file(); } catch (...) { state_->fail(std::current_exception(), "pending close"); }
+        for (char* buffer : buffers) ::free(buffer);
+    }
 private:
+    void close_file()
+    {
+        if (fd < 0) return;
+        const int closing = fd;
+        fd = -1;
+        if (io_.close(closing)) {
+            auto error = std::make_exception_ptr(std::system_error(errno, std::generic_category(), "close pending output"));
+            state_->fail(error, "pending close");
+            std::rethrow_exception(error);
+        }
+    }
+    void writer_entry() noexcept
+    {
+        try { writer_loop(); }
+        catch (...) { state_->fail(std::current_exception(), "pending writer"); }
+        cleanup_aio();
+        if (memory_pool_) {
+            // On failure the run aborts; no held source may remain Consuming.
+            for (int i = 0; i < memory_pool_->arena_count(); ++i) {
+                if (spilling_[i]) memory_pool_->empty_first(spills_[i]);
+                spilling_[i] = nullptr;
+            }
+            memory_pool_->set_spill_service(false);
+        }
+    }
     void writer_loop()
     {
-
-        std::memset(cbs, 0, sizeof(cbs));
-
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i) {
-            void* buffer_ptr = nullptr;
-            int ret = ::posix_memalign(&buffer_ptr, 4096, RAW_BUFFER_SIZE);
-            if (ret != 0) {
-                std::cerr << "posix_memalign failed for buffer: " << strerror(ret) << std::endl;
-                std::exit(-1);
+        SpinBackoff<> backoff;
+        bool closing = false;
+        for (;;) {
+            state_->check();
+            if (!closing && ring_memory_pool->producer_finished()) {
+                closing = true;
+                if (memory_pool_) memory_pool_->set_spill_service(false);
             }
-            buffer[i] = static_cast<char*>(buffer_ptr);
-            buffer_count[i] = 0;
-        }
-
-        SpinBackoff backoff;
-
-        char* block_ptr = nullptr;
-
-
-        content_type content;
-
-        while (true)
-        {
-            if (ring_memory_pool->consumer_try_dequeue(content))
-            {
-                backoff.decay();
-                block_ptr = content.data;
-                ExportBlock* export_kmer_block = reinterpret_cast<ExportBlock *>(block_ptr);
-                if (content.length > 0) [[likely]]
-                {
-                    process_block(export_kmer_block, content.length);
-                }
-                else {
-                    ring_memory_pool->consumer_enqueue(block_ptr);
-                }
-                // ring_memory_pool->consumer_enqueue(block_ptr);
-
+            bool worked = false;
+            content_type content;
+            // At most one 256 KiB normal block before reconsidering reclaim.
+            if (ring_memory_pool->consumer_try_dequeue(content)) {
+                auto* block = reinterpret_cast<ExportBlock*>(content.data);
+                append(block->k_mers.data(), content.length * record_bytes);
+                ring_memory_pool->consumer_enqueue(content.data);
+                worked = true;
             }
-            else if (ring_memory_pool->producer_finished())
-            {
-                while (ring_memory_pool->consumer_try_dequeue(content))
-                {
-                    block_ptr = content.data;
-                    ExportBlock* export_kmer_block = reinterpret_cast<ExportBlock *>(block_ptr);
-                    if (content.length > 0) [[likely]]
-                    {
-                        process_block(export_kmer_block, content.length);
-                    }
-                    else {
-                        ring_memory_pool->consumer_enqueue(block_ptr);
-                    }
-                    cpu_relax();
-                }
-                break;
-            }
-            else
-            {
+            if (memory_pool_ && spill_step(!closing)) worked = true;
+            if (!worked) {
+                // Production ended before this round's queue/held-spill checks.
+                if (closing) break;
                 backoff.backoff();
-            }
+            } else backoff.reset();
         }
-
-
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i)
-        {
-            if (cbs_active[i])
-            {
-                wait_write_finish(i);
-            }
-        }
-
-        if (buffer_count[current_buffer_index] > 0)
-        {
-            async_write(current_buffer_index);
-            wait_write_finish(current_buffer_index);
-        }
-
-        for (auto& buf : buffer) {
-            if (buf != nullptr)
-            {
-                ::free(buf);
-                buf = nullptr;
-            }
-        }
+        if (used[current]) submit(current);
+        for (size_t i = 0; i < NUM_AIO_BUFFERS; ++i) wait_write(i);
     }
-
-    void process_block(ExportBlock* block, uint64_t count)
+    bool spill_step(bool allow_claim)
     {
-        const unsigned char* input = block->k_mers.data();
-        size_t remaining = count * record_bytes;
-        while (remaining != 0) {
-            const size_t copied = std::min<size_t>(remaining,
-                RAW_BUFFER_SIZE - buffer_count[current_buffer_index]);
-            std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], input, copied);
-            buffer_count[current_buffer_index] += copied;
-            input += copied;
-            remaining -= copied;
-            if (buffer_count[current_buffer_index] == RAW_BUFFER_SIZE) {
-                async_write(current_buffer_index);
-                current_buffer_index = (current_buffer_index + 1) % NUM_AIO_BUFFERS;
-                wait_write_finish(current_buffer_index);
+        const int arenas = memory_pool_->arena_count();
+        for (int attempt = 0; attempt < arenas; ++attempt) {
+            const int index = next_arena_;
+            next_arena_ = (next_arena_ + 1) % arenas;
+            if (!spilling_[index]) {
+                if (!allow_claim) continue;
+                spilling_[index] = memory_pool_->claim_spill(index, spills_[index]);
+                if (!spilling_[index]) continue;
+                spill_offsets_[index] = 0;
+            }
+            auto* segment = spilling_[index];
+            const size_t count = std::min(EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / record_bytes,
+                ConcurrentMemoryPool::first_segment_record_capacity() - spill_offsets_[index]);
+            append(reinterpret_cast<const unsigned char*>(segment->data) + spill_offsets_[index] * record_bytes, count * record_bytes);
+            // Commit only after the copy is in Writer-owned transport.
+            spill_offsets_[index] += count;
+#ifdef TEST_MODE
+            memory_pool_->spill_bytes.fetch_add(count * record_bytes, std::memory_order_relaxed);
+#endif
+            if (spill_offsets_[index] == ConcurrentMemoryPool::first_segment_record_capacity()) {
+                memory_pool_->empty_first(spills_[index]);
+                spilling_[index] = nullptr;
+            }
+            return true;
+        }
+        return false;
+    }
+    void append(const unsigned char* input, size_t bytes)
+    {
+        // append() receives complete records from either transport or FIRST spill.
+        if (bytes && output_kind_ == OutputKind::Pending
+            && static_cast<uint64_t>(file_offset) + used[current] >= LOW_PENDING_SHARD_BYTES) {
+            if (used[current]) submit(current);
+            for (size_t i = 0; i < NUM_AIO_BUFFERS; ++i) wait_write(i);
+            close_file();
+            const std::string path = filename_ + "." + std::to_string(shard_count_);
+            fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) io_error("open pending shard");
+            ++shard_count_;
+            file_offset = 0;
+        }
+        while (bytes) {
+            const size_t count = std::min(bytes, RAW_BUFFER_SIZE - used[current]);
+            std::memcpy(buffers[current] + used[current], input, count);
+            used[current] += count;
+            input += count;
+            bytes -= count;
+            if (used[current] == RAW_BUFFER_SIZE) {
+                submit(current);
+                current = (current + 1) % NUM_AIO_BUFFERS;
+                wait_write(current);
             }
         }
-        ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(block));
     }
-
-    void wait_write_finish(const uint32_t buffer_index)
+    void submit(size_t i)
     {
-        if (!cbs_active[buffer_index]) [[unlikely]]
-        {
-            return;
-        }
-
-        const aiocb* list[1] = { &cbs[buffer_index] };
-        int err;
-        while ((err = ::aio_error(&cbs[buffer_index])) == EINPROGRESS)
-        {
-            if (::aio_suspend(list, 1, nullptr) != 0 && errno != EINTR) [[unlikely]]
-            {
-                std::cerr << "aio_suspend failed\n";
-                std::exit(-1);
-            }
-        }
-
-        err = ::aio_error(&cbs[buffer_index]);
-        if (err != 0) [[unlikely]]
-        {
-            std::cerr << "aio_write error\n";
-            std::exit(-1);
-        }
-
-        ssize_t n = ::aio_return(&cbs[buffer_index]);
-        if (n != static_cast<ssize_t>(cbs[buffer_index].aio_nbytes)) [[unlikely]]
-        {
-            std::cerr << "partial aio_write\n";
-            std::exit(-1);
-        }
-
-        cbs_active[buffer_index] = false;
+        if (used[i] > static_cast<uint64_t>(std::numeric_limits<off_t>::max() - file_offset))
+            throw std::overflow_error("pending file offset overflow");
+        cbs[i] = {};
+        cbs[i].aio_fildes = fd;
+        cbs[i].aio_buf = buffers[i];
+        cbs[i].aio_nbytes = used[i];
+        cbs[i].aio_offset = file_offset;
+        if (io_.submit(&cbs[i])) io_error("aio_write pending");
+        active[i] = true;
+        file_offset += used[i];
+        used[i] = 0;
     }
-
-    void async_write(const uint32_t buffer_index)
+    void wait_write(size_t i)
     {
-        std::memset(&cbs[buffer_index], 0, sizeof(struct aiocb));
-        cbs[buffer_index].aio_fildes = fd;
-        cbs[buffer_index].aio_buf = buffer[buffer_index];
-        cbs[buffer_index].aio_nbytes = buffer_count[buffer_index];
-        cbs[buffer_index].aio_offset = file_offset;
-
-        if (::aio_write(&cbs[buffer_index]) != 0) [[unlikely]]
-        {
-            std::cerr << "aio_write failed\n";
-            std::exit(-1);
+        if (!active[i]) return;
+        const aiocb* list[] = {&cbs[i]};
+        const timespec timeout{0, 10000000};
+        while (io_.error(&cbs[i]) == EINPROGRESS) {
+            state_->check();
+            if (io_.suspend(list, 1, &timeout) && errno != EINTR && errno != EAGAIN)
+                io_error("aio_suspend pending");
         }
-
-        file_offset += buffer_count[buffer_index];
-        buffer_count[buffer_index] = 0;
-        cbs_active[buffer_index] = true;
+        const int error = io_.error(&cbs[i]);
+        const ssize_t bytes = io_.result(&cbs[i]);
+        active[i] = false;
+        if (error) throw std::system_error(error, std::generic_category(), "aio completion pending");
+        if (bytes != static_cast<ssize_t>(cbs[i].aio_nbytes)) throw std::runtime_error("short pending write");
     }
-
-    constexpr uint64_t get_root_prefix(const unsigned char* val) const
+    void cleanup_aio() noexcept
     {
-        return val[0];
+        // Even after cancellation/failure, AIO must stop borrowing memory before
+        // buffers/descriptors are freed. No RunState check in this cleanup path.
+        for (size_t i = 0; i < NUM_AIO_BUFFERS; ++i) {
+            if (!active[i]) continue;
+            const aiocb* list[] = {&cbs[i]};
+            while (io_.error(&cbs[i]) == EINPROGRESS) io_.suspend(list, 1, nullptr);
+            io_.result(&cbs[i]);
+            active[i] = false;
+        }
     }
-
 };
-
-
-
-#endif // EXPORT_WRITER_HEADER
+#endif

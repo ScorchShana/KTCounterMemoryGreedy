@@ -4,6 +4,7 @@
 #include "kmer.h"
 #include "../include/xxh3.h"
 #include "ConcurrentMemoryPool.h"
+#include "MemoryBudget.h"
 
 #include <array>
 #include <cstdint>
@@ -37,7 +38,8 @@ public:
     explicit BloomFilter(size_t in_capacity)
         : capacity_(in_capacity), mod(capacity_ - 1)
     {
-        // capacity_ must be power of 2
+        if (!std::has_single_bit(in_capacity)) throw std::invalid_argument("Bloom capacity must be a power of two");
+        if (in_capacity > SIZE_MAX / sizeof(uint64_t)) throw std::overflow_error("Bloom capacity overflow");
         void* p = nullptr;
         posix_memalign(&p, 64, capacity_ * sizeof(uint64_t));
         if (p == nullptr) [[unlikely]]
@@ -165,11 +167,12 @@ public:
         uint64_t insert_num;
     };
 
-    explicit ConcurrentBloomFilter(size_t in_capacity, ConcurrentMemoryPool* memory_pool)
+    explicit ConcurrentBloomFilter(size_t in_capacity, ConcurrentMemoryPool* memory_pool, void* storage = nullptr)
         : capacity_(in_capacity), mod(capacity_ - 1)
     {
-        // capacity_ must be power of 2
-        bins = static_cast<std::atomic<uint64_t>*>(memory_pool->allocate_large(2 * capacity_ * sizeof(std::atomic<uint64_t>)));
+        const size_t bytes = bloom_bytes(capacity_);
+        if (!std::has_single_bit(in_capacity)) throw std::invalid_argument("Bloom capacity must be a power of two");
+        bins = static_cast<std::atomic<uint64_t>*>(storage ? storage : memory_pool->allocate_large(bytes));
         for (size_t i = 0; i < capacity_; ++i)
         {
             new (&bins[2 * i]) std::atomic<uint64_t>(0); // BF1 全置0

@@ -18,6 +18,7 @@
 
 class ConcurrentOpenAddressHashMap
 {
+    friend struct KmerTreeAllocationTestAccess;
 
 
     struct alignas(CACHE_LINE_SIZE) SizeCounter
@@ -436,68 +437,39 @@ public:
     }
 #endif
 
-    ConcurrentOpenAddressHashMap* ensure_next_map() {
-        ConcurrentOpenAddressHashMap* next_map_ptr = next_map.load(std::memory_order_acquire);
-        if (next_map_ptr == nullptr) [[unlikely]]
-        {
-            if (building_next.load(std::memory_order_acquire))
-            {
-                // Another thread is already building the next map, wait for it to finish
-                cpu_relax();
-                while (building_next.load(std::memory_order_acquire)) {
-                    cpu_relax();
-                    cpu_relax();
-                    cpu_relax();
-                    cpu_relax();
-                }
-                return next_map.load(std::memory_order_acquire);
-            }
-            else
-            {
-                bool expected = false;
-                if (building_next.compare_exchange_strong(expected,
-                    true,
-                    std::memory_order_release,
-                    std::memory_order_acquire))
-                {
-                    next_map_ptr = next_map.load(std::memory_order_acquire);
-                    if (next_map_ptr != nullptr)
-                    {
-                        building_next.store(false, std::memory_order_release);
-                        return next_map_ptr;
+    ConcurrentOpenAddressHashMap* ensure_next_map()
+    {
+        SpinBackoff<> backoff;
+        for (;;) {
+            pool->run_state().check();
+            auto* next = next_map.load(std::memory_order_acquire);
+            if (next) return next;
+            bool expected = false;
+            if (building_next.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                try {
+                    next = next_map.load(std::memory_order_acquire);
+                    if (!next) {
+                        const uint64_t next_id = segment_id + 1;
+                        const uint64_t factor = next_id > SEGMENT_WATERMARK ? 4 : 2;
+                        const uint64_t next_capacity = capacity > concurrent_hash_map_max_capacity / factor
+                            ? concurrent_hash_map_max_capacity : capacity * factor;
+                        void* memory = get_map_metadata_mem();
+                        next = new (memory) ConcurrentOpenAddressHashMap(next_capacity);
+                        next->segment_id = next_id;
+                        next_map.store(next, std::memory_order_release);
                     }
-                    else
-                    {
-                        // Build the next map
-                        uint32_t cur_segment_id = this->segment_id + 1;
-                        ConcurrentOpenAddressHashMap* new_map = reinterpret_cast<ConcurrentOpenAddressHashMap*>(get_map_metadata_mem());
-                        uint64_t new_capacity = cur_segment_id > SEGMENT_WATERMARK ? capacity * 4 : capacity * 2;
-                        new_capacity = std::min<uint64_t>(new_capacity, concurrent_hash_map_max_capacity); // Double the capacity for the next map
-                        new(new_map) ConcurrentOpenAddressHashMap(new_capacity);
-                        new_map->segment_id = cur_segment_id;
-                        next_map.store(new_map, std::memory_order_release);
-                        building_next.store(false, std::memory_order_release);
-                        return new_map;
-                    }
-                }
-                else
-                {
-                    cpu_relax();
-                    while (building_next.load(std::memory_order_acquire)) {
-                        cpu_relax();
-                        cpu_relax();
-                        cpu_relax();
-                        cpu_relax();
-                    }
-                    return next_map.load(std::memory_order_acquire);
+                    building_next.store(false, std::memory_order_release);
+                    return next;
+                } catch (...) {
+                    building_next.store(false, std::memory_order_release);
+                    throw;
                 }
             }
-        }
-        else
-        {
-            return next_map_ptr;
+            backoff.backoff();
         }
     }
+
 };
 
 #endif

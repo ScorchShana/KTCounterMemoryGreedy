@@ -66,7 +66,7 @@ public:
 
     ~FinalDrainWriter()
     {
-        close();
+        if (!RunState::active || !RunState::active->failed()) close();
     }
 
     void write_kmer_record(const unsigned char* kmer_data, const uint32_t count)

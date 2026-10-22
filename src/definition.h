@@ -144,6 +144,8 @@ constexpr uint64_t KMER_BATCH_PREFIX_BASES = ROOT_BASES;    // 根节点使用�
 constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节），包括计数和前缀
 
 // ExportWriter配置常量
+constexpr uint64_t LOW_PENDING_SHARD_BYTES = 20ULL << 30; // Target size; rotate between complete export blocks.
+static_assert(LOW_PENDING_SHARD_BYTES > 0);
 constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
 constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节点的导出缓冲区大小（字节）
 
@@ -181,6 +183,7 @@ alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> filtered_above_max_count{ 
 
 // 临时文件目录
 inline std::string temp_dir = "./tmp/";
+inline std::string mapping_filename = "mapping.tmp";
 
 // 布隆过滤器最大最小数目
 constexpr uint64_t MIN_BLOOM_FILTER_CAPACITY = 1ULL << 12; // 最低Bloom Filter容量，单位为元素数量

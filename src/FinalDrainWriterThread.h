@@ -26,8 +26,8 @@ class FinalDrainWriterThread
     std::thread thread_;
 
     struct aiocb cbs_[NUM_AIO_BUFFERS];
-    bool cbs_active_[NUM_AIO_BUFFERS];
-    std::array<char*, NUM_AIO_BUFFERS> buffer_;
+    bool cbs_active_[NUM_AIO_BUFFERS]{};
+    std::array<char*, NUM_AIO_BUFFERS> buffer_{};
     std::array<uint64_t, NUM_AIO_BUFFERS> buffer_count_;
     uint32_t current_buffer_index_ = 0;
     uint64_t file_offset_ = 0;
@@ -49,11 +49,11 @@ public:
 
     void start()
     {
-        fd_ = ::open((temp_dir + "high.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fd_ = ::open((temp_dir + "high.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd_ < 0) [[unlikely]]
         {
             std::cerr << "Failed to open high.bin\n";
-            std::exit(-1);
+            throw std::runtime_error("final output I/O failed");
         }
         for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i)
         {
@@ -69,8 +69,10 @@ public:
         if (thread_.joinable()) thread_.join();
         if (fd_ >= 0)
         {
-            ::close(fd_);
+            const int closing = fd_;
             fd_ = -1;
+            if (::close(closing) && RunState::active)
+                RunState::active->fail(std::make_exception_ptr(std::runtime_error("close high output failed")), "final writer");
         }
         for (int i = 0; i < NUM_AIO_BUFFERS; i++)
         {
@@ -87,6 +89,7 @@ public:
 
     ~FinalDrainWriterThread()
     {
+        RunState::fail_on_unwind();
         join();
 #ifdef TEST_MODE
         std::cout << "Final Drain Writer Thread consumer enqueue spin time: " << consumer_enqueue_spin_time << std::endl;
@@ -97,13 +100,15 @@ public:
 private:
     void writer_loop()
     {
+        run_worker("final writer", [&] {
+
         for (int i = 0; i < NUM_AIO_BUFFERS; i++)
         {
             void* buffer_ptr = nullptr;
             int ret = ::posix_memalign(&buffer_ptr, 4096, AIO_BUFFER_SIZE);
             if (ret != 0) {
                 std::cerr << "posix_memalign failed for buffer: " << strerror(ret) << std::endl;
-                std::exit(-1);
+                throw std::runtime_error("final output I/O failed");
             }
             buffer_[i] = static_cast<char*>(buffer_ptr);
         }
@@ -158,6 +163,15 @@ private:
         {
             if (buffer_[i]) ::free(buffer_[i]);
             buffer_[i] = nullptr;
+        }
+    
+        });
+        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i) {
+            if (!cbs_active_[i]) continue;
+            const aiocb* list[] = {&cbs_[i]};
+            while (::aio_error(&cbs_[i]) == EINPROGRESS) ::aio_suspend(list, 1, nullptr);
+            ::aio_return(&cbs_[i]);
+            cbs_active_[i] = false;
         }
     }
 
@@ -223,7 +237,7 @@ private:
         if (::aio_write(&cbs_[idx]) != 0) [[unlikely]]
         {
             std::cerr << "aio_write failed\n";
-            std::exit(-1);
+            throw std::runtime_error("final output I/O failed");
         }
 
         file_offset_ += buffer_count_[idx];
@@ -240,12 +254,14 @@ private:
 
         const aiocb* list[1] = { &cbs_[idx] };
         int err;
+        const timespec timeout{0, 10000000};
         while ((err = ::aio_error(&cbs_[idx])) == EINPROGRESS)
         {
-            if (::aio_suspend(list, 1, nullptr) != 0 && errno != EINTR) [[unlikely]]
+            RunState::check_active();
+            if (::aio_suspend(list, 1, &timeout) != 0 && errno != EINTR && errno != EAGAIN) [[unlikely]]
             {
                 std::cerr << "aio_suspend failed\n";
-                std::exit(-1);
+                throw std::runtime_error("final output I/O failed");
             }
         }
 
@@ -253,14 +269,15 @@ private:
         if (err != 0) [[unlikely]]
         {
             std::cerr << "aio_write error\n";
-            std::exit(-1);
+            throw std::runtime_error("final output I/O failed");
         }
 
         ssize_t n = ::aio_return(&cbs_[idx]);
+        cbs_active_[idx] = false;
         if (n != static_cast<ssize_t>(cbs_[idx].aio_nbytes)) [[unlikely]]
         {
             std::cerr << "partial aio_write\n";
-            std::exit(-1);
+            throw std::runtime_error("final output I/O failed");
         }
 
         cbs_active_[idx] = false;

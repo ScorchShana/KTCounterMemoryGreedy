@@ -48,7 +48,7 @@ class FastqPreReader
     std::vector<std::string> filenames_;
     size_t file_index_ = 0;
     RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
-    char* file_buffer;
+    char* file_buffer = nullptr; // Borrowed from pipeline_buffers_.
     char left_buffer_[128];
     size_t left_buffer_size_ = 0;
     bool is_gz_file = false;
@@ -73,26 +73,23 @@ public:
     {
         assert(ring_memory_pool_ptr_ != nullptr);
         assert(ring_memory_pool_ptr_->blockSize() > 1024);
-        if (filenames_.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
+        if (filenames_.empty()) { std::cerr << "No input files" << std::endl; throw std::runtime_error("input I/O failed"); }
 
         pipeline_buffers_.resize(PIPELINE_QUEUE_CAPACITY);
         for (uint64_t i = 0; i < PIPELINE_QUEUE_CAPACITY; ++i)
         {
             pipeline_buffers_[i] = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
-            if (!pipeline_buffers_[i]) { std::cerr << "Failed to allocate pipeline buffer" << std::endl; std::exit(-1); }
+            if (!pipeline_buffers_[i]) { std::cerr << "Failed to allocate pipeline buffer" << std::endl; throw std::runtime_error("input I/O failed"); }
             pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
         }
-
-        // need_read_ 在 pre_read() 中按文件数动态设置
-        file_buffer = new char[chunk_size_];
     }
 
     ~FastqPreReader()
     {
+        RunState::fail_on_unwind();
         if (io_thread_.joinable()) io_thread_.join();
         if (gzfile_ != nullptr) gzclose(gzfile_);
         if (fd_ != -1) ::close(fd_);
-        delete[] file_buffer;
         for (char* buf : pipeline_buffers_) if (buf) std::free(buf);
     }
 
@@ -111,7 +108,6 @@ public:
                 need_read_ = std::min(file_size_, per_file_limit);
             have_read_.store(0, std::memory_order_relaxed);
 
-            if (file_buffer) { delete[] file_buffer; file_buffer = nullptr; }
             io_thread_ = std::thread(&FastqPreReader::io_thread_func, this);
 
             ::content_type current_input{nullptr, 0};
@@ -144,20 +140,20 @@ private:
         std::cout << "FastqPreReader: " << (file_index_ + 1) << "/"
                   << filenames_.size() << ": " << fname << std::endl;
         fd_ = ::open(fname.data(), O_RDONLY);
-        if (fd_ == -1) { std::cerr << "Failed to open" << std::endl; std::exit(-1); }
+        if (fd_ == -1) { std::cerr << "Failed to open" << std::endl; throw std::runtime_error("input I/O failed"); }
         struct stat st;
-        if (fstat(fd_, &st) == -1) { std::cerr << "Failed to stat" << std::endl; std::exit(-1); }
+        if (fstat(fd_, &st) == -1) { std::cerr << "Failed to stat" << std::endl; throw std::runtime_error("input I/O failed"); }
         file_size_ = st.st_size;
 
         unsigned char buf[2];
         ssize_t n = ::read(fd_, buf, 2);
         is_gz_file = (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B);
-        if (lseek(fd_, 0, SEEK_SET) == -1) { std::cerr << "Failed to seek" << std::endl; std::exit(-1); }
+        if (lseek(fd_, 0, SEEK_SET) == -1) { std::cerr << "Failed to seek" << std::endl; throw std::runtime_error("input I/O failed"); }
 
         if (is_gz_file)
         {
             gzfile_ = gzopen(fname.c_str(), "rb");
-            if (gzfile_ == nullptr) { std::cerr << "Failed to open gzip" << std::endl; std::exit(-1); }
+            if (gzfile_ == nullptr) { std::cerr << "Failed to open gzip" << std::endl; throw std::runtime_error("input I/O failed"); }
         }
         else
         {
@@ -190,6 +186,8 @@ private:
 
     void io_thread_func()
     {
+        run_worker("pre-reader I/O", [&] {
+
         while (true)
         {
             char* buf = nullptr;
@@ -201,10 +199,11 @@ private:
             else
                 bytes_read = ::read(fd_, buf, chunk_size_);
 
-            if (bytes_read < 0) [[unlikely]] { std::cerr << "Failed to read" << std::endl; std::exit(-1); }
+            if (bytes_read < 0) [[unlikely]] { std::cerr << "Failed to read" << std::endl; throw std::runtime_error("input I/O failed"); }
             if (bytes_read == 0)
             {
-                pipeline_free_queue_.enqueue(buf);
+                // Only the parser returns buffers to the SPSC free queue.
+                pipeline_data_queue_.enqueue({buf, 0});
                 pipeline_data_queue_.enqueue({nullptr, 0});
                 break;
             }
@@ -218,6 +217,8 @@ private:
                 break;
             }
         }
+
+        });
     }
 
     void parse_loop(::content_type& current_input, bool& have_input)

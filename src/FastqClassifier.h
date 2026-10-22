@@ -12,6 +12,7 @@
 #include "SpinBackoff.h"
 #include "kmer.h"
 #include "ConcurrentFirstBlockRing.h"
+#include "RunState.h"
 
 #include <array>
 #include <algorithm>
@@ -45,11 +46,11 @@ class FastqClassifier
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>* classify_task_queue;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
     KmerTree* tree;
-    std::barrier<>& classifier_barrier;
 
     std::array<node, 1ULL << (2 * ROOT_BASES)> local_root_nodes{};
     std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_prefix_owners{};
-    std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> prefix_to_bloom_filter_index{};
+    std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_prefix_to_bloom_filter_index{};
+    std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_bloom_filter_index_to_prefix{};
 
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_counts{};
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_sums{};
@@ -76,6 +77,11 @@ class FastqClassifier
 
     SplitMix64 rng;
 
+    ConcurrentMemoryPool* memory_pool_;
+    unsigned char* first_active_;
+    size_t first_active_count_ = 0;
+    const int first_arena_;
+    size_t checkpoint_bytes_ = 0;
     ConcurrentFirstBlockRing* first_occurrence_ring_;
     uint8_t* first_block_;
     size_t first_block_count_ = 0;
@@ -83,7 +89,7 @@ class FastqClassifier
     std::array<uint8_t, EVICTED_BUFFER_BYTES> evicted_buffer_;
     size_t evicted_count_ = 0;
     size_t evicted_capacity_ = 0;
-    unsigned char* evicted_grouped_ = nullptr;
+    unsigned char evicted_grouped_[PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE];
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> evicted_prefix_counts_{};
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> evicted_prefix_offsets_{};
 
@@ -100,6 +106,10 @@ public:
     uint64_t low_records_recovered = 0;
     uint64_t first_drain_singletons = 0;
 #ifdef TEST_MODE
+    uint64_t first_direct_pending = 0;
+    uint64_t first_memory_to_tree = 0, first_memory_discarded = 0, first_memory_kept = 0;
+    uint64_t first_memory_tree_batches = 0;
+    uint64_t low_tree_batches = 0;
     uint64_t producer_enqueue_spin_time{ 0 };
     uint64_t producer_dequeue_spin_time{ 0 };
     uint64_t consumer_enqueue_spin_time{ 0 };
@@ -122,24 +132,24 @@ public:
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
         KmerTree* in_tree,
         ConcurrentMemoryPool* in_memory_pool,
-        std::barrier<>& in_barrier,
+        PhaseBarrier& in_barrier,
         ConcurrentFirstBlockRing* in_first_ring,
-        uint32_t in_producer_rank)
+        uint32_t in_producer_rank,
+        unsigned char* first_active = nullptr,
+        const std::array<void*, 256>* bloom_storage = nullptr)
         : classifier_index(in_classifier_index), parser_classifier_ring_pool(in_ring_pool),
         classify_task_queue(in_classify_task_queue), global_classifier_task_queue(in_global_classifier_task_queue),
-        tree(in_tree), classifier_barrier(in_barrier),
-        first_occurrence_ring_(in_first_ring), first_block_(in_first_ring->initial_block(in_producer_rank)),
+        tree(in_tree),
+        memory_pool_(in_memory_pool), first_active_(first_active), first_arena_(in_classifier_index% in_memory_pool->arena_count()),
+        first_occurrence_ring_(in_first_ring), first_block_(in_first_ring ? in_first_ring->initial_block(in_producer_rank) : nullptr),
         first_block_capacity_(ConcurrentFirstBlockRing::BLOCK_BYTES / kmer_bytes())
     {
         char* raw_block_ptr = nullptr;
         dequeue_data_to_export_writer(raw_block_ptr);
-        export_block_ptr = reinterpret_cast<ExportBlock *>(raw_block_ptr);
+        export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);
 
         const size_t packed_bytes = kmer_bytes();
         evicted_capacity_ = EVICTED_BUFFER_BYTES / packed_bytes;
-        const size_t grouped_bytes = evicted_capacity_ * kmer_bytes();
-        auto* grouped_storage = in_memory_pool->allocate_large(grouped_bytes);
-        evicted_grouped_ = static_cast<unsigned char*>(grouped_storage);
 
         local_prefix_owners = prefix_owners;
 
@@ -147,8 +157,9 @@ public:
         {
             if (local_prefix_owners[i] == classifier_index)
             {
-                local_bloom_filters.emplace_back(bloom_filter_capacity[i], in_memory_pool);
-                prefix_to_bloom_filter_index[i] = local_bloom_filters.size() - 1;
+                local_bloom_filters.emplace_back(bloom_filter_capacity[i], in_memory_pool, bloom_storage ? (*bloom_storage)[i] : nullptr);
+                local_prefix_to_bloom_filter_index[i] = local_bloom_filters.size() - 1;
+                local_bloom_filter_index_to_prefix[local_bloom_filters.size() - 1] = i;
             }
         }
 
@@ -309,8 +320,6 @@ public:
                 break;
             }
         }
-        // Finish all Bloom updates; remaining FIRSTs are drained after the Writer switches.
-        classifier_barrier.arrive_and_wait();
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
         export_block_ptr = nullptr;
@@ -324,7 +333,8 @@ public:
             dequeue_data_to_export_writer(raw_block_ptr);
             export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);
         }
-        first_drain_singletons += drain_first_occurrences<WRITE_LOW>();
+        if (first_occurrence_ring_) first_drain_singletons += drain_first_occurrences<WRITE_LOW>();
+        size_t hit_count = 0;
         local_first_round = 0;
         check_local_first_round = MIN_CHECK_LOCAL_ROUND * 2;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> backoff;
@@ -333,20 +343,100 @@ public:
         {
             if (parser_classifier_ring_pool->producer_finished()) {
                 while (classify_task_queue->try_dequeue(content))
-                    reconcile_low_block<WRITE_LOW>(content);
+                    reconcile_low_block<WRITE_LOW>(content, hit_count);
                 while (global_classifier_task_queue->try_dequeue(content))
-                    reconcile_low_block<WRITE_LOW>(content);
+                    reconcile_low_block<WRITE_LOW>(content, hit_count);
                 break;
             }
             if (try_dequeue_low_task(content)) {
                 backoff.decay();
-                reconcile_low_block<WRITE_LOW>(content);
-            } else {
+                reconcile_low_block<WRITE_LOW>(content, hit_count);
+            }
+            else {
                 backoff.backoff();
             }
         }
+        flush_recovered_tree_batch<false>(hit_count);
         if constexpr (WRITE_LOW) {
-            enqueue_content_to_export_writer({reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count});
+            enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
+            export_kmer_block_count = 0;
+            export_block_ptr = nullptr;
+        }
+    }
+
+    size_t first_tail_records() const noexcept { return first_active_count_; }
+
+    template<bool WRITE_LOW>
+    void process_memory_first()
+    {
+        if (!first_active_) return;
+        const size_t width = kmer_bytes();
+        size_t hit_count = 0;
+#ifdef TEST_MODE
+        const uint64_t queries_before = repeat_query_count;
+#endif
+        if constexpr (WRITE_LOW) {
+            char* raw_block_ptr = nullptr;
+            dequeue_data_to_export_writer(raw_block_ptr);
+            export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);
+        }
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> backoff;
+        for (;;) {
+            memory_pool_->run_state().check();
+            // Process the private tail first. Whole-segment extraction reuses
+            // this same reservation and returns the source before any Tree call.
+            for (size_t offset = 0; offset < first_active_count_;) {
+                const size_t take = std::min(evicted_capacity_, first_active_count_ - offset);
+                const auto* records = first_active_ + offset * width;
+                std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
+                for (size_t i = 0; i < std::min<size_t>(take, BLOOM_PREFETCH_DISTANCE); ++i)
+                    prepare_repeat_lookup(lookups[i], records + i * width);
+                size_t run_count = 0;
+                size_t misses = 0;
+                for (size_t i = 0; i < take; ++i) {
+                    const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
+                    const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
+                    if (i + BLOOM_PREFETCH_DISTANCE < take)
+                        prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
+                            records + (i + BLOOM_PREFETCH_DISTANCE) * width);
+                    if (repeated) {
+                        ++run_count;
+                    } else {
+                        if (run_count != 0) {
+                            append_recovered_tree_hits<true>(records + (i - run_count) * width, run_count, hit_count);
+                            run_count = 0;
+                        }
+                        if constexpr (WRITE_LOW) export_one_kmer(records + i * width);
+                        ++misses;
+                    }
+                }
+                if (run_count != 0)
+                    append_recovered_tree_hits<true>(records + (take - run_count) * width, run_count, hit_count);
+                first_drain_singletons += misses;
+#ifdef TEST_MODE
+                repeat_query_count += take;
+                if constexpr (WRITE_LOW) first_memory_kept += misses;
+                else first_memory_discarded += misses;
+#endif
+                offset += take;
+            }
+            first_active_count_ = 0;
+            const auto status = memory_pool_->extract_first_segment(first_arena_, first_active_);
+            if (status == ConcurrentMemoryPool::FirstExtractStatus::Done) break;
+            if (status == ConcurrentMemoryPool::FirstExtractStatus::Busy) backoff.backoff();
+            else {
+                first_active_count_ = ConcurrentMemoryPool::first_segment_record_capacity();
+                backoff.decay();
+            }
+        }
+        flush_recovered_tree_batch<true>(hit_count);
+#ifdef TEST_MODE
+        if (repeat_query_count - queries_before != first_memory_to_tree + first_memory_kept + first_memory_discarded
+            || first_memory_tree_batches != (first_memory_to_tree + INPUT_BLOCK_CAPACITY - 1) / INPUT_BLOCK_CAPACITY)
+            throw std::logic_error("memory FIRST scan did not conserve records or Tree batches");
+#endif
+        if constexpr (WRITE_LOW) {
+            enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
             export_kmer_block_count = 0;
             export_block_ptr = nullptr;
         }
@@ -363,6 +453,57 @@ public:
 
 
 private:
+    template<bool MEMORY_FIRST>
+    void append_recovered_tree_hits(const unsigned char* records, size_t count, size_t& hit_count)
+    {
+        const size_t width = kmer_bytes();
+        while (count != 0) {
+            const size_t take = std::min(count, INPUT_BLOCK_CAPACITY - hit_count);
+            std::memcpy(evicted_grouped_ + hit_count * width, records, take * width);
+            hit_count += take;
+            records += take * width;
+            count -= take;
+            if (hit_count == INPUT_BLOCK_CAPACITY) flush_recovered_tree_batch<MEMORY_FIRST>(hit_count);
+        }
+    }
+
+    template<bool MEMORY_FIRST>
+    void flush_recovered_tree_batch(size_t& hit_count)
+    {
+        if (hit_count == 0) return;
+        calculate_block_prefix_counts(evicted_grouped_, hit_count);
+        push_kmers_into_local_block_for_copy(evicted_grouped_, hit_count);
+        uint32_t root_count = 0;
+        for (uint32_t prefix = 0; prefix < local_block_prefix_counts.size(); ++prefix)
+            if (local_block_prefix_counts[prefix] != 0) prefix_ordered_by_owner[root_count++] = prefix;
+        tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts,
+            prefix_ordered_by_owner, root_count, local_root_nodes.data());
+        if constexpr (MEMORY_FIRST) {
+#ifdef TEST_MODE
+            first_memory_to_tree += hit_count;
+            recovered_first_count += hit_count;
+            ++first_memory_tree_batches;
+#endif
+        } else {
+            low_records_recovered += hit_count;
+#ifdef TEST_MODE
+            ++low_tree_batches;
+#endif
+        }
+#ifdef TEST_MODE
+        total_kmers_send_to_tree += hit_count;
+#endif
+        hit_count = 0;
+    }
+
+    void record_checkpoint()
+    {
+        checkpoint_bytes_ += kmer_bytes();
+        if (checkpoint_bytes_ >= BLOCK_SIZE) {
+            checkpoint_bytes_ = 0;
+            memory_pool_->run_state().check();
+        }
+    }
     bool try_dequeue_low_task(content_type& content)
     {
         if (local_first_round < check_local_first_round) {
@@ -379,64 +520,41 @@ private:
     }
 
     template <bool WRITE_LOW>
-    void reconcile_low_block(const content_type& content)
+    void reconcile_low_block(const content_type& content, size_t& hit_count)
     {
-        const size_t batch_capacity = std::min(evicted_capacity_, INPUT_BLOCK_CAPACITY);
+        const size_t width = kmer_bytes();
         std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
         const auto* keys = reinterpret_cast<const unsigned char*>(content.data);
-        for (size_t pos = 0; pos < content.length; pos += batch_capacity)
+        for (size_t i = 0; i < std::min<size_t>(content.length, BLOOM_PREFETCH_DISTANCE); ++i)
+            prepare_repeat_lookup(lookups[i], keys + i * width);
+
+        size_t run_count = 0;
+        for (size_t i = 0; i < content.length; ++i)
         {
-            const size_t count = std::min<size_t>(batch_capacity, content.length - pos);
-            evicted_prefix_counts_.fill(0);
-            for (size_t i = 0; i < std::min<size_t>(count, BLOOM_PREFETCH_DISTANCE); ++i)
-                prepare_repeat_lookup(lookups[i], (keys + (pos + i) * kmer_bytes()));
-
-            size_t recovered = 0;
-            for (size_t i = 0; i < count; ++i)
-            {
-                const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
-                const unsigned char* val = (keys + (pos + i) * kmer_bytes());
-                const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
-                if (i + BLOOM_PREFETCH_DISTANCE < count)
-                    prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
-                        (keys + (pos + i + BLOOM_PREFETCH_DISTANCE) * kmer_bytes()));
-                if (repeated) {
-                    std::memcpy((local_block_for_copy.data() + (recovered++) * kmer_bytes()), val, kmer_bytes());
-                    ++evicted_prefix_counts_[lookup.prefix];
-                } else if constexpr (WRITE_LOW) {
-                    export_one_kmer(val);
+            const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
+            const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
+            if (i + BLOOM_PREFETCH_DISTANCE < content.length)
+                prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
+                    keys + (i + BLOOM_PREFETCH_DISTANCE) * width);
+            if (repeated) {
+                ++run_count;
+            } else {
+                if (run_count != 0) {
+                    append_recovered_tree_hits<false>(keys + (i - run_count) * width, run_count, hit_count);
+                    run_count = 0;
                 }
+                if constexpr (WRITE_LOW) export_one_kmer(keys + i * width);
             }
-
-            uint32_t offset = 0;
-            for (size_t prefix = 0; prefix < evicted_prefix_counts_.size(); ++prefix) {
-                evicted_prefix_offsets_[prefix] = offset;
-                offset += evicted_prefix_counts_[prefix];
-            }
-            for (size_t i = 0; i < recovered; ++i) {
-                const auto* val = (local_block_for_copy.data() + (i) * kmer_bytes());
-                std::memcpy((evicted_grouped_ + (evicted_prefix_offsets_[get_root_prefix(val)]++) * kmer_bytes()), val, kmer_bytes());
-            }
-            offset = 0;
-            for (uint32_t prefix = 0; prefix < evicted_prefix_counts_.size(); ++prefix) {
-                const uint32_t amount = evicted_prefix_counts_[prefix];
-                if (amount > 0) {
-                    tree->main_add_kmers_to_local_root(evicted_grouped_ + offset * kmer_bytes(), amount,
-                        prefix, local_root_nodes.data());
-                    offset += amount;
-                }
-            }
-            low_records_recovered += recovered;
-#ifdef TEST_MODE
-            total_kmers_send_to_tree += recovered;
-#endif
         }
+        if (run_count != 0)
+            append_recovered_tree_hits<false>(keys + (content.length - run_count) * width, run_count, hit_count);
         low_records_scanned += content.length;
         parser_classifier_ring_pool->consumer_enqueue(content.data);
     }
 
     void process_owned_block(const unsigned char* kmer_data, const uint64_t kmer_count)
     {
+        memory_pool_->run_state().check();
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_owned_local_block();
@@ -445,6 +563,7 @@ private:
 
     void process_other_block(const unsigned char* kmer_data, const uint64_t kmer_count)
     {
+        memory_pool_->run_state().check();
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_other_local_block();
@@ -459,7 +578,7 @@ private:
         // 可以考虑simd加速
         for (uint64_t i = 0; i < kmer_count; ++i)
         {
-            const uint64_t prefix = get_root_prefix((kmer_data + (i) * kmer_bytes()));
+            const uint64_t prefix = get_root_prefix((kmer_data + (i)*kmer_bytes()));
             local_block_prefix_counts[prefix]++;
         }
 
@@ -474,14 +593,13 @@ private:
     {
         for (uint64_t index = 0; index < kmer_count; index++)
         {
-            const uint64_t prefix = get_root_prefix((kmer_data + (index) * kmer_bytes()));
-            const uint64_t pos = local_block_prefix_sums[prefix];
-            std::memcpy((local_block_for_copy.data() + (pos) * kmer_bytes()), (kmer_data + (index) * kmer_bytes()), kmer_bytes());
-            local_block_prefix_sums[prefix]++;
+            const uint64_t prefix = get_root_prefix((kmer_data + (index)*kmer_bytes()));
+            const uint64_t pos = local_block_prefix_sums[prefix]++;
+            std::memcpy((local_block_for_copy.data() + (pos)*kmer_bytes()), (kmer_data + (index)*kmer_bytes()), kmer_bytes());
         }
     }
 
-    void export_one_kmer(const unsigned char* val) noexcept
+    void export_one_kmer(const unsigned char* val)
     {
         std::memcpy((export_block_ptr->k_mers.data() + (export_kmer_block_count++) * kmer_bytes()), val, kmer_bytes());
         if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
@@ -497,11 +615,36 @@ private:
 #endif
     }
 
-    void push_first_occurrence(const unsigned char* val) noexcept
+    void push_first_occurrence(const unsigned char* val)
     {
 #ifdef TEST_MODE
         first_occurrence_count++;
 #endif
+        if (!first_occurrence_ring_) {
+            if (!first_active_) {
+                export_one_kmer(val);
+#ifdef TEST_MODE
+                ++first_direct_pending;
+#endif
+                return;
+            }
+            const size_t width = kmer_bytes();
+            std::memcpy(first_active_ + first_active_count_ * width, val, width);
+            if (++first_active_count_ == ConcurrentMemoryPool::first_segment_record_capacity()) {
+                if (!memory_pool_->cache_first_segment(first_arena_, first_active_)) {
+                    // No shared segment is held across Export Ring waits.
+                    for (size_t i = 0; i < first_active_count_; ++i) {
+                        export_one_kmer(first_active_ + i * width);
+                        record_checkpoint();
+                    }
+#ifdef TEST_MODE
+                    first_direct_pending += first_active_count_;
+#endif
+                }
+                first_active_count_ = 0;
+            }
+            return;
+        }
         const size_t width = kmer_bytes();
         std::memcpy(first_block_ + first_block_count_ * width, val, width);
         if (++first_block_count_ == first_block_capacity_)
@@ -513,7 +656,7 @@ private:
     }
 
     template<bool WRITE_MISSES = true>
-    uint64_t append_evicted_records(const uint8_t* records, size_t count) noexcept
+    uint64_t append_evicted_records(const uint8_t* records, size_t count)
     {
         const size_t width = kmer_bytes();
         uint64_t misses = 0;
@@ -529,7 +672,7 @@ private:
         return misses;
     }
 
-    void group_evicted() noexcept
+    void group_evicted()
     {
         const size_t width = kmer_bytes();
         evicted_prefix_counts_.fill(0);
@@ -554,16 +697,16 @@ private:
         }
     }
 
-    void prepare_repeat_lookup(RepeatLookup& lookup, const unsigned char* key) const noexcept
+    void prepare_repeat_lookup(RepeatLookup& lookup, const unsigned char* key) const
     {
         const uint32_t prefix = get_root_prefix(key);
         auto* filter = local_global_bloom_filter[prefix];
-        lookup = {filter, filter->prepare_insert(key), prefix};
+        lookup = { filter, filter->prepare_insert(key), prefix };
         filter->prefetch_contains(lookup.probe);
     }
 
     template<bool WRITE_MISSES = true>
-    uint64_t flush_evicted_batch() noexcept
+    uint64_t flush_evicted_batch()
     {
         if (evicted_count_ == 0)
         {
@@ -576,7 +719,7 @@ private:
         std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
         for (size_t i = 0; i < std::min<size_t>(evicted_count_, BLOOM_PREFETCH_DISTANCE); ++i)
         {
-            prepare_repeat_lookup(lookups[i], (evicted_grouped_ + (i) * kmer_bytes()));
+            prepare_repeat_lookup(lookups[i], (evicted_grouped_ + (i)*kmer_bytes()));
         }
 
         size_t output_count = 0;
@@ -584,7 +727,7 @@ private:
         for (size_t i = 0; i < evicted_count_; ++i)
         {
             const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
-            const unsigned char* val = (evicted_grouped_ + (i) * kmer_bytes());
+            const unsigned char* val = (evicted_grouped_ + (i)*kmer_bytes());
             const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
             if (i + BLOOM_PREFETCH_DISTANCE < evicted_count_)
             {
@@ -631,7 +774,7 @@ private:
     }
 
     template<bool WRITE_MISSES = true>
-    uint64_t drain_first_occurrences() noexcept
+    uint64_t drain_first_occurrences()
     {
         uint64_t misses = append_evicted_records<WRITE_MISSES>(first_block_, first_block_count_);
         first_block_count_ = 0;
@@ -645,14 +788,15 @@ private:
         return misses + flush_evicted_batch<WRITE_MISSES>();
     }
 
-    void classify_owned_local_block() noexcept
+    void classify_owned_local_block()
     {
 
         uint64_t local_block_count = 0;
 
         uint64_t read_offset = 0;
-        for (uint64_t prefix = 0; prefix < local_block_prefix_counts.size(); prefix++)
+        for (uint64_t bloom_filter_index = 0; bloom_filter_index < local_bloom_filters.size(); bloom_filter_index++)
         {
+            const uint32_t prefix = local_bloom_filter_index_to_prefix[bloom_filter_index];
             const uint32_t prefix_count = local_block_prefix_counts[prefix];
             if (prefix_count == 0)
             {
@@ -662,16 +806,15 @@ private:
             uint32_t to_tree_count = 0;
             uint64_t run_count = 0;
 
-            const uint32_t bloom_filter_index = prefix_to_bloom_filter_index[prefix];
-
             ConcurrentBloomFilter& bloom_filter = local_bloom_filters[bloom_filter_index];
 
             if (prefix_count < BLOOM_PREFETCH_DISTANCE / 2) [[unlikely]]
             {
                 for (uint32_t i = 0; i < prefix_count; ++i)
                 {
-                    const unsigned char* val = (local_block_for_copy.data() + (read_offset) * kmer_bytes());
+                    const unsigned char* val = (local_block_for_copy.data() + (read_offset)*kmer_bytes());
 
+                    record_checkpoint();
                     const Occurrence occ = bloom_filter.insert(val);
                     if (occ == Occurrence::FIRST)
                     {
@@ -711,7 +854,7 @@ private:
             for (uint32_t i = 0; i < warmup_count; ++i)
             {
                 const uint64_t idx = prefix_begin + i;
-                probes[i] = bloom_filter.prepare_insert((local_block_for_copy.data() + (idx) * kmer_bytes()));
+                probes[i] = bloom_filter.prepare_insert((local_block_for_copy.data() + (idx)*kmer_bytes()));
                 bloom_filter.prefetch_insert(probes[i]);
             }
 
@@ -719,15 +862,16 @@ private:
             {
                 const uint32_t slot = i % BLOOM_PREFETCH_DISTANCE;
                 const uint64_t idx = prefix_begin + i;
-                const unsigned char* val = (local_block_for_copy.data() + (idx) * kmer_bytes());
+                const unsigned char* val = (local_block_for_copy.data() + (idx)*kmer_bytes());
 
+                record_checkpoint();
                 const Occurrence occ = bloom_filter.insert_prepared(probes[slot]);
 
                 const uint32_t next_i = i + BLOOM_PREFETCH_DISTANCE;
                 if (next_i < prefix_count)
                 {
                     const uint64_t next_idx = prefix_begin + next_i;
-                    probes[slot] = bloom_filter.prepare_insert((local_block_for_copy.data() + (next_idx) * kmer_bytes()));
+                    probes[slot] = bloom_filter.prepare_insert((local_block_for_copy.data() + (next_idx)*kmer_bytes()));
                     bloom_filter.prefetch_insert(probes[slot]);
                 }
 
@@ -771,7 +915,7 @@ private:
         }
     }
 
-    void classify_other_local_block() noexcept
+    void classify_other_local_block()
     {
         uint64_t local_block_count = 0;
 
@@ -792,8 +936,9 @@ private:
 
             for (uint32_t i = 0; i < prefix_count; i++)
             {
-                const unsigned char* val = (local_block_for_copy.data() + (read_offset) * kmer_bytes());
+                const unsigned char* val = (local_block_for_copy.data() + (read_offset)*kmer_bytes());
 
+                record_checkpoint();
                 const Occurrence occ = bloom_filter.insert(val);
                 if (occ == Occurrence::FIRST)
                 {

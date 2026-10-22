@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON) # if compiler doesn't support C++20, then er
 include(CheckIncludeFileCXX)
 
 enable_testing()
+option(TEST_MODE "Enable diagnostic statistics and output for Tree" OFF)
 
 # List implementation source files here. Replace or remove entries
 # if the corresponding .cpp files do not exist.
@@ -38,6 +39,9 @@ set(ZLIB_ENABLE_EXAMPLES OFF)
 add_subdirectory(third_party/zlib-ng)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
+if(TEST_MODE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TEST_MODE)
+endif()
 
 target_link_libraries(${PROJECT_NAME} zlib)
 target_link_libraries(${PROJECT_NAME} rt)
@@ -122,6 +126,11 @@ if(HAVE_NUMA_H)
     target_link_libraries(reader_thread_pool_test numa)
 endif()
 add_test(NAME ReaderThreadPoolTest COMMAND reader_thread_pool_test)
+
+add_executable(fastq_pre_reader_test tests/test_fastq_pre_reader.cpp)
+target_link_libraries(fastq_pre_reader_test zlib rt pthread atomic)
+add_test(NAME FastqPreReaderTest COMMAND fastq_pre_reader_test)
+set_tests_properties(FastqPreReaderTest PROPERTIES TIMEOUT 30)
 
 add_executable(final_drain_reader_test tests/test_final_drain_reader.cpp)
 target_link_libraries(final_drain_reader_test rt)
@@ -254,3 +263,50 @@ add_executable(benchmark_gzip_base_extraction_test tests/benchmark_gzip_base_ext
 target_link_libraries(benchmark_gzip_base_extraction_test zlib)
 target_link_libraries(benchmark_gzip_base_extraction_test pthread)
 target_link_libraries(benchmark_gzip_base_extraction_test rt)
+
+add_executable(memory_budget_test tests/test_memory_budget.cpp)
+target_link_libraries(memory_budget_test pthread rt atomic)
+if(NUMA_LIBRARY)
+    target_link_libraries(memory_budget_test ${NUMA_LIBRARY})
+endif()
+add_test(NAME MemoryBudgetTest COMMAND memory_budget_test)
+set_tests_properties(MemoryBudgetTest PROPERTIES TIMEOUT 30)
+
+foreach(POOL_TEST IN ITEMS concurrent_memory_pool run_state first_full_segments first_pool_lifecycle tree_allocation_failure first_spill_writer large_memory_calculations large_memory_mapping file_arena first_memory_scan)
+    add_executable(${POOL_TEST}_test tests/test_${POOL_TEST}.cpp)
+    target_link_libraries(${POOL_TEST}_test pthread rt atomic)
+    if(NUMA_LIBRARY)
+        target_link_libraries(${POOL_TEST}_test ${NUMA_LIBRARY})
+    endif()
+endforeach()
+target_compile_definitions(first_full_segments_test PRIVATE TEST_MODE)
+target_compile_definitions(first_spill_writer_test PRIVATE TEST_MODE)
+add_test(NAME ConcurrentMemoryPoolTest COMMAND concurrent_memory_pool_test)
+add_test(NAME FileArenaTest COMMAND file_arena_test)
+set_tests_properties(FileArenaTest PROPERTIES TIMEOUT 60)
+add_test(NAME FirstMemoryScanTest COMMAND first_memory_scan_test)
+set_tests_properties(FirstMemoryScanTest PROPERTIES TIMEOUT 30)
+add_test(NAME LargeMemoryCalculationsTest COMMAND large_memory_calculations_test)
+set_tests_properties(LargeMemoryCalculationsTest PROPERTIES TIMEOUT 30)
+add_test(NAME LargeMemoryMappingTest COMMAND large_memory_mapping_test)
+set_tests_properties(LargeMemoryMappingTest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+add_test(NAME RunStateTest COMMAND run_state_test)
+add_test(NAME FirstFullSegmentsTest COMMAND first_full_segments_test)
+add_test(NAME FirstPoolLifecycleTest COMMAND first_pool_lifecycle_test)
+set_tests_properties(ConcurrentMemoryPoolTest RunStateTest FirstFullSegmentsTest FirstPoolLifecycleTest PROPERTIES TIMEOUT 30)
+
+add_test(NAME TreeAllocationFailureTest COMMAND tree_allocation_failure_test)
+set_tests_properties(TreeAllocationFailureTest PROPERTIES TIMEOUT 30)
+
+add_test(NAME FirstSpillWriterTest COMMAND first_spill_writer_test)
+set_tests_properties(FirstSpillWriterTest PROPERTIES TIMEOUT 60)
+if(PYTHON3_EXECUTABLE)
+    add_test(NAME FirstPoolEndToEndTest COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_first_pool_end_to_end.py $<TARGET_FILE:Tree>)
+    set_tests_properties(FirstPoolEndToEndTest PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+
+if(PYTHON3_EXECUTABLE)
+    add_test(NAME FirstPoolFailureTest COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_first_pool_failures.py $<TARGET_FILE:Tree>)
+    set_tests_properties(FirstPoolFailureTest PROPERTIES TIMEOUT 75 RUN_SERIAL TRUE)
+endif()

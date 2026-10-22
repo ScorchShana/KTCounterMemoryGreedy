@@ -55,12 +55,15 @@ public:
         threads_ptr.reserve(parser_count);
     }
 
+    ~ParserThreadPool() { RunState::fail_on_unwind(); join(); }
+
     void start(RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>& reads)
     {
         for (uint32_t i = 0; i < parser_count; ++i)
         {
             threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
                 {
+                    run_worker("parser", [&] {
                     std::this_thread::sleep_for(std::chrono::nanoseconds(20));
                     FastqParser parser( classifier_task_queues, global_classifier_task_queue, &reads, parser_classifier_ring_pool);
                     parser.parse_and_push();
@@ -76,6 +79,7 @@ public:
                     total_flush_cycles += parser.flush_cycles;
                     total_queue_wait_cycles += parser.queue_wait_cycles;
 #endif
+                    });
                 }));
         }
     }
@@ -90,9 +94,11 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([this, &reads]
                 {
+                    run_worker("low parser", [&] {
                     LowFrequencyParser parser(classifier_task_queues, global_classifier_task_queue);
                     parser.parse_and_push(reads, *parser_classifier_ring_pool);
                     parser_classifier_ring_pool->producer_set_finished();
+                    });
                 }));
         }
     }

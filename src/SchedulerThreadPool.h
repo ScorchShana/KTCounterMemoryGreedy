@@ -84,7 +84,7 @@ class SchedulerThreadPool final
     std::array<double, MAX_DEPTH> depth_ema_work{};
     std::vector<uint32_t> movein_workers_id;
 
-    std::barrier<> drain_all_done_barrier;
+    PhaseBarrier drain_all_done_barrier;
     FinalDrainWriterThread drain_writer_thread_;
 
     inline static thread_local SpinBackoff<16, 128, 128 + 8, 8> backoff;
@@ -142,6 +142,8 @@ public:
 
     ~SchedulerThreadPool()
     {
+        RunState::fail_on_unwind();
+        join();
 #ifdef TEST_MODE
         std::cout << "SchedulerThreadPool Request Sleep : " << total_request_sleep_time.load() << std::endl;
         std::cout << "SchedulerThreadPool Backoff Time With Tasks : " << total_backoff_time_with_tasks.load() << std::endl;
@@ -224,6 +226,7 @@ public:
         std::cout << "Final drain writer producer enqueue spin time: " << final_drain_writer_producer_enqueue_spin_time.load(std::memory_order_relaxed) << std::endl;
         std::cout << "Final drain writer producer dequeue spin time: " << final_drain_writer_producer_dequeue_spin_time.load(std::memory_order_relaxed) << std::endl;
 #endif
+        for (auto& thread : extra_drain_threads_) if (thread.joinable()) thread.join();
         drain_writer_thread_.join();
     }
 
@@ -471,6 +474,8 @@ private:
 
     void worker_thread_loop(const uint32_t worker_id)
     {
+        run_worker("tree worker", [&] {
+
 #if HAS_LIBNUMA
         numa_run_on_node(numa_nodes[(worker_id + 1) % numa_nodes.size()]);
 #endif
@@ -480,6 +485,7 @@ private:
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
         {
+            RunState::check_active();
             try_work(worker_id);
             loop_round++;
             if ((loop_round & 63) == 0)
@@ -523,6 +529,7 @@ private:
                     uint32_t extra_id = total_workers + i;
                     extra_drain_threads_.emplace_back([this, extra_id]()
                         {
+                            run_worker("extra drain", [&] {
 #if HAS_LIBNUMA
                             numa_run_on_node(numa_nodes[(extra_id + 1) % numa_nodes.size()]);
 #endif
@@ -549,6 +556,7 @@ private:
                                 }
                             }
 #endif
+                            });
                         });
                 }
             }
@@ -585,6 +593,8 @@ private:
                 if (t.joinable()) t.join();
             extra_drain_threads_.clear();
         }
+    
+        });
     }
 
     void get_snapshot(std::array<uint32_t, MAX_DEPTH>& depth_worker_count_snapshot,
@@ -842,6 +852,8 @@ private:
 
     void scheduler_thread_loop()
     {
+        run_worker("scheduler", [&] {
+
         const uint32_t total_workers = thread_count_ - 1;
 
         std::array<uint32_t, MAX_DEPTH> depth_worker_count_snapshot{};
@@ -867,6 +879,7 @@ private:
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
         {
+            RunState::check_active();
             bool is_drain = all_producers_done();
 
             get_snapshot(depth_worker_count_snapshot, worker_snapshots, depth_new_cycles_snapshot, depth_new_taks_snapshot);
@@ -877,6 +890,8 @@ private:
 
             std::this_thread::sleep_for(std::chrono::microseconds(SCHEDULE_INTERVAL_US));
         }
+    
+        });
     }
 };
 

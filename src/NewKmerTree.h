@@ -31,6 +31,7 @@
 
 class KmerTree
 {
+    friend struct KmerTreeAllocationTestAccess;
 
     static constexpr size_t align_up(const size_t value, const size_t alignment)
     {
@@ -145,6 +146,7 @@ public:
 
         node& target_node = root_nodes[root_idx];
 
+        ensure_spare_block();
         bool has_deferred_task = false;
         Task deferred_task;
 
@@ -154,7 +156,7 @@ public:
             if (target_node.active_block == nullptr)
             {
                 // 未初始化
-                target_node.active_block = reinterpret_cast<kmer_block *>(memory_pool->allocate());
+                target_node.active_block = reinterpret_cast<kmer_block *>(get_spare_block());
                 target_node.active_block->count = 0;
                 target_node.kmer_blocks[target_node.count++] = target_node.active_block;
             }
@@ -172,14 +174,14 @@ public:
                     has_deferred_task = true;
 
                     target_node.count = 1;
-                    target_node.active_block = reinterpret_cast<kmer_block *>(memory_pool->allocate());
+                    target_node.active_block = reinterpret_cast<kmer_block *>(get_spare_block());
                     target_node.kmer_blocks[0] = target_node.active_block;
                     target_node.active_block->count = 0;
                 }
                 else
                 {
                     // 申请一个新块写入
-                    target_node.active_block = reinterpret_cast<kmer_block *>(memory_pool->allocate());
+                    target_node.active_block = reinterpret_cast<kmer_block *>(get_spare_block());
                     target_node.kmer_blocks[target_node.count++] = target_node.active_block;
                     target_node.active_block->count = 0;
                 }
@@ -422,6 +424,22 @@ public:
         {
             layer_queue_->increase_size(0, local_increase_count);
         }
+    }
+
+    // Soft reclaim may only borrow space already owned by this Classifier.
+    // It never allocates, queues work, constructs a child, or waits.
+    size_t try_accept_first_batch(const unsigned char* records, size_t count,
+        uint32_t prefix, node* local_roots) noexcept
+    {
+        kmer_block* block = local_roots[prefix].active_block;
+        if (!block) return 0;
+        const size_t accepted = std::min<size_t>(count, get_block_capacity() - block->count);
+        std::memcpy(block->k_mers.data() + block->count * kmer_bytes(), records, accepted * kmer_bytes());
+        block->count += accepted;
+#ifdef TEST_MODE
+        total_kmers_added.fetch_add(accepted, std::memory_order_relaxed);
+#endif
+        return accepted;
     }
 
     // 向当前 Classifier 的一个本地 root 批量追加，不访问共享 root 的锁。
@@ -1248,143 +1266,65 @@ private:
 
     node* ensure_child_slab(node* parent)
     {
-        node* CONSTRUCTING = reinterpret_cast<node *>(MAGIC_POINTER);
-        node* child_slab = parent->children_ptr.load(std::memory_order_acquire);
-
-        if (child_slab != nullptr && child_slab != CONSTRUCTING) [[likely]]
-        {
-            return child_slab;
-        }
-
-        if (child_slab == nullptr)
-        {
-            node* expected = nullptr;
-
-            if (parent->children_ptr.compare_exchange_strong(expected, CONSTRUCTING,
-                std::memory_order_relaxed, std::memory_order_relaxed))
-            {
-                constexpr uint64_t node_num = 1ULL << (2 * NODE_BASES);
-                // 分配 (1 << (2 * NODE_BASES))个连续节点
-                void* raw_mem = memory_pool->allocate();
-                new (raw_mem) node[node_num]();
-                child_slab = static_cast<node *>(raw_mem);
-
-                // 预取整个子块（后续分桶会访问其中的节点）
-                __builtin_prefetch(&child_slab[0], 0, 0);
-
-                parent->children_ptr.store(child_slab, std::memory_order_release);
-            }
-            else
-            {
-                // CAS 失败，说明别人正在创建，自旋等待
-                thread_local_spin_backoff.reset();
-                while (parent->children_ptr.load(std::memory_order_relaxed) == CONSTRUCTING)
-                {
-                    thread_local_spin_backoff.backoff();
+        node* const constructing = reinterpret_cast<node*>(MAGIC_POINTER);
+        for (;;) {
+            memory_pool->run_state().check();
+            node* slab = parent->children_ptr.load(std::memory_order_acquire);
+            if (slab && slab != constructing) return slab;
+            if (!slab) {
+                node* expected = nullptr;
+                if (parent->children_ptr.compare_exchange_strong(expected, constructing,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    try {
+                        void* memory = memory_pool->allocate();
+                        slab = new (memory) node[1ULL << (2 * NODE_BASES)]();
+                        parent->children_ptr.store(slab, std::memory_order_release);
+                        return slab;
+                    } catch (...) {
+                        parent->children_ptr.store(nullptr, std::memory_order_release);
+                        throw;
+                    }
                 }
-                child_slab = parent->children_ptr.load(std::memory_order_acquire);
             }
+            thread_local_spin_backoff.backoff();
         }
-        else if (child_slab == CONSTRUCTING)
-        {
-            // 正在创建中，自旋等待
-            thread_local_spin_backoff.reset();
-            while (parent->children_ptr.load(std::memory_order_relaxed) == CONSTRUCTING)
-            {
-                thread_local_spin_backoff.backoff();
-            }
-            child_slab = parent->children_ptr.load(std::memory_order_acquire);
-        }
-
-        return child_slab;
     }
 
     node* load_child_slab_existing(node* parent)
     {
-        node* child_slab = parent->children_ptr.load(std::memory_order_acquire);
-        node* CONSTRUCTING = reinterpret_cast<node *>(MAGIC_POINTER);
-
-        if (child_slab == CONSTRUCTING)
-        {
-            while (parent->children_ptr.load(std::memory_order_relaxed) == CONSTRUCTING)
-            {
-                cpu_relax();
-            }
-            child_slab = parent->children_ptr.load(std::memory_order_acquire);
+        node* slab;
+        const auto constructing = reinterpret_cast<node*>(MAGIC_POINTER);
+        while ((slab = parent->children_ptr.load(std::memory_order_acquire)) == constructing) {
+            memory_pool->run_state().check();
+            thread_local_spin_backoff.backoff();
         }
-
-        return child_slab;
-    }
-
-    // 等待 hash map 构造完成，超时后返回 nullptr
-    [[nodiscard]] ConcurrentOpenAddressHashMap* wait_for_hash_map_construction(node* parent)
-    {
-        ConcurrentOpenAddressHashMap* CONSTRUCTING = reinterpret_cast<ConcurrentOpenAddressHashMap*>(MAGIC_POINTER);
-
-        static constexpr int BACKOFF_LIMIT = 32;
-        static constexpr int RETRY_LIMIT = 32;
-
-        int backoff_count = 1;
-        int retry_count = 0;
-
-        for (int retry_count = 0; retry_count < RETRY_LIMIT; retry_count++)
-        {
-            ConcurrentOpenAddressHashMap* current = parent->hash_map.load(std::memory_order_acquire);
-            if (current != CONSTRUCTING)
-            {
-                return current;  // 构造完成，返回有效指针（正常情况）
-            }
-            else
-            {
-                // 构造中，进行自旋等待
-                for (int i = 0; i < backoff_count; i++)
-                {
-                    cpu_relax();
-                }
-                backoff_count = std::min(backoff_count * 2, BACKOFF_LIMIT);
-            }
-        }
-
-        return nullptr;  // 超时，返回 nullptr
+        return slab;
     }
 
     [[nodiscard]] ConcurrentOpenAddressHashMap* ensure_hash_map(node* parent, const uint64_t capacity)
     {
-        ConcurrentOpenAddressHashMap* hash_map = parent->hash_map.load(std::memory_order_acquire);
-        ConcurrentOpenAddressHashMap* CONSTRUCTING = reinterpret_cast<ConcurrentOpenAddressHashMap *>(MAGIC_POINTER);
-
-        if (hash_map != nullptr && hash_map != CONSTRUCTING) [[likely]]
-        {
-            return hash_map;
-        }
-
-        if (hash_map == nullptr)
-        {
-            ConcurrentOpenAddressHashMap* expected = nullptr;
-
-            if (parent->hash_map.compare_exchange_strong(expected, CONSTRUCTING,
-                std::memory_order_relaxed, std::memory_order_relaxed))
-            {
-                ConcurrentOpenAddressHashMap* hash_map_mem = nullptr;
-                hash_map_mem = reinterpret_cast<ConcurrentOpenAddressHashMap*>(ConcurrentOpenAddressHashMap::get_map_metadata_mem());
-
-                new (hash_map_mem) ConcurrentOpenAddressHashMap(capacity);
-                hash_map = hash_map_mem;
-                parent->hash_map.store(hash_map, std::memory_order_release);
+        auto* const constructing = reinterpret_cast<ConcurrentOpenAddressHashMap*>(MAGIC_POINTER);
+        for (;;) {
+            memory_pool->run_state().check();
+            auto* map = parent->hash_map.load(std::memory_order_acquire);
+            if (map && map != constructing) return map;
+            if (!map) {
+                ConcurrentOpenAddressHashMap* expected = nullptr;
+                if (parent->hash_map.compare_exchange_strong(expected, constructing,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    try {
+                        void* memory = ConcurrentOpenAddressHashMap::get_map_metadata_mem();
+                        map = new (memory) ConcurrentOpenAddressHashMap(capacity);
+                        parent->hash_map.store(map, std::memory_order_release);
+                        return map;
+                    } catch (...) {
+                        parent->hash_map.store(nullptr, std::memory_order_release);
+                        throw;
+                    }
+                }
             }
-            else
-            {
-                // CAS 失败，说明别人正在创建，自旋等待
-                hash_map = wait_for_hash_map_construction(parent);
-            }
+            thread_local_spin_backoff.backoff();
         }
-        else if (hash_map == CONSTRUCTING)
-        {
-            // 正在创建中，自旋等待
-            hash_map = wait_for_hash_map_construction(parent);
-        }
-
-        return hash_map;
     }
 
     void append_export_record(FinalDrainWriter& writer, const unsigned char* key, const uint32_t count)
