@@ -44,7 +44,7 @@ class ClassifierThreadPool
     std::atomic<uint32_t> memory_first_done{0};
     std::atomic<bool> low_pass_start{false};
     const std::array<void*, 256>* bloom_storage_;
-    unsigned char* first_active_storage_;
+    bool first_cache_enabled_;
 
 public:
     uint64_t low_records_scanned = 0;
@@ -65,7 +65,7 @@ public:
     std::atomic<uint64_t> total_direct_pending{0};
     std::atomic<uint64_t> total_first_memory_to_tree{0}, total_first_memory_discarded{0}, total_first_memory_kept{0};
     std::atomic<uint64_t> total_first_memory_tree_batches{0};
-    std::atomic<uint64_t> input_first_records{0}, input_private_tail_records{0}, input_pending_records{0};
+    std::atomic<uint64_t> input_first_records{0}, input_pending_records{0};
     std::atomic<uint64_t> total_repeat_queries{ 0 };
     std::atomic<uint64_t> total_recovered_firsts{ 0 };
 #endif
@@ -77,14 +77,14 @@ public:
         SchedulerThreadPool* task_thread_pool_ptr,
         ConcurrentMemoryPool* in_memory_pool_ptr,
         uint32_t in_classifier_count,
-        const std::array<void*, 256>* bloom_storage = nullptr, unsigned char* first_active_storage = nullptr)
+        const std::array<void*, 256>* bloom_storage = nullptr, bool first_cache_enabled = false)
         :         tree(tree_ptr),
         parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
         classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue),
         classifier_count(in_classifier_count),
         task_thread_pool(task_thread_pool_ptr),
-        memory_pool(in_memory_pool_ptr), bloom_storage_(bloom_storage), first_active_storage_(first_active_storage)
+        memory_pool(in_memory_pool_ptr), bloom_storage_(bloom_storage), first_cache_enabled_(first_cache_enabled)
     {
         threads_ptr.reserve(classifier_count);
     }
@@ -108,12 +108,11 @@ public:
 #endif
                     FastqClassifier classifier(i, parser_classifier_ring_pool, classifier_task_queues[i].get(),
                         global_classifier_task_queue, tree, memory_pool, *start_barrier, nullptr, 0,
-                        first_active_storage_ ? first_active_storage_ + i * FIRST_SEGMENT_SIZE : nullptr,
+                        first_cache_enabled_,
                         bloom_storage_);
                     classifier.classify_first_pass();
 #ifdef TEST_MODE
                     input_first_records.fetch_add(classifier.first_occurrence_count, std::memory_order_relaxed);
-                    input_private_tail_records.fetch_add(classifier.first_tail_records(), std::memory_order_relaxed);
                     input_pending_records.fetch_add(classifier.first_direct_pending, std::memory_order_relaxed);
 #endif
                     first_pass_done.fetch_add(1, std::memory_order_release);

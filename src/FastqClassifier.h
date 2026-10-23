@@ -78,8 +78,7 @@ class FastqClassifier
     SplitMix64 rng;
 
     ConcurrentMemoryPool* memory_pool_;
-    unsigned char* first_active_;
-    size_t first_active_count_ = 0;
+    const bool first_cache_enabled_;
     const int first_arena_;
     size_t checkpoint_bytes_ = 0;
     ConcurrentFirstBlockRing* first_occurrence_ring_;
@@ -135,12 +134,12 @@ public:
         PhaseBarrier& in_barrier,
         ConcurrentFirstBlockRing* in_first_ring,
         uint32_t in_producer_rank,
-        unsigned char* first_active = nullptr,
+        bool first_cache_enabled = false,
         const std::array<void*, 256>* bloom_storage = nullptr)
         : classifier_index(in_classifier_index), parser_classifier_ring_pool(in_ring_pool),
         classify_task_queue(in_classify_task_queue), global_classifier_task_queue(in_global_classifier_task_queue),
         tree(in_tree),
-        memory_pool_(in_memory_pool), first_active_(first_active), first_arena_(in_classifier_index% in_memory_pool->arena_count()),
+        memory_pool_(in_memory_pool), first_cache_enabled_(first_cache_enabled), first_arena_(in_classifier_index% in_memory_pool->arena_count()),
         first_occurrence_ring_(in_first_ring), first_block_(in_first_ring ? in_first_ring->initial_block(in_producer_rank) : nullptr),
         first_block_capacity_(ConcurrentFirstBlockRing::BLOCK_BYTES / kmer_bytes())
     {
@@ -274,16 +273,15 @@ public:
                     }
                     else
                     {
-                        // 自旋等待
-                        enqueue_backoff.backoff();
-
-                        while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
+                        do
                         {
 #ifdef TEST_MODE
                             consumer_enqueue_spin_time++;
 #endif
+                            memory_pool_->seal_thread_first_if_reclaiming();
                             enqueue_backoff.backoff();
                         }
+                        while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data));
 
                         enqueue_backoff.decay();
                     }
@@ -296,6 +294,7 @@ public:
                         consumer_dequeue_spin_time++;
 #endif
 
+                    memory_pool_->seal_thread_first_if_reclaiming();
                     dequeue_backoff.backoff();
                 }
             }
@@ -306,7 +305,10 @@ public:
                     unsigned char* kmer_data = reinterpret_cast<unsigned char*>(content.data);
                     const uint64_t kmer_count = content.length; // length 就是 k-mer数量
                     process_owned_block(kmer_data, kmer_count);
-                    parser_classifier_ring_pool->consumer_enqueue(content.data);
+                    if (!parser_classifier_ring_pool->consumer_try_enqueue(content.data)) {
+                        memory_pool_->seal_thread_first();
+                        parser_classifier_ring_pool->consumer_enqueue(content.data);
+                    }
                 }
 
                 while (global_classifier_task_queue->try_dequeue(content))
@@ -314,12 +316,16 @@ public:
                     unsigned char* kmer_data = reinterpret_cast<unsigned char*>(content.data);
                     const uint64_t kmer_count = content.length; // length 就是 k-mer数量
                     process_other_block(kmer_data, kmer_count);
-                    parser_classifier_ring_pool->consumer_enqueue(content.data);
+                    if (!parser_classifier_ring_pool->consumer_try_enqueue(content.data)) {
+                        memory_pool_->seal_thread_first();
+                        parser_classifier_ring_pool->consumer_enqueue(content.data);
+                    }
                 }
 
                 break;
             }
         }
+        memory_pool_->seal_thread_first();
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
         export_block_ptr = nullptr;
@@ -356,7 +362,7 @@ public:
                 backoff.backoff();
             }
         }
-        flush_recovered_tree_batch<false>(hit_count);
+        flush_recovered_tree_batch(hit_count);
         if constexpr (WRITE_LOW) {
             enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
             export_kmer_block_count = 0;
@@ -364,79 +370,79 @@ public:
         }
     }
 
-    size_t first_tail_records() const noexcept { return first_active_count_; }
+    size_t first_tail_records() const noexcept { return memory_pool_->thread_first_records(); }
 
     template<bool WRITE_LOW>
     void process_memory_first()
     {
-        if (!first_active_) return;
+        if (!first_cache_enabled_) return;
         const size_t width = kmer_bytes();
-        size_t hit_count = 0;
-#ifdef TEST_MODE
-        const uint64_t queries_before = repeat_query_count;
-#endif
+        KmerTree::FirstScanBatch batch;
         if constexpr (WRITE_LOW) {
-            char* raw_block_ptr = nullptr;
-            dequeue_data_to_export_writer(raw_block_ptr);
-            export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);
+            char* raw = nullptr;
+            dequeue_data_to_export_writer(raw);
+            export_block_ptr = reinterpret_cast<ExportBlock*>(raw);
         }
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> backoff;
         for (;;) {
             memory_pool_->run_state().check();
-            // Process the private tail first. Whole-segment extraction reuses
-            // this same reservation and returns the source before any Tree call.
-            for (size_t offset = 0; offset < first_active_count_;) {
-                const size_t take = std::min(evicted_capacity_, first_active_count_ - offset);
-                const auto* records = first_active_ + offset * width;
-                std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
-                for (size_t i = 0; i < std::min<size_t>(take, BLOOM_PREFETCH_DISTANCE); ++i)
-                    prepare_repeat_lookup(lookups[i], records + i * width);
-                size_t run_count = 0;
-                size_t misses = 0;
-                for (size_t i = 0; i < take; ++i) {
-                    const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
-                    const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
-                    if (i + BLOOM_PREFETCH_DISTANCE < take)
-                        prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
-                            records + (i + BLOOM_PREFETCH_DISTANCE) * width);
-                    if (repeated) {
-                        ++run_count;
-                    } else {
-                        if (run_count != 0) {
-                            append_recovered_tree_hits<true>(records + (i - run_count) * width, run_count, hit_count);
-                            run_count = 0;
+            for (int i = 0; i < memory_pool_->arena_count(); ++i) memory_pool_->poll_first_progress(i);
+            if (memory_pool_->first_empty()) break;
+            if (tree->try_prepare_first_scan(batch, ConcurrentMemoryPool::first_segment_record_capacity())
+                != ConcurrentMemoryPool::RamReserveStatus::Ready) { backoff.backoff(); continue; }
+            ConcurrentMemoryPool::FirstSegmentView view;
+            const auto status = memory_pool_->try_claim_first(first_arena_, ConcurrentMemoryPool::FirstConsumer::Scan, view);
+            if (status == ConcurrentMemoryPool::FirstClaimStatus::Done) break;
+            if (status == ConcurrentMemoryPool::FirstClaimStatus::Busy) { backoff.backoff(); continue; }
+            size_t segment_hits = 0, segment_misses = 0;
+            try {
+                for (size_t offset = 0; offset < view.record_count;) {
+                    memory_pool_->run_state().check();
+                    const size_t take = std::min(evicted_capacity_, view.record_count - offset);
+                    const auto* records = view.records + offset * width;
+                    std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
+                    for (size_t i = 0; i < std::min<size_t>(take, BLOOM_PREFETCH_DISTANCE); ++i)
+                        prepare_repeat_lookup(lookups[i], records + i * width);
+                    size_t hit_run = 0, miss_run = 0;
+                    for (size_t i = 0; i < take; ++i) {
+                        const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
+                        const bool repeated = lookup.filter->contains_repeat_prepared(lookup.probe);
+                        if (i + BLOOM_PREFETCH_DISTANCE < take)
+                            prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE], records + (i + BLOOM_PREFETCH_DISTANCE) * width);
+                        if (repeated) {
+                            if constexpr (WRITE_LOW) {
+                                if (miss_run) { export_kmer_batch(records + (i - miss_run) * width, miss_run); miss_run = 0; }
+                            }
+                            ++hit_run;
+                            ++segment_hits;
+                        } else {
+                            if (hit_run) { tree->append_first_scan_hits(batch, records + (i - hit_run) * width, hit_run, local_root_nodes.data()); hit_run = 0; }
+                            if constexpr (WRITE_LOW) ++miss_run;
+                            ++segment_misses;
                         }
-                        if constexpr (WRITE_LOW) export_one_kmer(records + i * width);
-                        ++misses;
                     }
+                    if (hit_run) tree->append_first_scan_hits(batch, records + (take - hit_run) * width, hit_run, local_root_nodes.data());
+                    if constexpr (WRITE_LOW) if (miss_run) export_kmer_batch(records + (take - miss_run) * width, miss_run);
+                    offset += take;
                 }
-                if (run_count != 0)
-                    append_recovered_tree_hits<true>(records + (take - run_count) * width, run_count, hit_count);
-                first_drain_singletons += misses;
+            } catch (...) { memory_pool_->complete_first(view); throw; }
+            memory_pool_->complete_first(view);
+            tree->submit_first_scan(batch);
+            first_drain_singletons += segment_misses;
 #ifdef TEST_MODE
-                repeat_query_count += take;
-                if constexpr (WRITE_LOW) first_memory_kept += misses;
-                else first_memory_discarded += misses;
+            repeat_query_count += segment_hits + segment_misses;
+            first_memory_to_tree += segment_hits;
+            recovered_first_count += segment_hits;
+            total_kmers_send_to_tree += segment_hits;
+            if (segment_hits) ++first_memory_tree_batches; // Nonempty source batches, no 64 KiB input staging.
+            if constexpr (WRITE_LOW) first_memory_kept += segment_misses;
+            else first_memory_discarded += segment_misses;
 #endif
-                offset += take;
-            }
-            first_active_count_ = 0;
-            const auto status = memory_pool_->extract_first_segment(first_arena_, first_active_);
-            if (status == ConcurrentMemoryPool::FirstExtractStatus::Done) break;
-            if (status == ConcurrentMemoryPool::FirstExtractStatus::Busy) backoff.backoff();
-            else {
-                first_active_count_ = ConcurrentMemoryPool::first_segment_record_capacity();
-                backoff.decay();
-            }
+            backoff.reset();
         }
-        flush_recovered_tree_batch<true>(hit_count);
-#ifdef TEST_MODE
-        if (repeat_query_count - queries_before != first_memory_to_tree + first_memory_kept + first_memory_discarded
-            || first_memory_tree_batches != (first_memory_to_tree + INPUT_BLOCK_CAPACITY - 1) / INPUT_BLOCK_CAPACITY)
-            throw std::logic_error("memory FIRST scan did not conserve records or Tree batches");
-#endif
+        tree->release_unused_first_scan_pages(batch);
         if constexpr (WRITE_LOW) {
-            enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
+            enqueue_content_to_export_writer({reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count});
             export_kmer_block_count = 0;
             export_block_ptr = nullptr;
         }
@@ -453,7 +459,6 @@ public:
 
 
 private:
-    template<bool MEMORY_FIRST>
     void append_recovered_tree_hits(const unsigned char* records, size_t count, size_t& hit_count)
     {
         const size_t width = kmer_bytes();
@@ -463,11 +468,10 @@ private:
             hit_count += take;
             records += take * width;
             count -= take;
-            if (hit_count == INPUT_BLOCK_CAPACITY) flush_recovered_tree_batch<MEMORY_FIRST>(hit_count);
+            if (hit_count == INPUT_BLOCK_CAPACITY) flush_recovered_tree_batch(hit_count);
         }
     }
 
-    template<bool MEMORY_FIRST>
     void flush_recovered_tree_batch(size_t& hit_count)
     {
         if (hit_count == 0) return;
@@ -478,18 +482,10 @@ private:
             if (local_block_prefix_counts[prefix] != 0) prefix_ordered_by_owner[root_count++] = prefix;
         tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts,
             prefix_ordered_by_owner, root_count, local_root_nodes.data());
-        if constexpr (MEMORY_FIRST) {
+        low_records_recovered += hit_count;
 #ifdef TEST_MODE
-            first_memory_to_tree += hit_count;
-            recovered_first_count += hit_count;
-            ++first_memory_tree_batches;
+        ++low_tree_batches;
 #endif
-        } else {
-            low_records_recovered += hit_count;
-#ifdef TEST_MODE
-            ++low_tree_batches;
-#endif
-        }
 #ifdef TEST_MODE
         total_kmers_send_to_tree += hit_count;
 #endif
@@ -502,6 +498,7 @@ private:
         if (checkpoint_bytes_ >= BLOCK_SIZE) {
             checkpoint_bytes_ = 0;
             memory_pool_->run_state().check();
+            if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
         }
     }
     bool try_dequeue_low_task(content_type& content)
@@ -522,6 +519,7 @@ private:
     template <bool WRITE_LOW>
     void reconcile_low_block(const content_type& content, size_t& hit_count)
     {
+        memory_pool_->run_state().check();
         const size_t width = kmer_bytes();
         std::array<RepeatLookup, BLOOM_PREFETCH_DISTANCE> lookups;
         const auto* keys = reinterpret_cast<const unsigned char*>(content.data);
@@ -529,6 +527,7 @@ private:
             prepare_repeat_lookup(lookups[i], keys + i * width);
 
         size_t run_count = 0;
+        [[maybe_unused]] size_t miss_run_count = 0;
         for (size_t i = 0; i < content.length; ++i)
         {
             const auto lookup = lookups[i % BLOOM_PREFETCH_DISTANCE];
@@ -537,17 +536,27 @@ private:
                 prepare_repeat_lookup(lookups[i % BLOOM_PREFETCH_DISTANCE],
                     keys + (i + BLOOM_PREFETCH_DISTANCE) * width);
             if (repeated) {
+                if constexpr (WRITE_LOW) {
+                    if (miss_run_count != 0) {
+                        export_kmer_batch(keys + (i - miss_run_count) * width, miss_run_count);
+                        miss_run_count = 0;
+                    }
+                }
                 ++run_count;
             } else {
                 if (run_count != 0) {
-                    append_recovered_tree_hits<false>(keys + (i - run_count) * width, run_count, hit_count);
+                    append_recovered_tree_hits(keys + (i - run_count) * width, run_count, hit_count);
                     run_count = 0;
                 }
-                if constexpr (WRITE_LOW) export_one_kmer(keys + i * width);
+                if constexpr (WRITE_LOW) ++miss_run_count;
             }
         }
         if (run_count != 0)
-            append_recovered_tree_hits<false>(keys + (content.length - run_count) * width, run_count, hit_count);
+            append_recovered_tree_hits(keys + (content.length - run_count) * width, run_count, hit_count);
+        if constexpr (WRITE_LOW) {
+            if (miss_run_count != 0)
+                export_kmer_batch(keys + (content.length - miss_run_count) * width, miss_run_count);
+        }
         low_records_scanned += content.length;
         parser_classifier_ring_pool->consumer_enqueue(content.data);
     }
@@ -558,6 +567,7 @@ private:
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_owned_local_block();
+        if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
         total_deal_kmer_count += kmer_count;
     }
 
@@ -567,6 +577,7 @@ private:
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_other_local_block();
+        if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
         total_deal_kmer_count += kmer_count;
     }
 
@@ -599,6 +610,28 @@ private:
         }
     }
 
+    void export_kmer_batch(const unsigned char* records, size_t count)
+    {
+        const size_t width = kmer_bytes();
+        while (count != 0) {
+            const size_t take = std::min<size_t>(count, EXPORT_KMER_BLOCK_CAPACITY - export_kmer_block_count);
+            std::memcpy(export_block_ptr->k_mers.data() + export_kmer_block_count * width, records, take * width);
+            export_kmer_block_count += take;
+            records += take * width;
+            count -= take;
+#ifdef TEST_MODE
+            total_kmers_exported += take;
+#endif
+            if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) {
+                enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
+                export_kmer_block_count = 0;
+                char* raw_block_ptr = nullptr;
+                dequeue_data_to_export_writer(raw_block_ptr);
+                export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);
+            }
+        }
+    }
+
     void export_one_kmer(const unsigned char* val)
     {
         std::memcpy((export_block_ptr->k_mers.data() + (export_kmer_block_count++) * kmer_bytes()), val, kmer_bytes());
@@ -621,27 +654,11 @@ private:
         first_occurrence_count++;
 #endif
         if (!first_occurrence_ring_) {
-            if (!first_active_) {
+            if (!first_cache_enabled_ || !memory_pool_->cache_first_record(first_arena_, val)) {
                 export_one_kmer(val);
 #ifdef TEST_MODE
                 ++first_direct_pending;
 #endif
-                return;
-            }
-            const size_t width = kmer_bytes();
-            std::memcpy(first_active_ + first_active_count_ * width, val, width);
-            if (++first_active_count_ == ConcurrentMemoryPool::first_segment_record_capacity()) {
-                if (!memory_pool_->cache_first_segment(first_arena_, first_active_)) {
-                    // No shared segment is held across Export Ring waits.
-                    for (size_t i = 0; i < first_active_count_; ++i) {
-                        export_one_kmer(first_active_ + i * width);
-                        record_checkpoint();
-                    }
-#ifdef TEST_MODE
-                    first_direct_pending += first_active_count_;
-#endif
-                }
-                first_active_count_ = 0;
             }
             return;
         }
@@ -997,14 +1014,16 @@ private:
             return;
         }
 
-        while (!export_pool->producer_try_enqueue(content))
+        do
         {
 
 #ifdef TEST_MODE
             producer_enqueue_spin_time++;
 #endif
+            memory_pool_->seal_thread_first_if_reclaiming();
             enqueue_to_export_writer_backoff.backoff();
         }
+        while (!export_pool->producer_try_enqueue(content));
 
         enqueue_to_export_writer_backoff.decay();
     }
@@ -1019,14 +1038,16 @@ private:
             return;
         }
 
-        while (!export_pool->producer_try_dequeue(data))
+        do
         {
 
 #ifdef TEST_MODE
             producer_dequeue_spin_time++;
 #endif
+            memory_pool_->seal_thread_first_if_reclaiming();
             dequeue_from_export_writer_backoff.backoff();
         }
+        while (!export_pool->producer_try_dequeue(data));
 
         dequeue_from_export_writer_backoff.decay();
     }

@@ -91,6 +91,100 @@ class KmerTree
     static inline thread_local SpinBackoff<32, 64, 64 + 8> classifier_enqueue_spin_backoff;
 
 public:
+    class FirstScanBatch
+    {
+        friend class KmerTree;
+        ConcurrentMemoryPool* pool_ = nullptr;
+        std::array<void*, 772> pages_{};
+        std::array<Task, 305> tasks_{};
+        size_t page_count_ = 0, task_count_ = 0, submitted_ = 0;
+    public:
+        FirstScanBatch() = default;
+        FirstScanBatch(const FirstScanBatch&) = delete;
+        FirstScanBatch& operator=(const FirstScanBatch&) = delete;
+        ~FirstScanBatch()
+        {
+            if (!pool_) return;
+            pool_->release_ram_pages(std::span<void* const>(pages_.data(), page_count_));
+            for (size_t t = submitted_; t < task_count_; ++t)
+                for (size_t b = 0; b < tasks_[t].count; ++b) pool_->deallocate(tasks_[t].kmer_blocks[b]);
+        }
+    };
+
+    static size_t first_scan_page_bound(size_t records) noexcept
+    {
+        const size_t capacity = get_block_capacity();
+        return (records + capacity - 1) / capacity + 255;
+    }
+    ConcurrentMemoryPool::RamReserveStatus try_prepare_first_scan(FirstScanBatch& batch, size_t records)
+    {
+        assert(!batch.pool_ || batch.pool_ == memory_pool);
+        batch.pool_ = memory_pool;
+        const size_t bound = first_scan_page_bound(records);
+        assert(bound <= batch.pages_.size());
+        if (batch.page_count_ >= bound) return ConcurrentMemoryPool::RamReserveStatus::Ready;
+        const auto result = memory_pool->try_reserve_ram_pages(std::span<void*>(batch.pages_.data() + batch.page_count_, bound - batch.page_count_));
+        batch.page_count_ += result.acquired;
+        return result.status;
+    }
+    void append_first_scan_hits(FirstScanBatch& batch, const unsigned char* records, size_t count, node* local_roots) noexcept
+    {
+        const size_t width = kmer_bytes();
+        const size_t capacity = get_block_capacity();
+        while (count) {
+            const uint32_t prefix = get_root_prefix(records);
+            node& root = local_roots[prefix];
+            kmer_block* block = root.active_block;
+            if (!block || block->count == capacity) {
+                if (root.count == MAX_KMER_BLOCK_NUM) {
+                    assert(batch.task_count_ < batch.tasks_.size());
+                    Task& task = batch.tasks_[batch.task_count_++];
+                    task.current_node = root_nodes + prefix;
+                    task.depth = 0;
+                    task.count = root.count;
+                    task.kmer_blocks = root.kmer_blocks;
+                    root.count = 0;
+                    root.active_block = nullptr;
+                }
+                assert(batch.page_count_);
+                block = static_cast<kmer_block*>(batch.pages_[--batch.page_count_]);
+                block->count = 0;
+                root.active_block = block;
+                root.kmer_blocks[root.count++] = block;
+            }
+            const size_t limit = std::min(count, capacity - block->count);
+            size_t take = 1;
+            while (take < limit && get_root_prefix(records + take * width) == prefix) ++take;
+            std::memcpy(block->k_mers.data() + block->count * width, records, take * width);
+            block->count += take;
+            records += take * width;
+            count -= take;
+#ifdef TEST_MODE
+            total_kmers_added.fetch_add(take, std::memory_order_relaxed);
+#endif
+        }
+    }
+    void submit_first_scan(FirstScanBatch& batch)
+    {
+        auto* queue = layer_queue_->get_queue(0);
+        while (batch.submitted_ < batch.task_count_) {
+            layer_queue_->increase_size(0);
+            try {
+                while (!queue->try_enqueue(batch.tasks_[batch.submitted_])) {
+                    memory_pool->run_state().check();
+                    classifier_enqueue_spin_backoff.backoff();
+                }
+            } catch (...) { layer_queue_->decrease_size(0); throw; }
+            ++batch.submitted_;
+        }
+        batch.task_count_ = batch.submitted_ = 0;
+    }
+    void release_unused_first_scan_pages(FirstScanBatch& batch) noexcept
+    {
+        memory_pool->release_ram_pages(std::span<void* const>(batch.pages_.data(), batch.page_count_));
+        batch.page_count_ = 0;
+    }
+
     static void initialize_worker()
     {
         thread_local_counting_hash_map = std::make_unique<CountingHashMap<>>();
@@ -386,11 +480,12 @@ public:
                     }
                     else
                     {
-                        classifier_enqueue_spin_backoff.backoff();
-                        while (!queue_ptr->try_enqueue(task))
+                        do
                         {
+                            memory_pool->seal_thread_first_if_reclaiming();
                             classifier_enqueue_spin_backoff.backoff();
                         }
+                        while (!queue_ptr->try_enqueue(task));
                         classifier_enqueue_spin_backoff.decay();
                     }
 
@@ -472,11 +567,12 @@ public:
                     }
                     else
                     {
-                        classifier_enqueue_spin_backoff.backoff();
-                        while (!queue_ptr->try_enqueue(task))
+                        do
                         {
+                            memory_pool->seal_thread_first_if_reclaiming();
                             classifier_enqueue_spin_backoff.backoff();
                         }
+                        while (!queue_ptr->try_enqueue(task));
                         classifier_enqueue_spin_backoff.decay();
                     }
 #ifdef TEST_MODE

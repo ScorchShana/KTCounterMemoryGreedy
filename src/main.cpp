@@ -538,9 +538,6 @@ int process_main()
         bloom_storage[i] = bloom_begin + bloom_offset;
         bloom_offset += bloom_bytes(bloom_filter_capacity[i]);
     }
-    const size_t first_active_bytes = first_cache_enabled ? static_cast<size_t>(classifier_num) * FIRST_SEGMENT_SIZE : 0;
-    auto* first_active_storage = first_active_bytes
-        ? static_cast<unsigned char*>(pool->allocate_before_init_arenas(first_active_bytes)) : nullptr;
     pool->init_arenas();
 #ifdef TEST_MODE
     std::cout << "Bloom reserved bytes: " << bloom_total_bytes
@@ -553,7 +550,7 @@ int process_main()
         metadata_bytes += pool->segment_capacity(i) * sizeof(FirstSegmentDescriptor);
     }
     std::cout << "FIRST descriptor bytes: " << metadata_bytes
-        << "\nFIRST active reserved bytes: " << first_active_bytes << std::endl;
+        << "\nFIRST active reserved bytes: " << 0 << std::endl;
 #endif
     // pool->perform_first_touch(n_thread);
 
@@ -568,11 +565,11 @@ int process_main()
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
     auto task_thread_pool = std::make_shared<SchedulerThreadPool>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
-    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_active_storage);
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_cache_enabled);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
     auto parser_thread_pool = std::make_shared<ParserThreadPool>(classifier_task_queues, global_classifier_task_queue.get(), pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
-    auto export_writer = std::make_shared<ExportWriter>(export_ring_pool.get(), temp_dir + "low.pending.bin", ExportWriter::OutputKind::Pending, pool.get());
+    auto export_writer = std::make_shared<ExportWriter>(export_ring_pool.get(), temp_dir + "low.pending.bin", ExportWriter::OutputKind::Pending, pool.get(), nullptr, ExportWriter::ReclaimLifetime::UntilExplicitStop);
 
     // 正式计数阶段
     reader_parser_ring_pool->reset_producers(reader_num);
@@ -619,26 +616,19 @@ int process_main()
         classifier_end.time_since_epoch()).count(), std::memory_order_relaxed);
 #endif
 
-    // 第一阶段临时低频已全部提交，通知 Writer 排空队列并结束。
+    // Drain and permanently detach the ordinary Ring; raw reclamation stays live.
 #ifdef TEST_MODE
-    const auto export_join_start = std::chrono::steady_clock::now();
+    const auto normal_drain_start = std::chrono::steady_clock::now();
 #endif
     tree->mark_finish_export();
-    // 等待所有 pending 分片写完后再开始回读。
-    export_writer->join();
+    export_writer->wait_for_normal_drain();
 #ifdef TEST_MODE
-    const auto export_join_end = std::chrono::steady_clock::now();
-    const uint64_t resident_first = pool->first_resident_records();
-    const uint64_t private_first = classifier_thread_pool->input_private_tail_records.load();
-    const uint64_t pending_first = classifier_thread_pool->input_pending_records.load() + pool->spill_bytes.load() / kmer_bytes();
-    std::cout << "FIRST private tail records: " << private_first
-        << "\nFIRST writer-exit resident records: " << resident_first
-        << "\nFIRST writer-exit pending records: " << pending_first
-        << "\nFIRST writer-exit conservation: "
-        << (classifier_thread_pool->input_first_records.load() == private_first + resident_first + pending_first) << '\n';
+    const auto normal_drain_end = std::chrono::steady_clock::now();
+    std::cout << "FIRST sealed records: " << pool->first_valid_records.load()
+        << "\nFIRST input conservation: "
+        << (classifier_thread_pool->input_first_records.load() == classifier_thread_pool->input_pending_records.load() + pool->first_valid_records.load()) << '\n';
 #endif
 
-    // pending 已关闭；Bloom 只读，剩余 FIRST 直接进入最终 low 或补树。
     // Scheduler 继续处理入树任务，此时不进入 final drain。
 #ifdef TEST_MODE
     const auto low_start = std::chrono::steady_clock::now();
@@ -658,6 +648,14 @@ int process_main()
     classifier_thread_pool->wait_for_memory_first();
 #ifdef TEST_MODE
     const auto memory_first_end = std::chrono::steady_clock::now();
+#endif
+#ifdef TEST_MODE
+    const auto export_join_start = std::chrono::steady_clock::now();
+#endif
+    export_writer->finish_reclaim();
+    export_writer->join();
+#ifdef TEST_MODE
+    const auto export_join_end = std::chrono::steady_clock::now();
 #endif
     [[maybe_unused]] uint64_t low_records_read = 0;
     {
@@ -765,18 +763,18 @@ int process_main()
 #ifdef TEST_MODE
     std::cout << "RUN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - mid_start).count() << '\n';
     std::cout << "MEMORY_FIRST elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(memory_first_end - memory_first_start).count() << '\n';
+    std::cout << "NORMAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(normal_drain_end - normal_drain_start).count() << '\n';
     std::cout << "CLOSE_PENDING elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(export_join_end - export_join_start).count() << '\n';
     std::cout << "FINAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count() << '\n';
     std::cout << "FIRST spill bytes: " << pool->spill_bytes.load() << '\n';
     std::cout << "FIRST returned bytes: " << pool->returned_bytes.load() << '\n';
     const uint64_t publications = pool->first_publications.load();
     std::cout << "FIRST publications: " << publications << '\n';
-    std::cout << "FIRST shared valid bytes: " << publications * ConcurrentMemoryPool::first_segment_record_capacity() * kmer_bytes() << '\n';
-    std::cout << "FIRST shared padding bytes: " << publications * (FIRST_SEGMENT_SIZE % kmer_bytes()) << '\n';
+    std::cout << "FIRST shared valid bytes: " << pool->first_valid_records.load() * kmer_bytes() << '\n';
+    std::cout << "FIRST shared padding bytes: " << pool->first_unused_bytes.load() << '\n';
     std::cout << "FIRST Spill claims: " << pool->spill_claims.load() << '\n';
     std::cout << "FIRST admission capacity/watermark: " << pool->first_rejected_capacity.load() << '\n';
     std::cout << "FIRST admission Tree reservation: " << pool->first_rejected_tree.load() << '\n';
-    std::cout << "FIRST admission consuming: " << pool->first_rejected_consuming.load() << '\n';
     std::cout << "FIRST admission frozen: " << pool->first_rejected_frozen.load() << '\n';
     std::cout << "Allocation waits: " << pool->allocation_waits.load() << '\n';
     std::cout << "File Arena segments: " << pool->file_segment_count.load() << '\n';

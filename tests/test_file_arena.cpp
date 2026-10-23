@@ -1,3 +1,4 @@
+#include "first_pool_fixture.h"
 #include "../src/ConcurrentMemoryPool.h"
 #include <filesystem>
 #include <fstream>
@@ -129,7 +130,7 @@ struct ConcurrentMemoryPoolTestAccess
         pool.file_end_ = static_cast<size_t>(std::numeric_limits<off_t>::max()) & ~(BLOCK_SIZE - 1);
     }
     static bool reservation_empty(ConcurrentMemoryPool& pool) {
-        std::lock_guard lock(pool.arenas_[0].admission);
+        std::lock_guard lock(pool.arenas_[0].control_mutex);
         return !pool.arenas_[0].pending_bytes && !pool.arenas_[0].reserved_result;
     }
 };
@@ -166,6 +167,33 @@ static void check_local_return_without_locks()
     require(immediate, "warm file TLS return waited for a file or progress lock");
 }
 
+static void check_batch_return_without_progress_lock()
+{
+    ConcurrentMemoryPool pool(8ULL << 20);
+    ConcurrentMemoryPoolTestAccess::exhaust(pool);
+    ConcurrentMemoryPoolTestAccess::sparse(pool);
+    std::promise<void> warmed, start, returned;
+    auto start_gate = start.get_future();
+    auto result = returned.get_future();
+    std::thread worker([&] {
+        auto* page = pool.allocate();
+        pool.deallocate(page);
+        warmed.set_value();
+        start_gate.wait();
+        ConcurrentMemoryPool::get_thread_local_cache().release();
+        returned.set_value();
+    });
+    warmed.get_future().wait();
+    std::unique_lock progress(pool.run_state().mutex);
+    start.set_value();
+    const bool immediate = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    progress.unlock();
+    worker.join();
+    require(immediate, "TLS batch return waited for the global progress lock");
+    require(ConcurrentMemoryPoolTestAccess::central_count(pool) == TLS_CAPACITY,
+        "TLS batch return lost file pages");
+}
+
 static void check_batch_return()
 {
     ConcurrentMemoryPool pool(8ULL << 20);
@@ -184,8 +212,8 @@ static void check_batch_return()
         pool.deallocate(page);
         published += full;
         require(tls.file_free_count <= TLS_CAPACITY, "file TLS exceeded its bound");
-        require(pool.run_state().progress() == generation + published,
-            "local return notified or central publication did not notify");
+        require(pool.run_state().progress() == generation,
+            "resource return published a progress notification");
     }
     require(published == 6 && tls.file_free_count == 128
         && ConcurrentMemoryPoolTestAccess::central_count(pool) == 384, "file pages were not published in half-cache batches");
@@ -202,15 +230,52 @@ static void check_batch_return()
     require(ConcurrentMemoryPoolTestAccess::returned_pages(pool) == expected, "thread exit lost file pages");
 }
 
+static void check_expansion_waiters()
+{
+    for (bool inject_failure : {false, true}) {
+        ConcurrentMemoryPool pool(8ULL << 20);
+        ConcurrentMemoryPoolTestAccess::exhaust(pool);
+        ConcurrentMemoryPoolTestAccess::sparse(pool);
+        std::promise<void> entered, resume, waiting;
+        growing = &entered;
+        resume_growth = resume.get_future().share();
+        auto expansion = std::async(std::launch::async, [&] {
+            try { return pool.allocate_large(64ULL << 20) != nullptr; }
+            catch (const std::bad_alloc&) { return false; }
+        });
+        entered.get_future().wait();
+        auto allocator = std::async(std::launch::async, [&] {
+            waiting.set_value();
+            return pool.allocate();
+        });
+        waiting.get_future().wait();
+        const bool blocked = allocator.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+        // The first preallocation is already suspended; a retry must not enter
+        // that same one-shot gate after the injected failure.
+        growing = nullptr;
+        if (inject_failure) fail_operation = 2;
+        resume.set_value();
+        const bool expanded = expansion.get();
+        void* page = allocator.get();
+        require(blocked && page && expanded == !inject_failure,
+            "file expansion waiter ignored publication or failed to retry after failure");
+        pool.deallocate(page);
+        ConcurrentMemoryPoolTestAccess::validate(pool);
+    }
+}
+
 int main()
 {
     try {
+        k_length = 33;
         char name[] = "/tmp/tree-file-arena-XXXXXX";
         const auto directory = std::filesystem::path(::mkdtemp(name));
         const auto previous = std::filesystem::current_path();
         std::filesystem::current_path(directory);
         check_local_return_without_locks();
+        check_batch_return_without_progress_lock();
         check_batch_return();
+        check_expansion_waiters();
         {
             ConcurrentMemoryPool pool(8ULL << 20);
             ConcurrentMemoryPoolTestAccess::exhaust(pool);
@@ -378,7 +443,7 @@ int main()
             ConcurrentMemoryPool pool(8ULL << 20);
             ConcurrentMemoryPoolTestAccess::initialize(pool);
             ConcurrentMemoryPoolTestAccess::sparse(pool);
-            require(pool.cache_first_segment(0, first_records.data()), "shutdown fixture could not cache FIRST");
+            require(cache_full_first(pool, 0, first_records.data()), "shutdown fixture could not cache FIRST");
             const auto needed = pool.gap_bytes(0) + BLOCK_SIZE;
             pool.set_spill_service(true);
             auto allocation = std::async(std::launch::async, [&] { return pool.allocate_large(needed); });

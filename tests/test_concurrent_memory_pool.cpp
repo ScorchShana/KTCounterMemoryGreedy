@@ -1,3 +1,4 @@
+#include "first_pool_fixture.h"
 #include "../src/ConcurrentMemoryPool.h"
 #include <algorithm>
 #include <barrier>
@@ -23,13 +24,14 @@ static void require(bool ok, const char* message)
 int main()
 {
     try {
+        k_length = 33;
         ConcurrentMemoryPool pool(64ULL << 20);
         ConcurrentMemoryPoolTestAccess::single(pool);
         pool.init_arenas();
         auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool, 0);
         // A busy slow-path mutex must never make a try allocation wait.
         for (bool central : {false, true}) {
-            std::unique_lock held(central ? arena.mutex : arena.admission);
+            std::unique_lock held(central ? arena.mutex : arena.control_mutex);
             std::promise<void*> returned;
             auto result = returned.get_future();
             std::thread attempt([&pool, central, &returned] {
@@ -38,7 +40,7 @@ int main()
             const bool immediate = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
             held.unlock();
             attempt.join();
-            require(immediate && result.get() == nullptr, "try allocation waited on a busy mutex");
+            require(immediate && (central ? result.get() == nullptr : result.get() != nullptr), "try allocation waited on a busy mutex");
         }
         {
             ConcurrentMemoryPool other(8ULL << 20);
@@ -75,9 +77,9 @@ int main()
         });
         start.arrive_and_wait();
         std::vector<unsigned char> records(FIRST_SEGMENT_SIZE);
-        while (pool.cache_first_segment(0, records.data())) {
-            std::lock_guard lock(arena.admission);
-            first.push_back({0, arena.segment_frontier - 1, arena.segments[arena.segment_frontier - 1].generation});
+        while (cache_full_first(pool, 0, records.data())) {
+            const uint64_t slot = arena.first_offset.load() / FIRST_SEGMENT_SIZE;
+            first.push_back({0, slot, arena.segments[slot].tag.load() >> 3});
         }
         worker.join();
         std::set<void*> unique(tree.begin(), tree.end());
@@ -91,7 +93,7 @@ int main()
         require(pool.try_allocate_large(SIZE_MAX) == nullptr, "large overflow accepted");
         require(pool.try_allocate_large(capacity + BLOCK_SIZE) == nullptr, "impossible contiguous request accepted");
         // Consume the last partial refill, including the final single page.
-        size_t consumed = tree.size();
+        size_t consumed = tree.size() + 1;
         while (pool.try_allocate()) ++consumed;
         require(consumed * BLOCK_SIZE + first.size() * HUGE_PAGE_SIZE == capacity,
             "refill lost pages when fewer than a batch remained");

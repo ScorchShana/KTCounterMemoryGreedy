@@ -32,7 +32,7 @@ int main()
         require(rings.peak_bytes > rings.run_data, "RingPool object metadata missing");
         require(rings.peak_bytes == std::max({rings.run_bytes, rings.replay_bytes, rings.final_bytes}),
             "RingPool peak must use simultaneous lifetimes");
-        require(main_pool_budget(1) == ((1ULL << 30) - rings.peak_bytes) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
+        require(main_pool_budget(1) == ((1ULL << 30) - rings.peak_bytes - 4 * mib) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
             "main pool deduction/alignment");
         require(bloom_bytes(4096) == 2 * 4096 * sizeof(std::atomic<uint64_t>), "Bloom needs two words per bin");
         bool overflow = false;
@@ -56,7 +56,7 @@ int main()
             active.allocate_before_init_arenas(2 * FIRST_SEGMENT_SIZE);
             active.init_arenas();
             require(ConcurrentMemoryPoolTestAccess::available(active) == before - 2 * FIRST_SEGMENT_SIZE,
-                "private activity reservation was deducted twice");
+                "pre-Arena reservation was deducted twice");
         }
         {
             ConcurrentMemoryPool too_small(8 * mib);

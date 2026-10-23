@@ -39,6 +39,24 @@ public:
         count_ = std::min(count_ + 1, SLEEP_THRESHOLD);
     }
 
+    [[nodiscard]] bool backoff_should_check()
+    {
+        const int previous_count = count_;
+        backoff();
+
+        unsigned interval;
+        if (previous_count < YIELD_THRESHOLD)
+            interval = 1u << std::min(previous_count / 8, 4);
+        else if (previous_count < SLEEP_THRESHOLD)
+            interval = 2;
+        else
+            interval = 8;
+
+        if (++check_count_ < interval) return false;
+        check_count_ = 0;
+        return true;
+    }
+
     void decay()
     {
         count_ >>= 1;          // 阶段计数器指数衰减
@@ -68,6 +86,7 @@ public:
 #endif
 
 private:
+    unsigned check_count_ = 0;
     int count_ = 0;
     int backoff_ = BACKOFF_START;          // pause 初始值
     int sleep_time_us_ = 1;    // 初始睡眠时间为 1 微秒

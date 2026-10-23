@@ -69,6 +69,8 @@ constexpr uint32_t MAX_DEPTH = 4;  // 树的最大深度 (第 4 层将自动合�
 constexpr uint32_t NODE_SIZE = 256;
 
 constexpr size_t CACHE_LINE_SIZE = 64;
+constexpr size_t EXPORT_WRITER_BUFFER_BYTES = 2ULL << 20;
+constexpr size_t EXPORT_WRITER_BUFFER_COUNT = 2;
 
 constexpr uint32_t MAX_K = 128;
 
@@ -85,7 +87,7 @@ constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 
 constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE = 32ULL * 1024; // 环形内存池块大小（字节）
 
 // LowFrequencyReader 与 LowFrequencyParser：512 × 256 KiB = 128 MiB
-constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY = 1ULL << 9;
+constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY = 512ULL;
 constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024;
 
 // Parser与Classifier之间的RingMemoryPool配置常量

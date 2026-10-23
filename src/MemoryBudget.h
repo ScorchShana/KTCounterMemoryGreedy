@@ -39,7 +39,8 @@ inline size_t main_pool_budget(uint64_t gib)
     if (gib > std::numeric_limits<size_t>::max() / gib_bytes)
         throw std::invalid_argument("memory limit GiB conversion overflow");
     const size_t total = static_cast<size_t>(gib) * gib_bytes;
-    const size_t rings = ring_pool_budget().peak_bytes;
+    // The pending transport is freed at normal-drain before final-low starts.
+    const size_t rings = ring_pool_budget().peak_bytes + EXPORT_WRITER_BUFFER_BYTES * EXPORT_WRITER_BUFFER_COUNT;
     if (total <= rings || total - rings < segment_bytes)
         throw std::invalid_argument("memory limit cannot hold RingPools and main pool");
     return (total - rings) & ~(segment_bytes - 1);

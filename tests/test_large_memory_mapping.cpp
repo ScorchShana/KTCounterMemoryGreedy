@@ -1,3 +1,4 @@
+#include "first_pool_fixture.h"
 #include "../src/ConcurrentMemoryPool.h"
 #include <cstdlib>
 #include <iostream>
@@ -10,14 +11,15 @@ struct ConcurrentMemoryPoolTestAccess
         pool.num_arenas_ = 1;
         Arena& arena = pool.arenas_[0];
         arena.start_addr = pool.memory_start_;
-        arena.capacity = arena.first_offset = pool.memory_size_;
+        arena.initialize(pool.memory_size_);
         arena.end_addr = static_cast<char*>(arena.start_addr) + arena.capacity;
         arena.high = HUGE_PAGE_SIZE;
         arena.low = BLOCK_SIZE;
         arena.segment_capacity = arena.capacity / FIRST_SEGMENT_SIZE;
-        // Only slot zero is exercised. Do not fault millions of descriptors
-        // merely to validate the mapped production address calculations.
-        arena.segments = std::make_unique<FirstSegmentDescriptor[]>(1);
+        // Address-indexed descriptors use 64 bytes per 2 MiB (512 MiB here).
+        arena.segments = std::make_unique<FirstSegmentDescriptor[]>(arena.segment_capacity);
+        for (size_t i = 0; i < arena.segment_capacity; ++i)
+            arena.segments[i].data = static_cast<char*>(arena.start_addr) + i * FIRST_SEGMENT_SIZE;
         pool.arenas_initialized_.store(true, std::memory_order_release);
         madvise(pool.memory_start_, pool.memory_size_, MADV_NOHUGEPAGE);
     }
@@ -35,6 +37,7 @@ int main()
         return 77;
     }
     try {
+        k_length = 33;
         ConcurrentMemoryPool pool(16ULL << 40);
         ConcurrentMemoryPoolTestAccess::mapped_arena(pool);
         auto* base = static_cast<char*>(pool.allocate_large_from_numa((8ULL << 40) - BLOCK_SIZE, 0));
@@ -44,18 +47,18 @@ int main()
             "mapped allocation truncated at 8 TiB");
         *static_cast<volatile char*>(below) = 17;
         *static_cast<volatile char*>(above) = 29;
-        FirstSegmentRef ref;
+        ConcurrentMemoryPool::FirstSegmentView view;
         const size_t gap = pool.gap_bytes(0);
         std::vector<unsigned char> records(FIRST_SEGMENT_SIZE, 41);
-        require(pool.cache_first_segment(0, records.data()), "mapped FIRST publication failed");
+        require(cache_full_first(pool, 0, records.data()), "mapped FIRST publication failed");
         pool.request_first_drain();
-        auto* first = pool.claim_spill(0, ref);
-        require(first && pool.gap_bytes(0) == gap - FIRST_SEGMENT_SIZE, "mapped FIRST allocation failed");
-        *static_cast<volatile char*>(first->data) = 41;
-        pool.empty_first(ref);
+        const auto status = pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+        require(status == ConcurrentMemoryPool::FirstClaimStatus::Data && pool.gap_bytes(0) == gap - FIRST_SEGMENT_SIZE, "mapped FIRST allocation failed");
+        require(view.records[0] == 41, "mapped FIRST payload changed");
+        require(pool.complete_first(view), "mapped FIRST completion failed");
         require(pool.gap_bytes(0) == gap, "mapped FIRST reclamation truncated");
         require(*below == 17 && *above == 29, "mapped boundary pages overlap");
-        std::cout << "16 TiB virtual mapping passed; boundary pages and one full FIRST segment touched, no physical-memory claim\n";
+        std::cout << "16 TiB virtual mapping passed; boundary pages, FIRST payload, and 512 MiB metadata touched\n";
     } catch (const std::bad_alloc&) {
         std::cout << "Skipped: host cannot reserve the 16 TiB virtual mapping\n";
         return 77;
