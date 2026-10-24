@@ -1,6 +1,9 @@
 #pragma once
 
 #include "HistogramCommon.h"
+#include "../src/KtpFormat.h"
+
+#include <memory>
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -15,7 +18,7 @@ public:
     static constexpr uint64_t BUFFER_BYTES = 0; // No internal read buffers.
 
     CompactRecordReader(uint32_t k_len, uint32_t count_bytes)
-        : record_bytes_(RecordLayout(k_len, count_bytes).record_bytes) {}
+        : record_bytes_(RecordLayout(k_len, count_bytes).record_bytes), count_bytes_(count_bytes), k_len_(k_len) {}
     CompactRecordReader(const CompactRecordReader&) = delete;
     CompactRecordReader& operator=(const CompactRecordReader&) = delete;
     ~CompactRecordReader() { close(); }
@@ -24,6 +27,19 @@ public:
               uint64_t record_count = std::numeric_limits<uint64_t>::max())
     {
         close();
+        if (ktp::is_ktp_file(filename)) {
+            ktp_ = std::make_unique<ktp::Reader>();
+            ktp_->open(filename);
+            if (ktp_->k() != k_len_) throw std::runtime_error("KTP1 k mismatch");
+            const uint64_t records = ktp_->records();
+            if (first_record > records || (record_count != std::numeric_limits<uint64_t>::max() &&
+                                          record_count > records - first_record))
+                throw std::runtime_error("invalid compact record range");
+            first_record_ = first_record;
+            record_count_ = record_count == std::numeric_limits<uint64_t>::max()
+                ? records - first_record : record_count;
+            return;
+        }
         fd_ = ::open(filename.c_str(), O_RDONLY);
         if (fd_ < 0) throw std::runtime_error("failed to open " + filename + ": " + std::strerror(errno));
         try
@@ -53,6 +69,7 @@ public:
 
     void close() noexcept
     {
+        ktp_.reset();
         if (fd_ >= 0) ::close(fd_);
         fd_ = -1;
         first_record_ = record_count_ = delivered_ = 0;
@@ -63,6 +80,17 @@ public:
     uint64_t read_compact_records(char* output, uint64_t max_records)
     {
         uint64_t count = std::min(max_records, record_count_ - delivered_);
+        if (ktp_) {
+            char* cursor = output;
+            const uint32_t key_bytes = ktp_->key_bytes();
+            ktp_->decode_range(first_record_ + delivered_, count, [&](const uint8_t* key, uint32_t value) {
+                std::memcpy(cursor, key, key_bytes);
+                cursor += key_bytes;
+                for (uint32_t b = 0; b < count_bytes_; ++b) *cursor++ = static_cast<char>((value >> (8 * b)) & 0xffu);
+            });
+            delivered_ += count;
+            return count;
+        }
         uint64_t bytes = count * record_bytes_;
         uint64_t offset = (first_record_ + delivered_) * record_bytes_;
         uint64_t completed = 0;
@@ -86,5 +114,8 @@ public:
 private:
     int fd_ = -1;
     uint64_t record_bytes_;
+    uint32_t count_bytes_;
+    uint32_t k_len_ = 0;
+    std::unique_ptr<ktp::Reader> ktp_;
     uint64_t first_record_ = 0, record_count_ = 0, delivered_ = 0;
 };

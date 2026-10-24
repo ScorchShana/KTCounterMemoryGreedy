@@ -5,6 +5,9 @@
 #include "RingMemoryPool.h"
 #include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
+#include "KtpFormat.h"
+
+#include <memory>
 #include <aio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -55,6 +58,8 @@ private:
     std::array<BorrowedWrite, FIRST_AIO_SLOTS> borrowed_{};
     size_t current = 0;
     int next_arena_ = 0;
+    std::unique_ptr<ktp::Writer> ktp_;
+    bool ktp_written_ = false;
     content_type held_{};
     size_t held_offset_ = 0;
     bool normal_empty_ = false;
@@ -154,6 +159,18 @@ private:
         }
         return worked;
     }
+    void absorb(const void* raw, size_t begin, size_t end)
+    {
+        const char* data = static_cast<const char*>(raw);
+        for (size_t off = begin; off < end; off += record_bytes)
+            ktp_->add(data + off, 1);
+    }
+    void finalize_ktp()
+    {
+        if (!ktp_ || ktp_written_) return;
+        ktp_written_ = true;
+        ktp_->finish();
+    }
     bool normal_step()
     {
         if (!held_.data) {
@@ -162,6 +179,10 @@ private:
             held_offset_ = 0;
         }
         if (held_offset_ != held_.length * record_bytes) {
+            if (ktp_) {
+                absorb(held_.data, held_offset_, held_.length * record_bytes);
+                held_offset_ = held_.length * record_bytes;
+            } else {
             if (pending_borrowed()) return false;
             if (active[current]) {
                 const size_t other = (current + 1) % NUM_AIO_BUFFERS;
@@ -176,6 +197,7 @@ private:
             used[current] += bytes;
             held_offset_ += bytes;
             if (used[current] == usable_bytes) submit_normal(current);
+            }
         }
         if (held_offset_ == held_.length * record_bytes && ring_memory_pool->consumer_try_enqueue(held_.data)) held_ = {};
         return true;
@@ -197,6 +219,12 @@ private:
         if (!pending) return false;
         const size_t bytes = pending->view.record_count * record_bytes;
         if (!bytes) {
+            memory_pool_->complete_first(pending->view);
+            pending->owned = false;
+            return true;
+        }
+        if (ktp_) {
+            absorb(pending->view.records, 0, bytes);
             memory_pool_->complete_first(pending->view);
             pending->owned = false;
             return true;
@@ -281,9 +309,13 @@ public:
           state_(memory ? &memory->run_state() : RunState::active ? RunState::active : &local_state_),
           io_(ops ? *ops : IoOps{}), filename_(filename), output_kind_(kind), lifetime_(lifetime)
     {
-        const std::string path = kind == OutputKind::Pending ? filename + ".0" : filename;
-        fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) io_error("open pending output");
+        if (kind == OutputKind::FinalLow)
+            ktp_ = std::make_unique<ktp::Writer>(filename, k_length, /*has_counts=*/false);
+        if (!ktp_) {
+            const std::string path = kind == OutputKind::Pending ? filename + ".0" : filename;
+            fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) io_error("open pending output");
+        }
     }
     ExportWriter(const ExportWriter&) = delete;
     ExportWriter& operator=(const ExportWriter&) = delete;
@@ -310,6 +342,7 @@ public:
     void join()
     {
         if (worker.joinable()) worker.join();
+        finalize_ktp();
         close_file();
         state_->check();
     }
@@ -320,6 +353,7 @@ public:
             state_->fail(std::make_exception_ptr(std::runtime_error("pipeline unwound")), "main");
         finish_reclaim();
         if (worker.joinable()) worker.join();
+        try { finalize_ktp(); } catch (...) { state_->fail(std::current_exception(), "finalize low"); }
         cleanup_aio();
         try { close_file(); } catch (...) { state_->fail(std::current_exception(), "pending close"); }
         for (char* buffer : buffers) ::free(buffer);

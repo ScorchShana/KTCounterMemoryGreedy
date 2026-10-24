@@ -4,33 +4,21 @@
 #include "definition.h"
 #include "RingMemoryPool.h"
 #include "SpinBackoff.h"
+#include "KtpFormat.h"
 
-#include <aio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstdio>
-#include <cstdlib>
-#include <thread>
-#include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <thread>
 
+// high.bin 的写出线程：把 final drain 的 ring 块解码成 (key,count) 后写入 KTP1。
 class FinalDrainWriterThread
 {
-    static constexpr uint64_t AIO_BUFFER_SIZE = 2 * 1024 * 1024;
-    static constexpr uint32_t NUM_AIO_BUFFERS = 2;
-    // static constexpr uint64_t AIO_BUFFER_SIZE = 1ULL * 1024 * 1024;
-
     RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY> pool_;
-    int fd_;
     std::thread thread_;
-
-    struct aiocb cbs_[NUM_AIO_BUFFERS];
-    bool cbs_active_[NUM_AIO_BUFFERS]{};
-    std::array<char*, NUM_AIO_BUFFERS> buffer_{};
-    std::array<uint64_t, NUM_AIO_BUFFERS> buffer_count_;
-    uint32_t current_buffer_index_ = 0;
-    uint64_t file_offset_ = 0;
+    std::unique_ptr<ktp::Writer> ktp_;
+    bool ktp_written_ = false;
 
     SpinBackoff<> consumer_enqueue_backoff;
 
@@ -41,45 +29,30 @@ public:
     uint64_t consumer_enqueue_spin_time{ 0 };
     uint64_t consumer_dequeue_spin_time{ 0 };
 #endif
+
     FinalDrainWriterThread(uint32_t block_size, uint32_t producer_count)
-        : pool_(block_size, producer_count), fd_(-1) {
+        : pool_(block_size, producer_count),
+          ktp_(std::make_unique<ktp::Writer>(temp_dir + "high.final.tmp", k_length, /*has_counts=*/true)) {
     }
 
     auto* pool() { return &pool_; }
 
     void start()
     {
-        fd_ = ::open((temp_dir + "high.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd_ < 0) [[unlikely]]
-        {
-            std::cerr << "Failed to open high.bin\n";
-            throw std::runtime_error("final output I/O failed");
-        }
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i)
-        {
-            cbs_active_[i] = false;
-            buffer_[i] = nullptr;
-            buffer_count_[i] = 0;
-        }
         thread_ = std::thread(&FinalDrainWriterThread::writer_loop, this);
     }
 
     void join()
     {
         if (thread_.joinable()) thread_.join();
-        if (fd_ >= 0)
+        if (ktp_ && !ktp_written_)
         {
-            const int closing = fd_;
-            fd_ = -1;
-            if (::close(closing) && RunState::active)
-                RunState::active->fail(std::make_exception_ptr(std::runtime_error("close high output failed")), "final writer");
-        }
-        for (int i = 0; i < NUM_AIO_BUFFERS; i++)
-        {
-            if (buffer_[i] != nullptr)
-            {
-                ::free(buffer_[i]);
-                buffer_[i] = nullptr;
+            ktp_written_ = true;
+            try {
+                ktp_->finish();
+            } catch (...) {
+                if (RunState::active) RunState::active->fail(std::current_exception(), "final writer");
+                throw;
             }
         }
     }
@@ -90,7 +63,7 @@ public:
     ~FinalDrainWriterThread()
     {
         RunState::fail_on_unwind();
-        join();
+        try { join(); } catch (...) {}
 #ifdef TEST_MODE
         std::cout << "Final Drain Writer Thread consumer enqueue spin time: " << consumer_enqueue_spin_time << std::endl;
         std::cout << "Final Drain Writer Thread consumer dequeue spin time: " << consumer_dequeue_spin_time << std::endl;
@@ -101,78 +74,32 @@ private:
     void writer_loop()
     {
         run_worker("final writer", [&] {
-
-        for (int i = 0; i < NUM_AIO_BUFFERS; i++)
-        {
-            void* buffer_ptr = nullptr;
-            int ret = ::posix_memalign(&buffer_ptr, 4096, AIO_BUFFER_SIZE);
-            if (ret != 0) {
-                std::cerr << "posix_memalign failed for buffer: " << strerror(ret) << std::endl;
-                throw std::runtime_error("final output I/O failed");
-            }
-            buffer_[i] = static_cast<char*>(buffer_ptr);
-        }
-
-        SpinBackoff<> backoff;
-        content_type content;
-
-        while (true)
-        {
-            if (pool_.consumer_try_dequeue(content))
+            SpinBackoff<> backoff;
+            content_type content;
+            while (true)
             {
-#ifdef TEST_MODE
-                first_flag = true;
-#endif
-
-                backoff.double_decay();
-                process_block(content);
-            }
-            else if (pool_.producer_finished())
-            {
-                while (pool_.consumer_try_dequeue(content))
+                if (pool_.consumer_try_dequeue(content))
                 {
-                    process_block(content);
-                    cpu_relax();
-                }
-                break;
-            }
-            else
-            {
 #ifdef TEST_MODE
-                if (first_flag) consumer_dequeue_spin_time++;
+                    first_flag = true;
 #endif
-
-                backoff.backoff();
+                    backoff.double_decay();
+                    process_block(content);
+                }
+                else if (pool_.producer_finished())
+                {
+                    while (pool_.consumer_try_dequeue(content)) process_block(content);
+                    break;
+                }
+                else
+                {
+#ifdef TEST_MODE
+                    if (first_flag) consumer_dequeue_spin_time++;
+#endif
+                    backoff.backoff();
+                }
             }
-        }
-
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i)
-        {
-            if (cbs_active_[i])
-            {
-                wait_write_finish(i);
-            }
-        }
-        if (buffer_count_[current_buffer_index_] > 0)
-        {
-            async_write(current_buffer_index_);
-            wait_write_finish(current_buffer_index_);
-        }
-
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i)
-        {
-            if (buffer_[i]) ::free(buffer_[i]);
-            buffer_[i] = nullptr;
-        }
-    
         });
-        for (uint32_t i = 0; i < NUM_AIO_BUFFERS; ++i) {
-            if (!cbs_active_[i]) continue;
-            const aiocb* list[] = {&cbs_[i]};
-            while (::aio_error(&cbs_[i]) == EINPROGRESS) ::aio_suspend(list, 1, nullptr);
-            ::aio_return(&cbs_[i]);
-            cbs_active_[i] = false;
-        }
     }
 
     void process_block(const content_type& content)
@@ -183,26 +110,14 @@ private:
             return;
         }
 
-        if (buffer_count_[current_buffer_index_] + content.length >= AIO_BUFFER_SIZE)
+        const uint64_t record_bytes = ::kmer_bytes() + count_max_bytes;
+        const uint64_t records = content.length / record_bytes;
+        const char* record = content.data;
+        for (uint64_t i = 0; i < records; ++i, record += record_bytes)
         {
-            uint64_t to_copy = AIO_BUFFER_SIZE - buffer_count_[current_buffer_index_];
-            std::memcpy(buffer_[current_buffer_index_] + buffer_count_[current_buffer_index_],
-                content.data, to_copy);
-            uint64_t remaining = content.length - to_copy;
-            buffer_count_[current_buffer_index_] += to_copy;
-
-            async_write(current_buffer_index_);
-            current_buffer_index_ = (current_buffer_index_ + 1) % NUM_AIO_BUFFERS;
-            wait_write_finish(current_buffer_index_);
-
-            std::memcpy(buffer_[current_buffer_index_], content.data + to_copy, remaining);
-            buffer_count_[current_buffer_index_] = remaining;
-        }
-        else
-        {
-            std::memcpy(buffer_[current_buffer_index_] + buffer_count_[current_buffer_index_],
-                content.data, content.length);
-            buffer_count_[current_buffer_index_] += content.length;
+            uint32_t count = 0;
+            std::memcpy(&count, record + ::kmer_bytes(), count_max_bytes);
+            ktp_->add(record, count);
         }
 
         if (pool_.consumer_try_enqueue(content.data))
@@ -224,63 +139,6 @@ private:
             }
             consumer_enqueue_backoff.decay();
         }
-    }
-
-    void async_write(uint32_t idx)
-    {
-        std::memset(&cbs_[idx], 0, sizeof(struct aiocb));
-        cbs_[idx].aio_fildes = fd_;
-        cbs_[idx].aio_buf = buffer_[idx];
-        cbs_[idx].aio_nbytes = buffer_count_[idx];
-        cbs_[idx].aio_offset = file_offset_;
-
-        if (::aio_write(&cbs_[idx]) != 0) [[unlikely]]
-        {
-            std::cerr << "aio_write failed\n";
-            throw std::runtime_error("final output I/O failed");
-        }
-
-        file_offset_ += buffer_count_[idx];
-        buffer_count_[idx] = 0;
-        cbs_active_[idx] = true;
-    }
-
-    void wait_write_finish(uint32_t idx)
-    {
-        if (!cbs_active_[idx]) [[unlikely]]
-        {
-            return;
-        }
-
-        const aiocb* list[1] = { &cbs_[idx] };
-        int err;
-        const timespec timeout{0, 10000000};
-        while ((err = ::aio_error(&cbs_[idx])) == EINPROGRESS)
-        {
-            RunState::check_active();
-            if (::aio_suspend(list, 1, &timeout) != 0 && errno != EINTR && errno != EAGAIN) [[unlikely]]
-            {
-                std::cerr << "aio_suspend failed\n";
-                throw std::runtime_error("final output I/O failed");
-            }
-        }
-
-        err = ::aio_error(&cbs_[idx]);
-        if (err != 0) [[unlikely]]
-        {
-            std::cerr << "aio_write error\n";
-            throw std::runtime_error("final output I/O failed");
-        }
-
-        ssize_t n = ::aio_return(&cbs_[idx]);
-        cbs_active_[idx] = false;
-        if (n != static_cast<ssize_t>(cbs_[idx].aio_nbytes)) [[unlikely]]
-        {
-            std::cerr << "partial aio_write\n";
-            throw std::runtime_error("final output I/O failed");
-        }
-
-        cbs_active_[idx] = false;
     }
 };
 
