@@ -23,6 +23,7 @@
 #include <vector>
 #include <barrier>
 
+template<typename CountType = uint32_t>
 class FastqClassifier
 {
 
@@ -45,9 +46,9 @@ class FastqClassifier
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>* classify_task_queue;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
-    KmerTree* tree;
+    KmerTree<CountType>* tree;
 
-    std::array<node, 1ULL << (2 * ROOT_BASES)> local_root_nodes{};
+    std::array<node<CountType>, 1ULL << (2 * ROOT_BASES)> local_root_nodes{};
     std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_prefix_owners{};
     std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_prefix_to_bloom_filter_index{};
     std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_bloom_filter_index_to_prefix{};
@@ -129,7 +130,7 @@ public:
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_ring_pool,
         MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>* in_classify_task_queue,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
-        KmerTree* in_tree,
+        KmerTree<CountType>* in_tree,
         ConcurrentMemoryPool* in_memory_pool,
         PhaseBarrier& in_barrier,
         ConcurrentFirstBlockRing* in_first_ring,
@@ -377,7 +378,7 @@ public:
     {
         if (!first_cache_enabled_) return;
         const size_t width = kmer_bytes();
-        KmerTree::FirstScanBatch batch;
+        typename KmerTree<CountType>::FirstScanBatch batch;
         if constexpr (WRITE_LOW) {
             char* raw = nullptr;
             dequeue_data_to_export_writer(raw);

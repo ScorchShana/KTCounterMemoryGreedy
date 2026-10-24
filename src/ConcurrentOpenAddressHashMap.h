@@ -11,14 +11,21 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
 
 #ifdef TEST_MODE
 #include <utility>
 #endif
 
+template<typename CountType>
 class ConcurrentOpenAddressHashMap
 {
     friend struct KmerTreeAllocationTestAccess;
+    static_assert(std::is_same_v<CountType, uint8_t> ||
+        std::is_same_v<CountType, uint16_t> || std::is_same_v<CountType, uint32_t>);
+    static_assert(std::atomic<CountType>::is_always_lock_free);
 
 
     struct alignas(CACHE_LINE_SIZE) SizeCounter
@@ -36,12 +43,13 @@ class ConcurrentOpenAddressHashMap
     constexpr static double LOAD_FACTOR = 0.8;
 
     const size_t bytes_ = kmer_bytes();
+    const CountType limit_;
     SizeCounter size;
     uint64_t segment_id;
     uint64_t capacity;
     std::atomic<uint8_t>* ctrls;
     unsigned char* keys;
-    std::atomic<uint32_t>* counts;
+    std::atomic<CountType>* counts;
     std::atomic<bool> sealed;
     std::atomic<bool> building_next;
     std::atomic<ConcurrentOpenAddressHashMap*> next_map;
@@ -71,7 +79,9 @@ public:
         BEFORE_SEALED_CHECK,
         AFTER_SEALED_OBSERVED,
         AFTER_OPEN_CHECK_BEFORE_CTRL_CAS,
-        AFTER_SIZE_RESERVED_BEFORE_PUBLISH
+        AFTER_SIZE_RESERVED_BEFORE_PUBLISH,
+        BEFORE_COUNT_FETCH_ADD,
+        AFTER_COUNT_FETCH_ADD
     };
 
     using DebugHook = void (*)(DebugEvent,
@@ -97,30 +107,35 @@ public:
     }
 #endif
 
-    ConcurrentOpenAddressHashMap(uint64_t capacity)
-        : segment_id(0), capacity(capacity), sealed(false), building_next(false), next_map(nullptr)
+    ConcurrentOpenAddressHashMap(uint64_t capacity, uint32_t limit = count_max)
+        : limit_(checked_limit(limit)), segment_id(0), capacity(capacity), sealed(false), building_next(false), next_map(nullptr)
     {
         size.value.store(0, std::memory_order_relaxed);
         char* mem_area = reinterpret_cast<char*>(pool->allocate_large(get_mem_size(capacity)));
         ctrls = reinterpret_cast<std::atomic<uint8_t>*>(mem_area);
         keys = reinterpret_cast<unsigned char*>(ctrls + capacity);
-        counts = reinterpret_cast<std::atomic<uint32_t>*>(mem_area + counts_offset(capacity));
+        counts = reinterpret_cast<std::atomic<CountType>*>(mem_area + counts_offset(capacity));
         for (uint64_t i = 0; i < capacity; ++i)
         {
             new (ctrls + i) std::atomic<uint8_t>(EMPTY);
         }
-        // for (uint64_t i = 0; i < capacity; ++i)
-        // {
-        //     new (counts + i) std::atomic<uint32_t>(0);
-        // }
     }
 
+private:
+    static CountType checked_limit(uint32_t limit)
+    {
+        if (limit == 0 || limit > std::numeric_limits<CountType>::max())
+            throw std::invalid_argument("count limit is outside the counter type range");
+        return static_cast<CountType>(limit);
+    }
+
+public:
     static size_t counts_offset(uint64_t capacity) noexcept {
         return align_up(capacity * (sizeof(std::atomic<uint8_t>) + kmer_bytes()),
-            alignof(std::atomic<uint32_t>));
+            alignof(std::atomic<CountType>));
     }
     static uint64_t get_mem_size(uint64_t capacity) noexcept {
-        return counts_offset(capacity) + capacity * sizeof(std::atomic<uint32_t>);
+        return counts_offset(capacity) + capacity * sizeof(std::atomic<CountType>);
     }
     static uint64_t hash_key(const unsigned char* key) {
         return rapidhash(key, kmer_bytes());
@@ -158,7 +173,7 @@ public:
                 const uint8_t ctrl = map->ctrls[i].load(std::memory_order_acquire);
                 if ((ctrl & 0x80U) != 0) [[likely]]
                 {
-                    visitor(map->keys + i * map->bytes_, map->counts[i].load(std::memory_order_relaxed));
+                    visitor(map->keys + i * map->bytes_, static_cast<uint32_t>(map->counts[i].load(std::memory_order_relaxed)));
                 }
             }
             map = map->next_map.load(std::memory_order_acquire);
@@ -243,7 +258,7 @@ public:
         uint64_t h,
         const unsigned char* key,
         const uint8_t fp,
-        const uint32_t value,
+        const CountType value,
         uint64_t& local_count)
     {
         const int64_t cur_max_size = static_cast<int64_t>(capacity * LOAD_FACTOR);
@@ -308,8 +323,8 @@ public:
                         notify_debug_hook(DebugEvent::AFTER_SIZE_RESERVED_BEFORE_PUBLISH, this, key);
 #endif
                         std::memcpy(keys + index * bytes_, key, bytes_);
-                        const uint32_t corrected_value = std::min<uint32_t>(value, count_max);
-                        new (counts + index) std::atomic<uint32_t>(corrected_value);
+                        const CountType corrected_value = std::min(value, limit_);
+                        new (counts + index) std::atomic<CountType>(corrected_value);
                         ctrls[index].store(fp, std::memory_order_release); // Set the fingerprint
                         ++local_count;
                         return InsertResult::INSERTED; // Return true if we need to build next map
@@ -325,15 +340,19 @@ public:
             {
                 if (std::memcmp(keys + index * bytes_, key, bytes_) == 0) [[likely]]
                 {
-                    const uint32_t cur = counts[index].load(std::memory_order_relaxed);
-                    if (cur < count_max)
+                    const CountType cur = counts[index].load(std::memory_order_relaxed);
+                    if (cur < limit_)
                     {
-                        const uint32_t increment = static_cast<uint32_t>(
-                            std::min<uint32_t>(value, count_max));
-                        const uint32_t prev = counts[index].fetch_add(increment, std::memory_order_relaxed);
-                        if (increment > count_max - std::min(prev, count_max)) [[unlikely]]
+#ifdef CONCURRENT_OPEN_ADDRESS_HASH_MAP_TESTING
+                        notify_debug_hook(DebugEvent::BEFORE_COUNT_FETCH_ADD, this, key);
+#endif
+                        const CountType prev = counts[index].fetch_add(value, std::memory_order_relaxed);
+#ifdef CONCURRENT_OPEN_ADDRESS_HASH_MAP_TESTING
+                        notify_debug_hook(DebugEvent::AFTER_COUNT_FETCH_ADD, this, key);
+#endif
+                        if (value > limit_ - std::min(prev, limit_)) [[unlikely]]
                         {
-                            counts[index].store(count_max, std::memory_order_relaxed);
+                            counts[index].store(limit_, std::memory_order_relaxed);
                         }
                     }
                     return InsertResult::UPDATED;
@@ -352,7 +371,7 @@ public:
         }
     }
 
-    void increment(const unsigned char* key, const uint32_t& value, uint64_t& local_count) {
+    void increment(const unsigned char* key, const CountType value, uint64_t& local_count) {
         const uint64_t h = hash_key(key);
         const uint8_t fp = fingerprint(h);
 
@@ -380,6 +399,8 @@ public:
     }
 
 #ifdef CONCURRENT_OPEN_ADDRESS_HASH_MAP_TESTING
+    const std::atomic<CountType>* debug_count_storage() const noexcept { return counts; }
+
     template <typename Visitor>
     void debug_visit_entries(Visitor&& visitor) const
     {
@@ -394,7 +415,7 @@ public:
                 {
                     visitor(segment_index,
                         map->keys + i * map->bytes_,
-                        map->counts[i].load(std::memory_order_relaxed));
+                        static_cast<uint32_t>(map->counts[i].load(std::memory_order_relaxed)));
                 }
             }
             map = map->next_map.load(std::memory_order_acquire);
@@ -455,7 +476,7 @@ public:
                         const uint64_t next_capacity = capacity > concurrent_hash_map_max_capacity / factor
                             ? concurrent_hash_map_max_capacity : capacity * factor;
                         void* memory = get_map_metadata_mem();
-                        next = new (memory) ConcurrentOpenAddressHashMap(next_capacity);
+                        next = new (memory) ConcurrentOpenAddressHashMap(next_capacity, limit_);
                         next->segment_id = next_id;
                         next_map.store(next, std::memory_order_release);
                     }

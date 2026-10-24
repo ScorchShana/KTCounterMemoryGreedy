@@ -30,11 +30,7 @@
  * - Fixed capacity, no expansion
  * - No deletion support
  *
- * @tparam KeyCount Number of uint64_t elements in the key (1-4)
- * @tparam ValueType Counter type (default uint16_t)
- * @tparam MaxBytes Maximum memory usage (default 128 KB)
  */
-template <typename ValueType = uint16_t>
 class CountingHashMap
 {
 
@@ -55,7 +51,7 @@ public:
     /**
      * @brief Iterate over all entries
      * @pre Callback must not insert into or clear this map during traversal.
-     * @tparam Func Function type: void(const KeyType&, ValueType&)
+     * @tparam Func Function type: void(const KeyType&, uint16_t&)
      * @param func Callback function for each entry
      */
     template <typename Func>
@@ -64,7 +60,7 @@ public:
     /**
      * @brief Iterate over all entries (const version)
      * @pre Callback must not insert into or clear this map during traversal.
-     * @tparam Func Function type: void(const KeyType&, ValueType)
+     * @tparam Func Function type: void(const KeyType&, uint16_t)
      * @param func Callback function for each entry
      */
     template <typename Func>
@@ -155,14 +151,13 @@ public:
     std::vector<uint8_t> controls_;
 
     std::vector<unsigned char> keys_;
-    std::vector<ValueType> counts_;
+    std::vector<uint16_t> counts_;
 
 
 };
 
 // Implementation
-template <typename ValueType>
-void CountingHashMap<ValueType>::increment(const unsigned char* key)
+inline void CountingHashMap::increment(const unsigned char* key)
 {
 
     uint64_t h = hash_key(key);
@@ -243,9 +238,8 @@ void CountingHashMap<ValueType>::increment(const unsigned char* key)
     }
 }
 
-template <typename ValueType>
 template <typename Func>
-void CountingHashMap<ValueType>::for_each(Func&& func)
+void CountingHashMap::for_each(Func&& func)
 {
 #if defined(__AVX2__)
     constexpr size_t WIDTH = 32;
@@ -288,9 +282,8 @@ void CountingHashMap<ValueType>::for_each(Func&& func)
 #endif
 }
 
-template <typename ValueType>
 template <typename Func>
-void CountingHashMap<ValueType>::for_each(Func&& func) const
+void CountingHashMap::for_each(Func&& func) const
 {
 #if defined(__AVX2__)
     constexpr size_t WIDTH = 32;
@@ -333,8 +326,7 @@ void CountingHashMap<ValueType>::for_each(Func&& func) const
 #endif
 }
 
-template <typename ValueType>
-void CountingHashMap<ValueType>::clear()
+inline void CountingHashMap::clear()
 {
     std::memset(controls_.data(), 0, CAPACITY + GROUP_SIZE - 1);
     size_ = 0;

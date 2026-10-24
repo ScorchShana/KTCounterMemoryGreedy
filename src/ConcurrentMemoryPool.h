@@ -159,7 +159,7 @@ struct alignas(CACHE_LINE_SIZE) Arena
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> completion_sequence{0};
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> scan_reclaim_goal_pages{0};
     alignas(CACHE_LINE_SIZE) std::mutex control_mutex;
-    std::atomic<Request> request{Request::Idle};
+    alignas(CACHE_LINE_SIZE) std::atomic<Request> request{ Request::Idle };
     size_t pending_bytes = 0;
     char* reserved_result = nullptr;
     bool permanently_frozen = false;

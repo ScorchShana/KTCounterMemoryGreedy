@@ -21,7 +21,17 @@
 namespace
 {
 constexpr uint32_t kWords = 2;
-using Map = ConcurrentOpenAddressHashMap;
+#ifndef HASH_COUNT_BITS
+#define HASH_COUNT_BITS 32
+#endif
+using CountType = std::conditional_t<HASH_COUNT_BITS == 8, uint8_t,
+    std::conditional_t<HASH_COUNT_BITS == 16, uint16_t, uint32_t>>;
+using Map = ConcurrentOpenAddressHashMap<CountType>;
+
+CountType narrow(uint32_t value)
+{
+    return static_cast<CountType>(std::min<uint32_t>(value, std::numeric_limits<CountType>::max()));
+}
 using Kmer = std::vector<unsigned char>;
 
 struct KmerLess
@@ -117,7 +127,7 @@ void add_expected(Counts& expected, const Operation& op)
 {
     uint64_t& count = expected[op.key];
     count = std::min<uint64_t>(
-        std::numeric_limits<uint32_t>::max(), count + op.value);
+        count_max, count + op.value);
 }
 
 Snapshot take_snapshot(const Map& map)
@@ -259,7 +269,7 @@ bool insert_one(Map& map,
     uint64_t& local_count,
     Counts& expected)
 {
-    map.increment(op.key.data(), op.value, local_count);
+    map.increment(op.key.data(), narrow(op.value), local_count);
     add_expected(expected, op);
     return true;
 }
@@ -285,7 +295,7 @@ long long run_parallel(Map& map,
                 const auto start = std::chrono::steady_clock::now();
                 for (const Operation& op : operations[thread_index])
                 {
-                    map.increment(op.key.data(), op.value, local_counts[thread_index]);
+                    map.increment(op.key.data(), narrow(op.value), local_counts[thread_index]);
                 }
                 const auto end = std::chrono::steady_clock::now();
                 const long long elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -824,8 +834,121 @@ bool test_post_cas_sealed_race(ConcurrentMemoryPool& pool)
     return validate_map(map, expected, capacity, capacity, "post-CAS sealed race");
 }
 
+bool test_count_limits_and_layout(ConcurrentMemoryPool& pool)
+{
+    const uint32_t high = std::numeric_limits<CountType>::max();
+    if (uint32_t(narrow(300)) != std::min<uint32_t>(300, high) ||
+        uint32_t(narrow(65536)) != std::min<uint32_t>(65536, high)) return false;
+    const size_t before = pool.gap_bytes(0);
+    for (uint32_t invalid : {uint32_t{0}, high == UINT32_MAX ? uint32_t{0} : high + 1}) {
+        try { Map map(1024, invalid); return false; }
+        catch (const std::invalid_argument&) {}
+    }
+    if (pool.gap_bytes(0) != before) return false;
+    const uint32_t limits[] = {1, 4, 100, 255, 256, 1000, 65535, 65536,
+                              0xffffff, 0x1000000, UINT32_MAX};
+    for (uint32_t limit : limits) {
+        if (limit > high) continue;
+        Map map(1024, limit);
+        if (reinterpret_cast<uintptr_t>(map.debug_count_storage()) % alignof(std::atomic<CountType>)) return false;
+        const size_t offset = (1024 * (sizeof(std::atomic<uint8_t>) + kmer_bytes()) +
+            alignof(std::atomic<CountType>) - 1) & ~(alignof(std::atomic<CountType>) - 1);
+        if (Map::counts_offset(1024) != offset ||
+            Map::get_mem_size(1024) != offset + 1024 * sizeof(std::atomic<CountType>)) return false;
+        uint64_t unique = 0;
+        const auto first = make_kmer(100);
+        map.increment(first.data(), narrow(high), unique);
+        const auto second = make_kmer(200);
+        map.increment(second.data(), narrow(65472), unique);
+        for (uint32_t delta : {uint32_t{1}, uint32_t{2}, high}) {
+            const auto key = make_kmer(300 + delta);
+            map.increment(key.data(), narrow(limit - 1), unique);
+            const uint64_t h = Map::hash_key(key.data());
+            map.try_increment(h, key.data(), Map::fingerprint(h), narrow(delta), unique);
+            map.increment(key.data(), CountType{1}, unique);
+        }
+        bool valid = true;
+        map.for_each_entry([&](const unsigned char* bytes, auto count) {
+            static_assert(std::is_same_v<decltype(count), uint32_t>);
+            const uint32_t expected = std::memcmp(bytes, second.data(), kmer_bytes()) == 0
+                ? std::min<uint32_t>(65472, limit) : limit;
+            if (count != expected) valid = false;
+        });
+        if (!valid) return false;
+        auto* next = map.ensure_next_map();
+        next->increment(first.data(), narrow(high), unique);
+        next->for_each_entry([&](const unsigned char*, uint32_t count) { if (count != limit) valid = false; });
+        if (!valid) return false;
+    }
+    k_length = 81; // 21-byte keys, measured through the real page-rounded allocator.
+    size_t gap_before = 0, gap_after = 0;
+    for (int i = 0; i < pool.arena_count(); ++i) gap_before += pool.gap_bytes(i);
+    Map layout(1024, 1);
+    for (int i = 0; i < pool.arena_count(); ++i) gap_after += pool.gap_bytes(i);
+    const size_t allocated = (Map::get_mem_size(1024) + 4095) & ~size_t{4095};
+    if (gap_before - gap_after != allocated) return false;
+    std::cout << "count_bits=" << HASH_COUNT_BITS << " atomic_bytes=" << sizeof(std::atomic<CountType>)
+              << " array_bytes=" << Map::get_mem_size(1024) << " allocated_bytes=" << allocated << '\n';
+    k_length = 33;
+    return true;
+}
+
+struct CountRace
+{
+    Map::DebugEvent stop;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false, resume = false;
+};
+CountRace* count_race = nullptr;
+thread_local bool pause_count_update = false;
+void count_hook(Map::DebugEvent event, const Map*, const unsigned char*)
+{
+    if (!pause_count_update || event != count_race->stop) return;
+    std::unique_lock lock(count_race->mutex);
+    count_race->paused = true;
+    count_race->cv.notify_all();
+    count_race->cv.wait(lock, [] { return count_race->resume; });
+}
+
+bool test_count_race(ConcurrentMemoryPool& pool, bool after_add)
+{
+    const uint32_t limit = HASH_COUNT_BITS == 8 ? 100 : HASH_COUNT_BITS == 16 ? 1000 : 65536;
+    Map map(16, limit);
+    const auto key = make_kmer(555);
+    uint64_t unique = 0;
+    map.increment(key.data(), narrow(limit - 1), unique);
+    CountRace race;
+    race.stop = after_add ? Map::DebugEvent::AFTER_COUNT_FETCH_ADD : Map::DebugEvent::BEFORE_COUNT_FETCH_ADD;
+    count_race = &race;
+    Map::set_debug_hook(count_hook);
+    std::thread delayed([&] {
+        Map::set_memory_pool(&pool);
+        pause_count_update = true;
+        uint64_t added = 0;
+        map.increment(key.data(), after_add ? std::numeric_limits<CountType>::max() : CountType{1}, added);
+    });
+    bool reached;
+    {
+        std::unique_lock lock(race.mutex);
+        reached = race.cv.wait_for(lock, std::chrono::seconds(5), [&] { return race.paused; });
+    }
+    if (reached) map.increment(key.data(), CountType{1}, unique);
+    {
+        std::lock_guard lock(race.mutex);
+        race.resume = true;
+        race.cv.notify_all();
+    }
+    delayed.join();
+    Map::set_debug_hook(nullptr);
+    count_race = nullptr;
+    return reached && take_snapshot(map).counts == Counts{{key, limit}};
+}
+
 bool run_correctness_suite(ConcurrentMemoryPool& pool)
 {
+    if (!test_count_limits_and_layout(pool)) { std::cerr << "count limits/layout failed\n"; return false; }
+    if (!test_count_race(pool, false) || !test_count_race(pool, true)) { std::cerr << "count race failed\n"; return false; }
     if (!test_growth_boundaries_and_old_key_updates()) return false;
     if (!test_hot_key(pool)) return false;
     if (!test_mixed_workload(pool, 0x1234ULL, 8, 2'000, "mixed workload")) return false;
@@ -1024,7 +1147,7 @@ bool run_benchmark(ConcurrentMemoryPool& pool, const BenchmarkConfig& cfg)
 int main(int argc, char** argv)
 {
     k_length = 33;
-    count_max = std::numeric_limits<uint32_t>::max();
+    count_max = std::numeric_limits<CountType>::max();
     ConcurrentMemoryPool pool(512ULL * 1024ULL * 1024ULL);
     pool.init_arenas();
     Map::set_memory_pool(&pool);

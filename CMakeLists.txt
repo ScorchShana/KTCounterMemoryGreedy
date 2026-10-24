@@ -61,11 +61,12 @@ endif()
 
 
 foreach(SIMD IN ITEMS scalar sse avx2)
-    add_executable(counting_hash_map_${SIMD}_test tests/test_counting_hash_map.cpp)
+    add_executable(counting_hash_map_${SIMD}_test tests/test_counting_hash_map.cpp
+        tests/counting_hash_map_link_probe.cpp)
     if(SIMD STREQUAL "avx2")
         target_compile_options(counting_hash_map_${SIMD}_test PRIVATE -mavx2)
     elseif(SIMD STREQUAL "sse")
-        target_compile_options(counting_hash_map_${SIMD}_test PRIVATE -mno-avx -mno-avx2 -mno-sse4.2 -msse2)
+        target_compile_options(counting_hash_map_${SIMD}_test PRIVATE -mno-avx -mno-avx2 -msse4.2)
     else()
         target_compile_options(counting_hash_map_${SIMD}_test PRIVATE -mno-avx -mno-avx2 -mno-sse2)
     endif()
@@ -74,43 +75,53 @@ foreach(SIMD IN ITEMS scalar sse avx2)
     set_tests_properties(CountingHashMap_${SIMD} PROPERTIES TIMEOUT 30)
 endforeach()
 
-add_executable(concurrent_open_address_hash_map_test tests/test_concurrent_open_address_hash_map.cpp)
-target_link_libraries(concurrent_open_address_hash_map_test pthread rt)
-if(NUMA_LIBRARY)
-    target_link_libraries(concurrent_open_address_hash_map_test ${NUMA_LIBRARY})
-endif()
-add_test(NAME ConcurrentOpenAddressHashMapTest COMMAND concurrent_open_address_hash_map_test)
-set_tests_properties(ConcurrentOpenAddressHashMapTest PROPERTIES TIMEOUT 120)
-
 option(ENABLE_TSAN_TESTS "Build ThreadSanitizer tests" OFF)
-if(ENABLE_TSAN_TESTS)
-    add_executable(concurrent_open_address_hash_map_tsan_test tests/test_concurrent_open_address_hash_map.cpp)
-    target_compile_options(concurrent_open_address_hash_map_tsan_test PRIVATE
-        -O3
-        -g
-        -fsanitize=thread
-        -fno-omit-frame-pointer
-        -fno-lto)
-    set_property(TARGET concurrent_open_address_hash_map_tsan_test
-        APPEND_STRING PROPERTY LINK_FLAGS " -fsanitize=thread -fno-lto")
-    target_link_libraries(concurrent_open_address_hash_map_tsan_test pthread rt)
-    if(NUMA_LIBRARY)
-        target_link_libraries(concurrent_open_address_hash_map_tsan_test ${NUMA_LIBRARY})
-    endif()
-    find_program(SETARCH_EXECUTABLE setarch)
-    if(SETARCH_EXECUTABLE)
-        add_test(NAME ConcurrentOpenAddressHashMapTsanTest
-            COMMAND ${SETARCH_EXECUTABLE} ${CMAKE_SYSTEM_PROCESSOR} -R
-                $<TARGET_FILE:concurrent_open_address_hash_map_tsan_test>)
+foreach(BITS IN ITEMS 32 8 16)
+    if(BITS EQUAL 32)
+        set(COUNT_SUFFIX "")
+        set(COUNT_TEST_SUFFIX "")
     else()
-        add_test(NAME ConcurrentOpenAddressHashMapTsanTest
-            COMMAND concurrent_open_address_hash_map_tsan_test)
+        set(COUNT_SUFFIX "_uint${BITS}")
+        set(COUNT_TEST_SUFFIX "Uint${BITS}")
     endif()
-    set_tests_properties(ConcurrentOpenAddressHashMapTsanTest PROPERTIES
-        LABELS "tsan"
-        TIMEOUT 180
-        ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1")
+    set(MAP_TARGET concurrent_open_address_hash_map${COUNT_SUFFIX}_test)
+    add_executable(${MAP_TARGET} tests/test_concurrent_open_address_hash_map.cpp)
+    target_compile_definitions(${MAP_TARGET} PRIVATE HASH_COUNT_BITS=${BITS})
+    target_link_libraries(${MAP_TARGET} pthread rt atomic)
+    if(NUMA_LIBRARY)
+        target_link_libraries(${MAP_TARGET} ${NUMA_LIBRARY})
+    endif()
+    add_test(NAME ConcurrentOpenAddressHashMap${COUNT_TEST_SUFFIX}Test COMMAND ${MAP_TARGET})
+    set_tests_properties(ConcurrentOpenAddressHashMap${COUNT_TEST_SUFFIX}Test PROPERTIES TIMEOUT 120)
+    if(ENABLE_TSAN_TESTS)
+        set(TSAN_TARGET concurrent_open_address_hash_map${COUNT_SUFFIX}_tsan_test)
+        add_executable(${TSAN_TARGET} tests/test_concurrent_open_address_hash_map.cpp)
+        target_compile_definitions(${TSAN_TARGET} PRIVATE HASH_COUNT_BITS=${BITS})
+        target_compile_options(${TSAN_TARGET} PRIVATE -O3 -g -fsanitize=thread -fno-omit-frame-pointer -fno-lto)
+        set_property(TARGET ${TSAN_TARGET} APPEND_STRING PROPERTY LINK_FLAGS " -fsanitize=thread -fno-lto")
+        target_link_libraries(${TSAN_TARGET} pthread rt atomic)
+        if(NUMA_LIBRARY)
+            target_link_libraries(${TSAN_TARGET} ${NUMA_LIBRARY})
+        endif()
+        find_program(SETARCH_EXECUTABLE setarch)
+        if(SETARCH_EXECUTABLE)
+            add_test(NAME ConcurrentOpenAddressHashMap${COUNT_TEST_SUFFIX}TsanTest
+                COMMAND ${SETARCH_EXECUTABLE} ${CMAKE_SYSTEM_PROCESSOR} -R $<TARGET_FILE:${TSAN_TARGET}>)
+        else()
+            add_test(NAME ConcurrentOpenAddressHashMap${COUNT_TEST_SUFFIX}TsanTest COMMAND ${TSAN_TARGET})
+        endif()
+        set_tests_properties(ConcurrentOpenAddressHashMap${COUNT_TEST_SUFFIX}TsanTest PROPERTIES
+            LABELS "tsan" TIMEOUT 180 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1")
+    endif()
+endforeach()
+
+add_executable(hash_count_types_test tests/test_hash_count_types.cpp)
+target_link_libraries(hash_count_types_test pthread rt atomic)
+if(NUMA_LIBRARY)
+    target_link_libraries(hash_count_types_test ${NUMA_LIBRARY})
 endif()
+add_test(NAME HashCountTypesTest COMMAND hash_count_types_test)
+set_tests_properties(HashCountTypesTest PROPERTIES TIMEOUT 120)
 
 add_executable(export_reader_test tests/test_export_reader.cpp)
 target_link_libraries(export_reader_test rt)

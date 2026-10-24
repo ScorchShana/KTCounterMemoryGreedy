@@ -317,6 +317,7 @@ void get_numa_nodes()
 
 }
 
+template<typename CountType>
 int process_main()
 {
     RunState runtime;
@@ -341,7 +342,7 @@ int process_main()
     const auto init_start = std::chrono::steady_clock::now();
 
     // 初始化层级队列，用于在树的不同深度间传递任务
-    auto layer_queues = std::make_shared<LayerQueues>();
+    auto layer_queues = std::make_shared<LayerQueues<CountType>>();
     // 初始化解析器环形内存池，管理 Reader 读取后的碱基字符串数据块
     auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, pre_reader_num);
     // 初始化分类器环形内存池，管理 Parser 线程处理后的 k-mer 数据块
@@ -555,7 +556,7 @@ int process_main()
     // pool->perform_first_touch(n_thread);
 
     // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
-    auto tree = std::make_shared<KmerTree>(pool.get(), layer_queues.get(), export_ring_pool.get());
+    auto tree = std::make_shared<KmerTree<CountType>>(pool.get(), layer_queues.get(), export_ring_pool.get());
     // 初始化布隆过滤器的MPSC队列
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     for (uint32_t i = 0; i < classifier_num; i++)
@@ -563,9 +564,9 @@ int process_main()
         classifier_task_queues.push_back(std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>());
     }
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
-    auto task_thread_pool = std::make_shared<SchedulerThreadPool>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
+    auto task_thread_pool = std::make_shared<SchedulerThreadPool<CountType>>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
-    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_cache_enabled);
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<CountType>>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_cache_enabled);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
     auto parser_thread_pool = std::make_shared<ParserThreadPool>(classifier_task_queues, global_classifier_task_queue.get(), pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
@@ -1022,7 +1023,11 @@ int main(int argc, char* argv[])
         count_max_bytes = 4;
     }
 
-    try { return process_main(); }
+    try {
+        if (count_max <= UINT8_MAX) return process_main<uint8_t>();
+        if (count_max <= UINT16_MAX) return process_main<uint16_t>();
+        return process_main<uint32_t>();
+    }
     catch (const std::exception& error) {
         std::cerr << "Counting failed: " << error.what() << std::endl;
         return 1;

@@ -39,14 +39,16 @@ struct kmer_block
     std::array<unsigned char, KMER_BLOCK_SIZE - sizeof(uint32_t)> k_mers;
 };
 static_assert(sizeof(kmer_block) == KMER_BLOCK_SIZE);
+template<typename CountType = uint32_t>
 class ConcurrentOpenAddressHashMap;
+template<typename CountType>
 struct node
 {
     // cache line 0-2 for write
     // SpinLock buffer_lock;
     SpinLock buffer_lock;
     std::atomic<int> writer_count{ 0 }; // 当前正在写入的线程数
-    std::atomic<ConcurrentOpenAddressHashMap*> hash_map{ nullptr };
+    std::atomic<ConcurrentOpenAddressHashMap<CountType>*> hash_map{ nullptr };
     kmer_block* active_block = nullptr;
     uint64_t count = 0; // counter for used block
     std::array<kmer_block*, MAX_KMER_BLOCK_NUM> kmer_blocks{};

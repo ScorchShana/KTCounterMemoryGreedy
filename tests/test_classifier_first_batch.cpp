@@ -36,7 +36,7 @@ struct ConcurrentFirstBlockRingTestAccess
 
 struct FastqClassifierTestAccess
 {
-    static void feed(FastqClassifier& classifier, std::vector<Key>& keys, bool owned)
+    static void feed(FastqClassifier<uint32_t>& classifier, std::vector<Key>& keys, bool owned)
     {
         const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
         const auto bytes = flatten(keys);
@@ -47,39 +47,39 @@ struct FastqClassifierTestAccess
         }
     }
     template<bool WRITE_MISSES = true>
-    static uint64_t flush(FastqClassifier& classifier) { return classifier.flush_evicted_batch<WRITE_MISSES>(); }
-    static void group_and_decode(FastqClassifier& classifier) { classifier.group_evicted(); }
-    static const auto* grouped(FastqClassifier& classifier) { return classifier.evicted_grouped_; }
+    static uint64_t flush(FastqClassifier<uint32_t>& classifier) { return classifier.flush_evicted_batch<WRITE_MISSES>(); }
+    static void group_and_decode(FastqClassifier<uint32_t>& classifier) { classifier.group_evicted(); }
+    static const auto* grouped(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_grouped_; }
     template<bool WRITE_MISSES = true>
-    static uint64_t finish(FastqClassifier& classifier) { return classifier.drain_first_occurrences<WRITE_MISSES>(); }
-    static size_t block_capacity(FastqClassifier& classifier) { return classifier.first_block_capacity_; }
-    static size_t ring_capacity(FastqClassifier& classifier)
+    static uint64_t finish(FastqClassifier<uint32_t>& classifier) { return classifier.drain_first_occurrences<WRITE_MISSES>(); }
+    static size_t block_capacity(FastqClassifier<uint32_t>& classifier) { return classifier.first_block_capacity_; }
+    static size_t ring_capacity(FastqClassifier<uint32_t>& classifier)
     { return ConcurrentFirstBlockRingTestAccess::capacity(*classifier.first_occurrence_ring_) * block_capacity(classifier); }
-    static void push(FastqClassifier& classifier, const Key& key) { classifier.push_first_occurrence(key.data()); }
-    static size_t batch_capacity(FastqClassifier& classifier) { return classifier.evicted_capacity_; }
-    static size_t pending(FastqClassifier& classifier) { return classifier.evicted_count_; }
-    static const auto& prefix_counts(FastqClassifier& classifier, bool evicted)
+    static void push(FastqClassifier<uint32_t>& classifier, const Key& key) { classifier.push_first_occurrence(key.data()); }
+    static size_t batch_capacity(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_capacity_; }
+    static size_t pending(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_count_; }
+    static const auto& prefix_counts(FastqClassifier<uint32_t>& classifier, bool evicted)
     { return evicted ? classifier.evicted_prefix_counts_ : classifier.local_block_prefix_counts; }
-    static auto& packed(FastqClassifier& classifier) { return classifier.evicted_buffer_; }
-    static void stage(FastqClassifier& classifier, const std::vector<Key>& keys)
+    static auto& packed(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_buffer_; }
+    static void stage(FastqClassifier<uint32_t>& classifier, const std::vector<Key>& keys)
     {
         for (size_t i = 0; i < keys.size(); ++i)
             std::memcpy(classifier.evicted_buffer_.data() + i * kmer_bytes(), keys[i].data(), kmer_bytes());
         classifier.evicted_count_ = keys.size();
     }
-    static auto* roots(FastqClassifier& classifier) { return classifier.local_root_nodes.data(); }
+    static auto* roots(FastqClassifier<uint32_t>& classifier) { return classifier.local_root_nodes.data(); }
     template<bool WRITE_LOW = false>
-    static void low_block(FastqClassifier& classifier, const content_type& content, size_t& hit_count)
+    static void low_block(FastqClassifier<uint32_t>& classifier, const content_type& content, size_t& hit_count)
     { classifier.reconcile_low_block<WRITE_LOW>(content, hit_count); }
-    static void flush_low(FastqClassifier& classifier, size_t& hit_count)
+    static void flush_low(FastqClassifier<uint32_t>& classifier, size_t& hit_count)
     { classifier.flush_recovered_tree_batch(hit_count); }
-    static void export_batch(FastqClassifier& classifier, const unsigned char* records, size_t count)
+    static void export_batch(FastqClassifier<uint32_t>& classifier, const unsigned char* records, size_t count)
     { classifier.export_kmer_batch(records, count); }
-    static void acquire_export_block(FastqClassifier& classifier, char*& block)
+    static void acquire_export_block(FastqClassifier<uint32_t>& classifier, char*& block)
     { classifier.dequeue_data_to_export_writer(block); }
-    static size_t export_count(const FastqClassifier& classifier) { return classifier.export_kmer_block_count; }
-    static const auto* export_block(const FastqClassifier& classifier) { return classifier.export_block_ptr; }
-    static void collect_partial_export(FastqClassifier& classifier, std::map<Key, uint64_t>& counts)
+    static size_t export_count(const FastqClassifier<uint32_t>& classifier) { return classifier.export_kmer_block_count; }
+    static const auto* export_block(const FastqClassifier<uint32_t>& classifier) { return classifier.export_block_ptr; }
+    static void collect_partial_export(FastqClassifier<uint32_t>& classifier, std::map<Key, uint64_t>& counts)
     {
         for (size_t i = 0; i < classifier.export_kmer_block_count; ++i)
             ++counts[read_key(classifier.export_block_ptr->k_mers.data() + i * kmer_bytes())];
@@ -87,6 +87,12 @@ struct FastqClassifierTestAccess
 };
 
 namespace {
+struct ScopedCountMax
+{
+    uint32_t previous = count_max;
+    ~ScopedCountMax() { count_max = previous; }
+};
+
 void require(bool ok, const char* message)
 {
     if (!ok) throw std::runtime_error(message);
@@ -352,21 +358,21 @@ struct Fixture
 {
     Shared& shared;
     ConcurrentMemoryPool pool{64ULL << 20};
-    std::unique_ptr<LayerQueues> layers = std::make_unique<LayerQueues>();
-    std::unique_ptr<KmerTree> tree;
+    std::unique_ptr<LayerQueues<uint32_t>> layers = std::make_unique<LayerQueues<uint32_t>>();
+    std::unique_ptr<KmerTree<uint32_t>> tree;
     std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>> local =
         std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>();
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
     PhaseBarrier start{1};
-    std::unique_ptr<FastqClassifier> classifier;
+    std::unique_ptr<FastqClassifier<uint32_t>> classifier;
     Fixture(Shared& state, uint32_t k) : shared(state)
     {
         k_length = k;
         pool.init_arenas();
         prefix_owners.fill(0);
         bloom_filter_capacity.fill(4096);
-        tree = std::make_unique<KmerTree>( &pool, layers.get(), &shared.exports);
-        classifier = std::make_unique<FastqClassifier>(0, &shared.inputs, local.get(), &global,
+        tree = std::make_unique<KmerTree<uint32_t>>( &pool, layers.get(), &shared.exports);
+        classifier = std::make_unique<FastqClassifier<uint32_t>>(0, &shared.inputs, local.get(), &global,
             tree.get(), &pool, start,
             ConcurrentFirstBlockRing::create(&pool, 0, 1,
                 align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
@@ -374,7 +380,7 @@ struct Fixture
     }
 };
 
-void collect_roots(node* roots, std::map<Key, uint64_t>& counts)
+void collect_roots(node<uint32_t>* roots, std::map<Key, uint64_t>& counts)
 {
     for (uint32_t prefix = 0; prefix < 256; ++prefix) {
         for (size_t b = 0; b < roots[prefix].count; ++b) {
@@ -496,7 +502,7 @@ void check_root_block_rollover(Shared& shared)
     require(roots[prefix].count == 0, "empty root append allocated a tree block");
     fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), keys.size(), prefix, roots);
     require(fixture.layers->size(0) == 1, "root rollover did not account for its queued task");
-    Task task;
+    Task<uint32_t> task;
     require(fixture.layers->get_queue(0)->try_dequeue(task), "full local root was not queued");
     require(task.current_node == fixture.tree->root_nodes + prefix && task.depth == 0,
         "rollover task points at the wrong global root");
@@ -943,42 +949,43 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
     constexpr uint32_t k = 33;
     k_length = k;
     constexpr uint32_t prefix = 57;
-    Fixture fixture(shared, k);
-    const uint32_t saved_min = filter_min, saved_max = filter_max, saved_cap = count_max;
+    ScopedCountMax restore_cap;
+    const uint32_t saved_min = filter_min, saved_max = filter_max;
     filter_min = minimum;
     filter_max = maximum;
     count_max = 4;
+    Fixture fixture(shared, k);
     const auto below_before = filtered_below_min_count.load();
     const auto above_before = filtered_above_max_count.load();
     std::array<Key, 4> keys;
     const std::array<uint32_t, 4> counts{1, 2, 4, 5};
     std::map<Key, uint32_t> expected;
     uint64_t below = 0, above = 0;
-    std::vector<std::unique_ptr<node[]>> slabs;
-    std::unique_ptr<ConcurrentOpenAddressHashMap> map;
+    std::vector<std::unique_ptr<node<uint32_t>[]>> slabs;
+    std::unique_ptr<ConcurrentOpenAddressHashMap<uint32_t>> map;
     if (hashed) {
         auto* current = fixture.tree->root_nodes + prefix;
         for (uint32_t depth = 0; depth + 1 < MAX_DEPTH; ++depth) {
             auto* children = current->children_ptr.load();
             if (!children) {
-                slabs.push_back(std::make_unique<node[]>(1ULL << (2 * NODE_BASES)));
+                slabs.push_back(std::make_unique<node<uint32_t>[]>(1ULL << (2 * NODE_BASES)));
                 children = slabs.back().get();
                 current->children_ptr.store(children);
             }
             current = children;
         }
-        ConcurrentOpenAddressHashMap::set_memory_pool(&fixture.pool);
-        map = std::make_unique<ConcurrentOpenAddressHashMap>(64);
+        ConcurrentOpenAddressHashMap<uint32_t>::set_memory_pool(&fixture.pool);
+        map = std::make_unique<ConcurrentOpenAddressHashMap<uint32_t>>(64);
         current->hash_map.store(map.get());
     }
     for (size_t i = 0; i < keys.size(); ++i) {
         keys[i] = make_key(k, i + 1);
         keys[i][0] = ((uint64_t{prefix} << 56)) >> 56;
         if (hashed) {
-            const auto hash = ConcurrentOpenAddressHashMap::hash_key(keys[i].data());
+            const auto hash = ConcurrentOpenAddressHashMap<uint32_t>::hash_key(keys[i].data());
             uint64_t inserted = 0;
-            require(map->try_increment(hash, keys[i].data(), ConcurrentOpenAddressHashMap::fingerprint(hash),
-                counts[i], inserted) == ConcurrentOpenAddressHashMap::InsertResult::INSERTED,
+            require(map->try_increment(hash, keys[i].data(), ConcurrentOpenAddressHashMap<uint32_t>::fingerprint(hash),
+                counts[i], inserted) == ConcurrentOpenAddressHashMap<uint32_t>::InsertResult::INSERTED,
                 "failed to seed final drain hash map");
         } else {
             std::vector<Key> copies(counts[i], keys[i]);
@@ -1002,7 +1009,6 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
         "incorrect above-maximum unique count or repeated close counted twice");
     filter_min = saved_min;
     filter_max = saved_max;
-    count_max = saved_cap;
 
     const size_t record_bytes = kmer_bytes() + count_max_bytes;
     std::map<Key, uint32_t> actual;
@@ -1022,26 +1028,28 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
 
 void check_final_drain_runs(Shared& shared, uint32_t k)
 {
-    Fixture fixture(shared, k);
-    const auto saved_min = filter_min, saved_max = filter_max, saved_cap = count_max;
+    k_length = k;
+    ScopedCountMax restore_cap;
+    const auto saved_min = filter_min, saved_max = filter_max;
     const auto saved_count_bytes = count_max_bytes;
     RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY> output(FINAL_DRAIN_RING_POOL_BLOCK_SIZE, 1);
-    auto* root = fixture.tree->root_nodes + 57;
-    std::array<node*, MAX_DEPTH> path{root, root->children_ptr.load()};
-    std::vector<std::unique_ptr<node[]>> slabs;
-    for (uint32_t depth = 2; depth < MAX_DEPTH; ++depth) {
-        slabs.push_back(std::make_unique<node[]>(16));
-        path[depth] = slabs.back().get();
-        path[depth - 1]->children_ptr.store(path[depth]);
-    }
     const size_t capacity = 4092 / kmer_bytes();
     const uint32_t padding = (4 - k % 4) % 4 * 2;
-    for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth) {
-        auto* leaf = path[depth];
-        auto* children = leaf->children_ptr.exchange(nullptr);
-        for (uint32_t count_bytes : {1u, 2u, 4u}) {
-            count_max_bytes = count_bytes;
-            count_max = count_bytes == 1 ? 255 : count_bytes == 2 ? 65535 : UINT32_MAX;
+    for (uint32_t count_bytes : {1u, 2u, 4u}) {
+        count_max_bytes = count_bytes;
+        count_max = count_bytes == 1 ? 255 : count_bytes == 2 ? 65535 : UINT32_MAX;
+        Fixture fixture(shared, k);
+        auto* root = fixture.tree->root_nodes + 57;
+        std::array<node<uint32_t>*, MAX_DEPTH> path{root, root->children_ptr.load()};
+        std::vector<std::unique_ptr<node<uint32_t>[]>> slabs;
+        for (uint32_t depth = 2; depth < MAX_DEPTH; ++depth) {
+            slabs.push_back(std::make_unique<node<uint32_t>[]>(16));
+            path[depth] = slabs.back().get();
+            path[depth - 1]->children_ptr.store(path[depth]);
+        }
+        for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth) {
+            auto* leaf = path[depth];
+            auto* children = leaf->children_ptr.exchange(nullptr);
             for (uint32_t blocks : {0u, 1u, 2u, 3u, 8u, 16u}) {
                 for (uint32_t pattern = 0; pattern < 5; ++pattern) {
                     filter_min = pattern == 3 ? 2 : 1;
@@ -1120,13 +1128,14 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                     require(actual == expected, "final drain changed the complete key/frequency mapping");
                 }
             }
+            leaf->children_ptr.store(children);
         }
-        leaf->children_ptr.store(children);
     }
     // Two large leaves share one writer, crossing its 128 KiB block boundary.
     filter_min = 1;
     filter_max = count_max = UINT32_MAX;
     count_max_bytes = 4;
+    Fixture fixture(shared, k);
     std::map<Key, uint32_t> expected, actual;
     {
         FinalDrainWriter writer(&output);
@@ -1170,7 +1179,6 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
     require(output_blocks >= 2 && actual == expected, "large drain lost records across output blocks");
     filter_min = saved_min;
     filter_max = saved_max;
-    count_max = saved_cap;
     count_max_bytes = saved_count_bytes;
 }
 
@@ -1182,8 +1190,8 @@ void check_low_owner_and_global_queues(Shared& shared)
     for (size_t i = 0; i < prefix_owners.size(); ++i) prefix_owners[i] = i % 2;
     bloom_filter_capacity.fill(4096);
     shared.inputs.reset_producers(0);
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree( &shared.pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree( &shared.pool, layers.get(), &shared.exports);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
     PhaseBarrier start(2);
@@ -1191,7 +1199,7 @@ void check_low_owner_and_global_queues(Shared& shared)
         align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
             + 3 * ConcurrentFirstBlockRing::BLOCK_BYTES);
     auto create = [&](uint32_t index, auto* local) {
-        return std::make_unique<FastqClassifier>(index, &shared.inputs, local, &global,
+        return std::make_unique<FastqClassifier<uint32_t>>(index, &shared.inputs, local, &global,
             &tree, &shared.pool, start, ring, index);
     };
     auto constructing_a = std::async(std::launch::async, [&] { return create(0, &local_a); });
@@ -1251,8 +1259,8 @@ void check_cross_classifier_finish(Shared& shared)
     using Access = FastqClassifierTestAccess;
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree( &shared.pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree( &shared.pool, layers.get(), &shared.exports);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
     PhaseBarrier start(2);
@@ -1260,7 +1268,7 @@ void check_cross_classifier_finish(Shared& shared)
         align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
             + 3 * ConcurrentFirstBlockRing::BLOCK_BYTES);
     auto create = [&](uint32_t index, auto* local) {
-        return std::make_unique<FastqClassifier>(index, &shared.inputs, local, &global,
+        return std::make_unique<FastqClassifier<uint32_t>>(index, &shared.inputs, local, &global,
             &tree, &shared.pool, start, ring, index);
     };
     auto constructing_a = std::async(std::launch::async, [&] { return create(0, &local_a); });
@@ -1308,14 +1316,14 @@ void check_dynamic_safe_points(Shared& shared, bool enabled)
     k_length = 33;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier,
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier,
         nullptr, 0, enabled);
     auto first = make_key(33, 8831), next = make_key(33, 12931);
     std::vector<Key> input{first};
@@ -1369,14 +1377,14 @@ void check_memory_first_batches(Shared& shared, bool keep_singletons)
     filter_min = keep_singletons ? 1 : 2;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
     std::vector<Key> first, repeated;
     std::set<std::pair<uint32_t, uint64_t>> occupied;
     for (size_t seed = 0; first.size() < 5000; ++seed) {
@@ -1455,14 +1463,14 @@ void check_memory_first_scan(Shared& shared, uint32_t k, size_t count,
     const size_t segment_capacity = ConcurrentMemoryPool::first_segment_record_capacity();
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
     std::vector<Key> keys;
     std::vector<std::vector<uint64_t>> bloom_before;
     const size_t roots = pattern == FirstScanPattern::AllRoots ? 256 : 4;
@@ -1559,7 +1567,7 @@ void check_memory_first_scan(Shared& shared, uint32_t k, size_t count,
         "memory FIRST or following pending pass export statistics differ");
     std::map<Key, uint64_t> actual_tree;
     collect_roots(Access::roots(classifier), actual_tree);
-    Task task;
+    Task<uint32_t> task;
     while (layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
@@ -1612,17 +1620,17 @@ void check_memory_first_inline_storage(Shared& shared)
     constexpr size_t bytes = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier a(0, &shared.inputs, &local_a, &global, &tree, &pool, barrier,
+    FastqClassifier<uint32_t> a(0, &shared.inputs, &local_a, &global, &tree, &pool, barrier,
         nullptr, 0, true);
     // This Classifier owns no roots, and must still submit every global hit.
-    FastqClassifier b(1, &shared.inputs, &local_b, &global, &tree, &pool, barrier,
+    FastqClassifier<uint32_t> b(1, &shared.inputs, &local_b, &global, &tree, &pool, barrier,
         nullptr, 0, true);
     std::array<Key, 4> keys;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1680,7 +1688,7 @@ void check_memory_first_inline_storage(Shared& shared)
     std::map<Key, uint64_t> actual;
     collect_roots(Access::roots(a), actual);
     collect_roots(Access::roots(b), actual);
-    Task task;
+    Task<uint32_t> task;
     while (layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
@@ -1701,14 +1709,14 @@ void check_direct_first_segments(Shared& shared)
         k_length = k;
         ConcurrentMemoryPool pool(64ULL << 20);
             pool.init_arenas();
-        auto layers = std::make_unique<LayerQueues>();
-        KmerTree tree(&pool, layers.get(), &shared.exports);
+        auto layers = std::make_unique<LayerQueues<uint32_t>>();
+        KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
         prefix_owners.fill(0);
         bloom_filter_capacity.fill(4096);
         PhaseBarrier barrier(1);
         MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-        FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
         const auto key = make_key(k, 8831);
         const size_t capacity = FIRST_SEGMENT_SIZE / ((k + 3) / 4);
         // Thousands of small input batches must keep writing the same pool-owned
@@ -1743,14 +1751,14 @@ void check_soft_pressure_keeps_filling(Shared& shared)
     k_length = 33;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
     const auto key = make_key(33, 8831);
     FastqClassifierTestAccess::push(classifier, key);
     const size_t high = arena_watermark(pool.segment_capacity(0) * FIRST_SEGMENT_SIZE, 8);
@@ -1778,8 +1786,8 @@ void check_sparse_input_keeps_filling(Shared& shared, bool reclaim_while_idle = 
     k_length = 33;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
@@ -1792,7 +1800,7 @@ void check_sparse_input_keeps_filling(Shared& shared, bool reclaim_while_idle = 
     block = held.back();
     held.pop_back();
     auto worker = std::async(std::launch::async, [&] {
-        FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
         classifier.classify_first_pass();
         std::map<Key, uint64_t> roots;
         collect_roots(FastqClassifierTestAccess::roots(classifier), roots);
@@ -1861,8 +1869,8 @@ void check_export_wait_reclaim(Shared& shared)
     k_length = 33;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
@@ -1872,7 +1880,7 @@ void check_export_wait_reclaim(Shared& shared)
     auto resume_signal = resume.get_future();
     const auto key = make_key(33, 8831);
     auto worker = std::async(std::launch::async, [&] {
-        FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
         FastqClassifierTestAccess::push(classifier, key);
         ready.set_value();
         resume_signal.wait();
@@ -1914,7 +1922,7 @@ void check_memory_first_wait_failure(Shared& shared)
 {
     Fixture fixture(shared, 33);
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> queues{fixture.local};
-    ClassifierThreadPool workers(fixture.tree.get(), &shared.inputs, queues, &fixture.global,
+    ClassifierThreadPool<uint32_t> workers(fixture.tree.get(), &shared.inputs, queues, &fixture.global,
         nullptr, &fixture.pool, 1);
     auto waiting = std::async(std::launch::async, [&] {
         try { workers.wait_for_memory_first(); }
@@ -2014,7 +2022,7 @@ void check_low_scan(Shared& shared, uint32_t k, size_t count, FirstScanPattern p
     for (auto* block : held) shared.exports.consumer_enqueue(block);
     std::map<Key, uint64_t> actual;
     collect_roots(Access::roots(classifier), actual);
-    Task task;
+    Task<uint32_t> task;
     while (fixture.layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
@@ -2107,14 +2115,14 @@ void check_scan_failures(Shared& shared)
     k_length = 33;
     ConcurrentMemoryPool pool(64ULL << 20);
     pool.init_arenas();
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree(&pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
     PhaseBarrier barrier(1);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    FastqClassifier classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
     auto key = make_key(33, 8831);
     auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
     for (size_t i = 0; i < 2 * bloom_filter_capacity[key[0]]; ++i) bloom->get_bins()[i].store(0);
@@ -2205,7 +2213,7 @@ void check_low_queue_pause(Shared& shared)
         && classifier.low_tree_batches == 1, "queue pause or EOF drain prematurely flushed a hit tail");
     std::map<Key, uint64_t> actual;
     collect_roots(Access::roots(classifier), actual);
-    Task task;
+    Task<uint32_t> task;
     while (fixture.layers->get_queue(0)->try_dequeue(task))
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)

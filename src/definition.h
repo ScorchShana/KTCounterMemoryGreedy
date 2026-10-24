@@ -163,11 +163,13 @@ inline uint32_t k_length = 0;
 inline size_t kmer_bytes() noexcept { return (k_length + 3) / 4; }
 
 struct kmer_block;
+template<typename CountType = uint32_t>
 struct node;
 
+template<typename CountType = uint32_t>
 struct alignas(64) Task
 {
-    node* current_node = nullptr;
+    node<CountType>* current_node = nullptr;
     uint64_t depth;
     uint64_t count;
     std::array<kmer_block*, MAX_KMER_BLOCK_NUM> kmer_blocks{};

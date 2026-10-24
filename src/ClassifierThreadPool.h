@@ -23,6 +23,7 @@
 #include <latch>
 #include <semaphore>
 
+template<typename CountType = uint32_t>
 class ClassifierThreadPool
 {
 
@@ -30,9 +31,9 @@ class ClassifierThreadPool
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
-    SchedulerThreadPool* task_thread_pool;
+    SchedulerThreadPool<CountType>* task_thread_pool;
     ConcurrentMemoryPool* memory_pool;
-    KmerTree* tree;
+    KmerTree<CountType>* tree;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
     std::shared_ptr<PhaseBarrier> start_barrier;
     std::shared_ptr<PhaseBarrier> finish_barrier;
@@ -70,11 +71,11 @@ public:
     std::atomic<uint64_t> total_recovered_firsts{ 0 };
 #endif
 
-    explicit ClassifierThreadPool(KmerTree* tree_ptr,
+    explicit ClassifierThreadPool(KmerTree<CountType>* tree_ptr,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool_ptr,
         std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
-        SchedulerThreadPool* task_thread_pool_ptr,
+        SchedulerThreadPool<CountType>* task_thread_pool_ptr,
         ConcurrentMemoryPool* in_memory_pool_ptr,
         uint32_t in_classifier_count,
         const std::array<void*, 256>* bloom_storage = nullptr, bool first_cache_enabled = false)
@@ -106,7 +107,7 @@ public:
 #if HAS_LIBNUMA
                     numa_run_on_node(memory_pool->arena_node(arena));
 #endif
-                    FastqClassifier classifier(i, parser_classifier_ring_pool, classifier_task_queues[i].get(),
+                    FastqClassifier<CountType> classifier(i, parser_classifier_ring_pool, classifier_task_queues[i].get(),
                         global_classifier_task_queue, tree, memory_pool, *start_barrier, nullptr, 0,
                         first_cache_enabled_,
                         bloom_storage_);

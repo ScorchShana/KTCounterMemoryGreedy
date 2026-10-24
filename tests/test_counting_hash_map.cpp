@@ -29,7 +29,7 @@ using Expected = std::map<Key, uint32_t>;
 
 // Catches missing/high-bit lanes, sign-bit-only occupancy checks, duplicate
 // mirror-tail visits, wrong callback order/counts, and changed reference types.
-void check(const CountingHashMap<>& map, const Expected& expected)
+void check(const CountingHashMap& map, const Expected& expected)
 {
     Expected actual;
     size_t visits = 0, previous_slot = 0;
@@ -50,7 +50,7 @@ void check(const CountingHashMap<>& map, const Expected& expected)
 void test_boundaries(uint32_t k)
 {
     k_length = k;
-    CountingHashMap<> map;
+    CountingHashMap map;
     Expected expected;
     check(map, expected);
     const size_t cap = map.capacity();
@@ -116,7 +116,7 @@ void test_boundaries(uint32_t k)
 void test_density_and_reuse(uint32_t k)
 {
     k_length = k;
-    CountingHashMap<> map;
+    CountingHashMap map;
     Expected expected;
     const size_t limit = MAX_KMER_BLOCK_NUM * (4092 / kmer_bytes());
     for (size_t size : {size_t{0}, size_t{1}, size_t{8}, size_t{32},
@@ -137,9 +137,21 @@ void test_density_and_reuse(uint32_t k)
 }
 }
 
+void counting_hash_map_link_probe();
+
 int main()
 {
     try {
+        counting_hash_map_link_probe();
+        k_length = 1;
+        CountingHashMap batch;
+        static_assert(std::is_same_v<decltype(batch.counts_)::value_type, uint16_t>);
+        const unsigned char key = 0;
+        for (unsigned i = 0; i < 65472; ++i) batch.increment(&key);
+        check(batch, {{Key{key}, 65472}});
+        batch.clear();
+        batch.increment(&key);
+        check(batch, {{Key{key}, 1}});
         for (uint32_t k : {31, 32, 33, 63, 64, 65, 81, 127, 128}) {
             test_boundaries(k);
             test_density_and_reuse(k);
