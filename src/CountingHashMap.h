@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <stdexcept>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -36,8 +37,8 @@ class CountingHashMap
 
 public:
 
-    CountingHashMap()
-        : bytes_(kmer_bytes()), RAW_CAPACITY(MAX_KMER_BLOCK_NUM * (4092 / bytes_)),
+    explicit CountingHashMap(size_t key_bytes = kmer_bytes())
+        : bytes_(checked_key_bytes(key_bytes)), RAW_CAPACITY(MAX_KMER_BLOCK_NUM * (4092 / bytes_)),
           CAPACITY(std::max(GROUP_SIZE, std::bit_ceil((RAW_CAPACITY * 8 + 6) / 7))),
           controls_(CAPACITY + GROUP_SIZE - 1), keys_(CAPACITY * bytes_), counts_(CAPACITY) {}
 
@@ -91,6 +92,12 @@ private:
 #else
     static constexpr size_t GROUP_SIZE = 8;
 #endif
+
+    static size_t checked_key_bytes(size_t bytes)
+    {
+        if (bytes == 0) throw std::invalid_argument("key width must be positive");
+        return bytes;
+    }
 
     const size_t bytes_;
     const size_t RAW_CAPACITY;
@@ -194,7 +201,7 @@ inline void CountingHashMap::increment(const unsigned char* key)
         {
             int bit = __builtin_ctz(match_mask);
             size_t slot = (base + bit) & MOD;
-            if (std::memcmp(keys_.data() + slot * bytes_, key, bytes_) == 0)
+            if (::__memcmpeq(keys_.data() + slot * bytes_, key, bytes_) == 0)
             {
                 counts_[slot]++;
                 return;

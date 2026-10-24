@@ -893,6 +893,45 @@ bool test_count_limits_and_layout(ConcurrentMemoryPool& pool)
     return true;
 }
 
+bool test_suffix_widths(ConcurrentMemoryPool& pool)
+{
+    const auto saved_k = k_length;
+    k_length = 81;
+    ScopedMapMaxCapacity maximum(32);
+    Map full(32, 100, 21);
+    const std::vector<unsigned char> full_key(21, 0x3a);
+    uint64_t full_unique = 0;
+    uint32_t full_count = 0;
+    for (size_t width : {size_t{1}, size_t{2}, size_t{7}, size_t{19}, size_t{21}}) {
+        Map map(32, 100, width);
+        uint64_t unique = 0;
+        for (unsigned id = 0; id < 96; ++id) {
+            std::vector<unsigned char> key(width, 0x95); key[0] = id;
+            map.increment(key.data(), CountType{1}, unique);
+        }
+        if (unique != 96 || map.get_next_map() == nullptr) return false;
+        for (auto* segment = &map; segment; segment = segment->get_next_map())
+            if (segment->key_bytes() != width) return false;
+        unsigned visited = 0;
+        bool valid = true;
+        map.for_each_entry([&](const unsigned char* key, uint32_t count) {
+            if (count != 1 || key[0] >= 96) valid = false;
+            for (size_t i = 1; i < width; ++i) if (key[i] != 0x95) valid = false;
+            ++visited;
+        });
+        if (!valid || visited != 96) return false;
+        full.increment(full_key.data(), CountType{1}, full_unique);
+        ++full_count;
+        full.for_each_entry([&](const unsigned char* key, uint32_t count) {
+            if (std::memcmp(key, full_key.data(), full_key.size()) != 0 || count != full_count) valid = false;
+        });
+        if (!valid || full_unique != 1) return false;
+    }
+    k_length = saved_k;
+    (void)pool;
+    return true;
+}
+
 struct CountRace
 {
     Map::DebugEvent stop;
@@ -947,7 +986,7 @@ bool test_count_race(ConcurrentMemoryPool& pool, bool after_add)
 
 bool run_correctness_suite(ConcurrentMemoryPool& pool)
 {
-    if (!test_count_limits_and_layout(pool)) { std::cerr << "count limits/layout failed\n"; return false; }
+    if (!test_suffix_widths(pool) || !test_count_limits_and_layout(pool)) { std::cerr << "count limits/layout failed\n"; return false; }
     if (!test_count_race(pool, false) || !test_count_race(pool, true)) { std::cerr << "count race failed\n"; return false; }
     if (!test_growth_boundaries_and_old_key_updates()) return false;
     if (!test_hot_key(pool)) return false;

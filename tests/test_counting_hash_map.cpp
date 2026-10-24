@@ -29,18 +29,18 @@ using Expected = std::map<Key, uint32_t>;
 
 // Catches missing/high-bit lanes, sign-bit-only occupancy checks, duplicate
 // mirror-tail visits, wrong callback order/counts, and changed reference types.
-void check(const CountingHashMap& map, const Expected& expected)
+void check(const CountingHashMap& map, const Expected& expected, size_t width = kmer_bytes())
 {
     Expected actual;
     size_t visits = 0, previous_slot = 0;
     map.for_each([&](const unsigned char* key, const auto& count) {
         static_assert(std::is_const_v<std::remove_reference_t<decltype(count)>>);
-        const size_t slot = (key - map.keys_.data()) / kmer_bytes();
+        const size_t slot = (key - map.keys_.data()) / width;
         require(slot < map.capacity(), "visited mirrored controls or invalid key");
         require(visits == 0 || slot > previous_slot, "callback order changed");
         previous_slot = slot;
         ++visits;
-        require(actual.emplace(Key(key, key + kmer_bytes()), count).second, "duplicate key callback");
+        require(actual.emplace(Key(key, key + width), count).second, "duplicate key callback");
     });
     require(actual == expected, "keys or counts differ");
     require(visits == expected.size() && map.size() == expected.size(),
@@ -113,26 +113,44 @@ void test_boundaries(uint32_t k)
     check(map, expected);
 }
 
-void test_density_and_reuse(uint32_t k)
+void test_density_and_reuse(uint32_t k, size_t width = 0)
 {
     k_length = k;
-    CountingHashMap map;
+    if (!width) width = kmer_bytes();
+    CountingHashMap map(width);
     Expected expected;
-    const size_t limit = MAX_KMER_BLOCK_NUM * (4092 / kmer_bytes());
+    const size_t limit = MAX_KMER_BLOCK_NUM * (4092 / width);
     for (size_t size : {size_t{0}, size_t{1}, size_t{8}, size_t{32},
                        size_t{64}, size_t{257}, limit}) {
         map.clear();
         expected.clear();
-        for (size_t i = 1; i <= size; ++i) {
+        size_t inserted = 0;
+        for (size_t i = 1; inserted < size; ++i) {
             auto key = make_key(i);
+            key.resize(width);
             map.increment(key.data());
             ++expected[key];
-            if (i % 3 == 0) {
+            ++inserted;
+            if (i % 3 == 0 && inserted < size) {
                 map.increment(key.data());
                 ++expected[key];
+                ++inserted;
             }
         }
-        check(map, expected);
+        check(map, expected, width);
+    }
+    // A valid Task can consist entirely of distinct records. Keep maximum-load
+    // coverage separate from batches where duplicates consume the record budget.
+    if (width >= 4) {
+        map.clear(); expected.clear();
+        for (size_t i = 0; i < limit; ++i) {
+            Key key(width, 0);
+            for (size_t byte = 0; byte < std::min(width, sizeof(i)); ++byte)
+                key[byte] = i >> (8 * byte);
+            map.increment(key.data()); expected.emplace(key, 1);
+        }
+        require(map.size() == limit, "maximum distinct Task lost entries");
+        check(map, expected, width);
     }
 }
 }
@@ -156,6 +174,7 @@ int main()
             test_boundaries(k);
             test_density_and_reuse(k);
         }
+        for (size_t width : {size_t{1}, size_t{2}, size_t{7}, size_t{19}}) test_density_and_reuse(81, width);
         std::cout << "CountingHashMap tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

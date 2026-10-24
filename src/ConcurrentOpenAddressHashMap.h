@@ -42,7 +42,7 @@ class ConcurrentOpenAddressHashMap
     constexpr static uint8_t INSERTING = 0x01;
     constexpr static double LOAD_FACTOR = 0.8;
 
-    const size_t bytes_ = kmer_bytes();
+    const size_t bytes_;
     const CountType limit_;
     SizeCounter size;
     uint64_t segment_id;
@@ -107,14 +107,14 @@ public:
     }
 #endif
 
-    ConcurrentOpenAddressHashMap(uint64_t capacity, uint32_t limit = count_max)
-        : limit_(checked_limit(limit)), segment_id(0), capacity(capacity), sealed(false), building_next(false), next_map(nullptr)
+    ConcurrentOpenAddressHashMap(uint64_t capacity, uint32_t limit = count_max, size_t key_bytes = kmer_bytes())
+        : bytes_(checked_key_bytes(key_bytes)), limit_(checked_limit(limit)), segment_id(0), capacity(capacity), sealed(false), building_next(false), next_map(nullptr)
     {
         size.value.store(0, std::memory_order_relaxed);
-        char* mem_area = reinterpret_cast<char*>(pool->allocate_large(get_mem_size(capacity)));
+        char* mem_area = reinterpret_cast<char*>(pool->allocate_large(get_mem_size(capacity, bytes_)));
         ctrls = reinterpret_cast<std::atomic<uint8_t>*>(mem_area);
         keys = reinterpret_cast<unsigned char*>(ctrls + capacity);
-        counts = reinterpret_cast<std::atomic<CountType>*>(mem_area + counts_offset(capacity));
+        counts = reinterpret_cast<std::atomic<CountType>*>(mem_area + counts_offset(capacity, bytes_));
         for (uint64_t i = 0; i < capacity; ++i)
         {
             new (ctrls + i) std::atomic<uint8_t>(EMPTY);
@@ -122,6 +122,12 @@ public:
     }
 
 private:
+    static size_t checked_key_bytes(size_t bytes)
+    {
+        if (bytes == 0) throw std::invalid_argument("key width must be positive");
+        return bytes;
+    }
+
     static CountType checked_limit(uint32_t limit)
     {
         if (limit == 0 || limit > std::numeric_limits<CountType>::max())
@@ -130,16 +136,18 @@ private:
     }
 
 public:
-    static size_t counts_offset(uint64_t capacity) noexcept {
-        return align_up(capacity * (sizeof(std::atomic<uint8_t>) + kmer_bytes()),
+    static size_t counts_offset(uint64_t capacity, size_t key_bytes = kmer_bytes()) noexcept {
+        return align_up(capacity * (sizeof(std::atomic<uint8_t>) + key_bytes),
             alignof(std::atomic<CountType>));
     }
-    static uint64_t get_mem_size(uint64_t capacity) noexcept {
-        return counts_offset(capacity) + capacity * sizeof(std::atomic<CountType>);
+    static uint64_t get_mem_size(uint64_t capacity, size_t key_bytes = kmer_bytes()) noexcept {
+        return counts_offset(capacity, key_bytes) + capacity * sizeof(std::atomic<CountType>);
     }
-    static uint64_t hash_key(const unsigned char* key) {
-        return rapidhash(key, kmer_bytes());
+    static uint64_t hash_key(const unsigned char* key, size_t key_bytes = kmer_bytes()) {
+        return rapidhash(key, key_bytes);
     }
+
+    size_t key_bytes() const noexcept { return bytes_; }
 
     // Extract fingerprint from hash (high 7 bits, most significant bit is 1)
     static uint8_t fingerprint(const uint64_t h)
@@ -338,7 +346,7 @@ public:
             }
             else if (ctrl == fp)
             {
-                if (std::memcmp(keys + index * bytes_, key, bytes_) == 0) [[likely]]
+                if (::__memcmpeq(keys + index * bytes_, key, bytes_) == 0) [[likely]]
                 {
                     const CountType cur = counts[index].load(std::memory_order_relaxed);
                     if (cur < limit_)
@@ -372,7 +380,7 @@ public:
     }
 
     void increment(const unsigned char* key, const CountType value, uint64_t& local_count) {
-        const uint64_t h = hash_key(key);
+        const uint64_t h = hash_key(key, bytes_);
         const uint8_t fp = fingerprint(h);
 
         ConcurrentOpenAddressHashMap* map_ptr = this;
@@ -476,7 +484,7 @@ public:
                         const uint64_t next_capacity = capacity > concurrent_hash_map_max_capacity / factor
                             ? concurrent_hash_map_max_capacity : capacity * factor;
                         void* memory = get_map_metadata_mem();
-                        next = new (memory) ConcurrentOpenAddressHashMap(next_capacity, limit_);
+                        next = new (memory) ConcurrentOpenAddressHashMap(next_capacity, limit_, bytes_);
                         next->segment_id = next_id;
                         next_map.store(next, std::memory_order_release);
                     }

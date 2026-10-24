@@ -1,6 +1,8 @@
 #include "../src/NewKmerTree.h"
 #include "first_pool_fixture.h"
 #include <future>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -33,6 +35,7 @@ static void check_source_return_before_queue_wait()
     size_t filled = 0;
     while (queue->try_enqueue(empty)) { layers->increase_size(0); ++filled; }
     std::array<node<uint32_t>, 256> roots{};
+    KmerTree<uint32_t>::initialize_roots(roots.data());
     tree.append_first_scan_hits(batch, source.records, source.record_count, roots.data());
     if (layers->size(0) != static_cast<int64_t>(filled) || !pool.complete_first(source))
         throw std::runtime_error("scan published Tasks or failed to return source with full queue");
@@ -68,7 +71,9 @@ int main()
 {
     k_length = 33;
     check_source_return_before_queue_wait();
-    mapping_filename = "/dev/null"; // Exclusive creation fails after RAM exhaustion.
+    const auto failure_path = std::filesystem::temp_directory_path() / "tree-allocation-failure-existing";
+    std::ofstream(failure_path).put(0);
+    mapping_filename = failure_path.string(); // Exclusive creation fails after RAM exhaustion.
     ConcurrentMemoryPool pool(16ULL << 20);
     pool.init_arenas();
     RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> output(64, 1);
@@ -79,6 +84,7 @@ int main()
         const auto count = ConcurrentMemoryPool::first_segment_record_capacity();
         if (tree.try_prepare_first_scan(batch, count) != ConcurrentMemoryPool::RamReserveStatus::Ready) return 1;
         std::array<node<uint32_t>, 256> prepared_roots{};
+        KmerTree<uint32_t>::initialize_roots(prepared_roots.data());
         std::vector<unsigned char> records(count * kmer_bytes());
         for (size_t i = 0; i < count; ++i) records[i * kmer_bytes()] = i % 256;
         const size_t before_scan = pool.gap_bytes(0);
@@ -99,6 +105,7 @@ int main()
         if (seen != count) return 1;
     }
     std::array<node<uint32_t>, 256> local_roots{};
+    KmerTree<uint32_t>::initialize_roots(local_roots.data());
     const unsigned char key[9]{};
     const size_t before = pool.gap_bytes(0);
     if (tree.try_accept_first_batch(key, 1, 0, local_roots.data()) != 0 || pool.gap_bytes(0) != before) return 1;

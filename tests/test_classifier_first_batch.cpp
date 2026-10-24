@@ -21,6 +21,31 @@ using Key = std::vector<unsigned char>;
 static Key read_key(const unsigned char* bytes)
 { return Key(bytes, bytes + kmer_bytes()); }
 
+static size_t tree_record_bytes(uint32_t depth = 0)
+{ return std::max(size_t{1}, kmer_bytes() - std::min(kmer_bytes(), size_t{1} + depth / 2)); }
+
+static Key read_tree_key(const unsigned char* bytes, const node<uint32_t>* owner, uint32_t depth = 0)
+{
+    Key full(kmer_bytes());
+    const size_t cut = std::min(full.size(), size_t{1} + depth / 2);
+    for (size_t i = 0; i < cut; ++i)
+        full[i] = owner->prefix_code >> (8 + 4 * depth - 8 * (i + 1));
+    if (cut < full.size()) std::memcpy(full.data() + cut, bytes, full.size() - cut);
+    return full;
+}
+
+static void store_tree_key(unsigned char* dest, const Key& full, uint32_t depth)
+{
+    const size_t cut = std::min(full.size(), size_t{1} + depth / 2);
+    if (cut == full.size()) dest[0] = 0;
+    else std::memcpy(dest, full.data() + cut, full.size() - cut);
+}
+
+static void initialize_children(node<uint32_t>* parent, node<uint32_t>* children)
+{
+    for (uint32_t i = 0; i < 16; ++i) children[i].prefix_code = (parent->prefix_code << 4) | i;
+}
+
 static std::vector<unsigned char> flatten(const std::vector<Key>& keys)
 {
     std::vector<unsigned char> bytes(keys.size() * kmer_bytes());
@@ -103,8 +128,10 @@ struct TemporaryDirectory
     std::filesystem::path path;
     TemporaryDirectory()
     {
-        char name[] = "/tmp/tree-first-drain-test-XXXXXX";
-        const char* created = ::mkdtemp(name);
+        auto name_string = (std::filesystem::temp_directory_path() / "tree-first-drain-test-XXXXXX").string();
+        std::vector<char> name(name_string.begin(), name_string.end());
+        name.push_back(0);
+        const char* created = ::mkdtemp(name.data());
         if (created == nullptr) throw std::runtime_error("failed to create test directory");
         path = created;
     }
@@ -386,7 +413,7 @@ void collect_roots(node<uint32_t>* roots, std::map<Key, uint64_t>& counts)
         for (size_t b = 0; b < roots[prefix].count; ++b) {
             auto* block = roots[prefix].kmer_blocks[b];
             for (size_t i = 0; i < block->count; ++i) {
-                const auto key = read_key(block->k_mers.data() + i * kmer_bytes());
+                const auto key = read_tree_key(block->k_mers.data() + i * tree_record_bytes(), roots + prefix);
                 require(key[0] == prefix, "recovered key was submitted to the wrong root");
                 ++counts[key];
             }
@@ -495,7 +522,7 @@ void check_root_block_rollover(Shared& shared)
     constexpr uint32_t prefix = 57;
     auto key = make_key(33, 999);
     key[0] = ((uint64_t{prefix} << 56)) >> 56;
-    const size_t block_capacity = 4092 / kmer_bytes();
+    const size_t block_capacity = 4092 / tree_record_bytes();
     const size_t count = (MAX_KMER_BLOCK_NUM + 1) * block_capacity + 3;
     std::vector<Key> keys(count, key);
     fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), 0, prefix, roots);
@@ -512,7 +539,7 @@ void check_root_block_rollover(Shared& shared)
     {
         require(task.kmer_blocks[b]->count == block_capacity, "rollover published a partial block");
         for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)
-            ++actual[read_key(task.kmer_blocks[b]->k_mers.data() + i * kmer_bytes())];
+            ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
     }
     // The ordinary multi-root interface must share the same append behavior.
     auto other = key;
@@ -970,21 +997,25 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
             if (!children) {
                 slabs.push_back(std::make_unique<node<uint32_t>[]>(1ULL << (2 * NODE_BASES)));
                 children = slabs.back().get();
+                initialize_children(current, children);
                 current->children_ptr.store(children);
             }
             current = children;
         }
         ConcurrentOpenAddressHashMap<uint32_t>::set_memory_pool(&fixture.pool);
-        map = std::make_unique<ConcurrentOpenAddressHashMap<uint32_t>>(64);
+        map = std::make_unique<ConcurrentOpenAddressHashMap<uint32_t>>(64, count_max, tree_record_bytes(MAX_DEPTH - 1));
         current->hash_map.store(map.get());
     }
     for (size_t i = 0; i < keys.size(); ++i) {
         keys[i] = make_key(k, i + 1);
         keys[i][0] = ((uint64_t{prefix} << 56)) >> 56;
         if (hashed) {
-            const auto hash = ConcurrentOpenAddressHashMap<uint32_t>::hash_key(keys[i].data());
+            keys[i][1] = 0; keys[i][2] &= 0x0f;
+            Key suffix(tree_record_bytes(MAX_DEPTH - 1));
+            store_tree_key(suffix.data(), keys[i], MAX_DEPTH - 1);
+            const auto hash = ConcurrentOpenAddressHashMap<uint32_t>::hash_key(suffix.data(), suffix.size());
             uint64_t inserted = 0;
-            require(map->try_increment(hash, keys[i].data(), ConcurrentOpenAddressHashMap<uint32_t>::fingerprint(hash),
+            require(map->try_increment(hash, suffix.data(), ConcurrentOpenAddressHashMap<uint32_t>::fingerprint(hash),
                 counts[i], inserted) == ConcurrentOpenAddressHashMap<uint32_t>::InsertResult::INSERTED,
                 "failed to seed final drain hash map");
         } else {
@@ -1033,7 +1064,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
     const auto saved_min = filter_min, saved_max = filter_max;
     const auto saved_count_bytes = count_max_bytes;
     RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY> output(FINAL_DRAIN_RING_POOL_BLOCK_SIZE, 1);
-    const size_t capacity = 4092 / kmer_bytes();
+    const size_t capacity = 4092 / tree_record_bytes();
     const uint32_t padding = (4 - k % 4) % 4 * 2;
     for (uint32_t count_bytes : {1u, 2u, 4u}) {
         count_max_bytes = count_bytes;
@@ -1045,9 +1076,11 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
         for (uint32_t depth = 2; depth < MAX_DEPTH; ++depth) {
             slabs.push_back(std::make_unique<node<uint32_t>[]>(16));
             path[depth] = slabs.back().get();
+            initialize_children(path[depth - 1], path[depth]);
             path[depth - 1]->children_ptr.store(path[depth]);
         }
         for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth) {
+            const size_t capacity = 4092 / tree_record_bytes(depth);
             auto* leaf = path[depth];
             auto* children = leaf->children_ptr.exchange(nullptr);
             for (uint32_t blocks : {0u, 1u, 2u, 3u, 8u, 16u}) {
@@ -1074,7 +1107,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                             id <<= padding;
                             for (uint32_t byte = 0; byte < 4; ++byte)
                                 key[key.size() - 1 - byte] = id >> (byte * 8);
-                            std::memcpy(block->k_mers.data() + i * kmer_bytes(), key.data(), key.size());
+                            store_tree_key(block->k_mers.data() + i * tree_record_bytes(depth), key, depth);
                             ++truth[key];
                         }
                         leaf->kmer_blocks[leaf->count++] = block;
@@ -1086,7 +1119,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                         auto* block = static_cast<kmer_block*>(fixture.pool.allocate());
                         block->count = 1;
                         const auto& key = truth.begin()->first;
-                        std::memcpy(block->k_mers.data(), key.data(), key.size());
+                        store_tree_key(block->k_mers.data(), key, 0);
                         root->kmer_blocks[0] = block;
                         root->count = 1;
                         root->active_block = block;
@@ -1151,7 +1184,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                     const uint32_t id = (b * capacity + i) << padding;
                     for (uint32_t byte = 0; byte < 4; ++byte)
                         key[key.size() - 1 - byte] = id >> (byte * 8);
-                    std::memcpy(block->k_mers.data() + i * kmer_bytes(), key.data(), key.size());
+                    store_tree_key(block->k_mers.data() + i * tree_record_bytes(), key, 0);
                     expected.emplace(key, 1);
                 }
                 leaf->kmer_blocks[leaf->count++] = block;
@@ -1571,7 +1604,7 @@ void check_memory_first_scan(Shared& shared, uint32_t k, size_t count,
     while (layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
-                const auto key = read_key(task.kmer_blocks[b]->k_mers.data() + i * width);
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
                 require(task.current_node == tree.root_nodes + key[0], "queued memory hit has the wrong root");
                 ++actual_tree[key];
             }
@@ -1692,7 +1725,7 @@ void check_memory_first_inline_storage(Shared& shared)
     while (layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
-                const auto key = read_key(task.kmer_blocks[b]->k_mers.data() + i * kmer_bytes());
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
                 require(task.current_node == tree.root_nodes + key[0], "parallel recovery task has the wrong root");
                 ++actual[key];
             }
@@ -2026,7 +2059,7 @@ void check_low_scan(Shared& shared, uint32_t k, size_t count, FirstScanPattern p
     while (fixture.layers->get_queue(0)->try_dequeue(task)) {
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
-                const auto key = read_key(task.kmer_blocks[b]->k_mers.data() + i * width);
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
                 require(task.current_node == fixture.tree->root_nodes + key[0], "pending task has the wrong root");
                 ++actual[key];
             }
@@ -2217,7 +2250,7 @@ void check_low_queue_pause(Shared& shared)
     while (fixture.layers->get_queue(0)->try_dequeue(task))
         for (size_t b = 0; b < task.count; ++b)
             for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)
-                ++actual[read_key(task.kmer_blocks[b]->k_mers.data() + i * kmer_bytes())];
+                ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
     require(actual == std::map<Key, uint64_t>{{key, capacity}}, "normal and EOF queues lost pending hits");
 }
 }

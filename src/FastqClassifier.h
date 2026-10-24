@@ -144,6 +144,7 @@ public:
         first_occurrence_ring_(in_first_ring), first_block_(in_first_ring ? in_first_ring->initial_block(in_producer_rank) : nullptr),
         first_block_capacity_(ConcurrentFirstBlockRing::BLOCK_BYTES / kmer_bytes())
     {
+        KmerTree<CountType>::initialize_roots(local_root_nodes.data());
         char* raw_block_ptr = nullptr;
         dequeue_data_to_export_writer(raw_block_ptr);
         export_block_ptr = reinterpret_cast<ExportBlock*>(raw_block_ptr);

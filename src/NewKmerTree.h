@@ -160,7 +160,7 @@ public:
             const size_t limit = std::min(count, capacity - block->count);
             size_t take = 1;
             while (take < limit && get_root_prefix(records + take * width) == prefix) ++take;
-            std::memcpy(block->k_mers.data() + block->count * width, records, take * width);
+            key_ops.write_root_batch(block->k_mers.data() + block->count * key_ops.bytes(0), records, take);
             block->count += take;
             records += take * width;
             count -= take;
@@ -192,7 +192,12 @@ public:
 
     static void initialize_worker()
     {
-        thread_local_counting_hash_map = std::make_unique<CountingHashMap>();
+        thread_local_counting_hash_map = std::make_unique<CountingHashMap>(kmer{}.bytes(MAX_DEPTH - 1));
+    }
+
+    static void initialize_roots(node<CountType>* roots) noexcept
+    {
+        for (uint32_t i = 0; i < (1U << (2 * ROOT_BASES)); ++i) roots[i].prefix_code = i;
     }
 
     // 根节点数组，2^(2 * ROOT_BASES) 个，每个对应一种短前缀
@@ -210,13 +215,15 @@ public:
     {
         initialize_worker();
         root_nodes = new node<CountType>[1ULL << (2 * ROOT_BASES)]();
+        initialize_roots(root_nodes);
 
         constexpr uint64_t node_num = 1ULL << (2 * NODE_BASES);
         for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); ++i)
         {
             // 分配 (1 << (2 * NODE_BASES))个连续节点
             void* raw_mem = memory_pool->allocate();
-            new (raw_mem) node<CountType>[node_num]();
+            auto* children = new (raw_mem) node<CountType>[node_num]();
+            for (uint32_t c = 0; c < node_num; ++c) children[c].prefix_code = (root_nodes[i].prefix_code << 4) | c;
             root_nodes[i].children_ptr.store(reinterpret_cast<node<CountType> *>(raw_mem), std::memory_order_relaxed);
         }
     }
@@ -287,7 +294,8 @@ public:
             }
 
             // 5. 未满直接写入
-            std::memcpy((target_node.active_block->k_mers.data() + (target_node.active_block->count++) * kmer_bytes()), kmer_val, kmer_bytes());
+            key_ops.write_root_batch(target_node.active_block->k_mers.data() +
+                (target_node.active_block->count++) * key_ops.bytes(0), kmer_val, 1);
         }
 
         if (has_deferred_task)
@@ -384,9 +392,9 @@ public:
                         active_block->count += this_copy;
                     }
 
-                    std::memcpy(active_block->k_mers.data() + block_original_count * kmer_bytes(),
-                        local_root->kmer_blocks[block_index]->k_mers.data() + block_for_copy_offset * kmer_bytes(),
-                        static_cast<size_t>(this_copy) * kmer_bytes());
+                    std::memcpy(active_block->k_mers.data() + block_original_count * key_ops.bytes(0),
+                        local_root->kmer_blocks[block_index]->k_mers.data() + block_for_copy_offset * key_ops.bytes(0),
+                        static_cast<size_t>(this_copy) * key_ops.bytes(0));
 
                     block_for_copy_offset += this_copy;
                     remaining -= this_copy;
@@ -451,9 +459,8 @@ public:
             const uint64_t first_space_left = capacity - first_block_original_count;
             const uint64_t first_copy_this_time = (first_space_left < remaining) ? first_space_left : remaining;
             remaining -= first_copy_this_time;
-            std::memcpy(active_block->k_mers.data() + first_block_original_count * kmer_bytes(),
-                kmer_block_for_copy.data() + read_offset * kmer_bytes(),
-                static_cast<size_t>(first_copy_this_time) * kmer_bytes());
+            key_ops.write_root_batch(active_block->k_mers.data() + first_block_original_count * key_ops.bytes(0),
+                kmer_block_for_copy.data() + read_offset * kmer_bytes(), first_copy_this_time);
             read_offset += first_copy_this_time;
             active_block->count += first_copy_this_time;
 
@@ -507,9 +514,8 @@ public:
                 target_root->active_block = active_block;
                 target_root->kmer_blocks[target_root->count++] = target_root->active_block;
 
-                std::memcpy(active_block->k_mers.data(),
-                    kmer_block_for_copy.data() + read_offset * kmer_bytes(),
-                    static_cast<size_t>(copy_this_time) * kmer_bytes());
+                key_ops.write_root_batch(active_block->k_mers.data(),
+                    kmer_block_for_copy.data() + read_offset * kmer_bytes(), copy_this_time);
 
                 active_block->count = copy_this_time;
 
@@ -534,7 +540,7 @@ public:
         kmer_block* block = local_roots[prefix].active_block;
         if (!block) return 0;
         const size_t accepted = std::min<size_t>(count, get_block_capacity() - block->count);
-        std::memcpy(block->k_mers.data() + block->count * kmer_bytes(), records, accepted * kmer_bytes());
+        key_ops.write_root_batch(block->k_mers.data() + block->count * key_ops.bytes(0), records, accepted);
         block->count += accepted;
 #ifdef TEST_MODE
         total_kmers_added.fetch_add(accepted, std::memory_order_relaxed);
@@ -594,7 +600,7 @@ public:
             }
 
             const uint64_t copy_count = std::min<uint64_t>(capacity - block->count, count);
-            std::memcpy(block->k_mers.data() + block->count * kmer_bytes(), kmers, copy_count * kmer_bytes());
+            key_ops.write_root_batch(block->k_mers.data() + block->count * key_ops.bytes(0), kmers, copy_count);
             block->count += copy_count;
             kmers += copy_count * kmer_bytes();
             count -= copy_count;
@@ -690,7 +696,7 @@ private:
             uint64_t kmer_count = input_kmer_block->count;
             for (uint64_t i = 0; i < kmer_count; ++i)
             {
-                local_map.increment((input_kmer_block->k_mers.data() + (i) * kmer_bytes()));
+                local_map.increment((input_kmer_block->k_mers.data() + (i) * key_ops.bytes(current_task.depth)));
             }
         }
 
@@ -718,7 +724,7 @@ private:
     void insert_kmer_in_task_to_node_hash_map_without_local_hash_map(const Task<CountType>& current_task)
     {
         node<CountType>* parent = current_task.current_node;
-        // const uint64_t root_prefix = get_root_prefix((current_task.kmer_blocks[0]->k_mers.data() + (0) * kmer_bytes()));
+        // const uint64_t root_prefix = get_root_prefix((current_task.kmer_blocks[0]->k_mers.data() + (0) * key_ops.bytes(current_task.depth)));
         ConcurrentOpenAddressHashMap<CountType>* hash_map = ensure_hash_map(parent, concurrent_hash_map_min_capacity);
 
         if (hash_map == nullptr) [[unlikely]]
@@ -735,7 +741,7 @@ private:
 
             for (uint64_t i = 0; i < input_kmer_block->count; ++i)
             {
-                hash_map->increment((input_kmer_block->k_mers.data() + (i) * kmer_bytes()), CountType{1}, local_size_count);
+                hash_map->increment((input_kmer_block->k_mers.data() + (i) * key_ops.bytes(current_task.depth)), CountType{1}, local_size_count);
             }
             memory_pool->deallocate(input_kmer_block);
         }
@@ -745,11 +751,16 @@ private:
     void scatter_kmer_blocks_to_children(const Task<CountType>& current_task)
     {
         uint64_t cur_block_index = 0;
+        const uint32_t depth = static_cast<uint32_t>(current_task.depth);
+        const size_t parent_bytes = key_ops.bytes(depth);
+        const size_t child_bytes = key_ops.bytes(depth + 1);
+        const size_t cut = depth & 1U;
+        const unsigned shift = (depth & 1U) ? 0U : 4U;
+        const unsigned mask = ROOT_BASES + depth * NODE_BASES < k_length ? 0x0fU : 0U;
+        const bool child_empty = key_ops.removed_bytes(depth + 1) == key_ops.bytes();
 
         while (cur_block_index < current_task.count)
         {
-            const uint32_t depth = current_task.depth;
-
             thread_local_block_prefix_counts.fill(0);
 
             const uint64_t block_index_boundary = std::min<uint64_t>(
@@ -760,7 +771,8 @@ private:
                 const uint64_t kmer_count = block_ptr->count;
                 for (uint64_t index = 0; index < kmer_count; index++)
                 {
-                    const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
+                    const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                    const unsigned prefix = (src[0] >> shift) & mask;
                     thread_local_block_prefix_counts[prefix]++;
                 }
             }
@@ -771,16 +783,35 @@ private:
                 thread_local_block_prefix_sums[i] = thread_local_block_prefix_sums[i - 1] + thread_local_block_prefix_counts[i - 1];
             }
 
-            for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
+            if (child_empty)
             {
-                kmer_block* block_ptr = current_task.kmer_blocks[block_index];
-                const uint64_t kmer_count = block_ptr->count;
-                for (uint64_t index = 0; index < kmer_count; index++)
+                for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
                 {
-                    const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
-                    const uint64_t pos = thread_local_block_prefix_sums[prefix];
-                    std::memcpy((thread_local_block_for_copy.data() + (pos) * kmer_bytes()), (block_ptr->k_mers.data() + (index) * kmer_bytes()), kmer_bytes());
-                    thread_local_block_prefix_sums[prefix]++;
+                    kmer_block* block_ptr = current_task.kmer_blocks[block_index];
+                    const uint64_t kmer_count = block_ptr->count;
+                    for (uint64_t index = 0; index < kmer_count; index++)
+                    {
+                        const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                        const unsigned prefix = (src[0] >> shift) & mask;
+                        const auto pos = thread_local_block_prefix_sums[prefix]++;
+                        thread_local_block_for_copy[pos] = 0;
+                    }
+                }
+            }
+            else
+            {
+                for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; block_index++)
+                {
+                    kmer_block* block_ptr = current_task.kmer_blocks[block_index];
+                    const uint64_t kmer_count = block_ptr->count;
+                    for (uint64_t index = 0; index < kmer_count; index++)
+                    {
+                        const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                        const unsigned prefix = (src[0] >> shift) & mask;
+                        const auto pos = thread_local_block_prefix_sums[prefix]++;
+                        std::memcpy(thread_local_block_for_copy.data() + pos * child_bytes,
+                            src + cut, child_bytes);
+                    }
                 }
             }
             cur_block_index = block_index_boundary;
@@ -795,7 +826,7 @@ private:
         thread_local_block_prefix_counts.fill(0);
         for (uint64_t index = 0; index < block_ptr->count; index++)
         {
-            const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
+            const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * key_ops.bytes(depth)), depth);
             thread_local_block_prefix_counts[prefix]++;
         }
 
@@ -810,7 +841,7 @@ private:
     {
         uint64_t remaining = thread_local_block_prefix_counts[prefix];
         uint64_t block_for_copy_offset = in_block_for_copy_offset;
-        const uint32_t capacity = get_block_capacity();
+        const uint32_t capacity = get_block_capacity(current_depth + 1);
 
         while (remaining > 0)
         {
@@ -839,9 +870,9 @@ private:
             const uint64_t block_original_count = active_block->count;
             const uint64_t this_copy = std::min<uint64_t>(capacity - block_original_count, remaining);
 
-            std::memcpy(active_block->k_mers.data() + block_original_count * kmer_bytes(),
-                thread_local_block_for_copy.data() + block_for_copy_offset * kmer_bytes(),
-                static_cast<size_t>(this_copy) * kmer_bytes());
+            std::memcpy(active_block->k_mers.data() + block_original_count * key_ops.bytes(current_depth + 1),
+                thread_local_block_for_copy.data() + block_for_copy_offset * key_ops.bytes(current_depth + 1),
+                static_cast<size_t>(this_copy) * key_ops.bytes(current_depth + 1));
 
             active_block->count += this_copy;
             block_for_copy_offset += this_copy;
@@ -853,6 +884,12 @@ private:
     {
         uint64_t cur_block_index = 0;
         const uint32_t depth = static_cast<uint32_t>(task.depth);
+        const size_t parent_bytes = key_ops.bytes(depth);
+        const size_t child_bytes = key_ops.bytes(depth + 1);
+        const size_t cut = depth & 1U;
+        const unsigned shift = (depth & 1U) ? 0U : 4U;
+        const unsigned mask = ROOT_BASES + depth * NODE_BASES < k_length ? 0x0fU : 0U;
+        const bool child_empty = key_ops.removed_bytes(depth + 1) == key_ops.bytes();
 
         while (cur_block_index < task.count)
         {
@@ -865,7 +902,8 @@ private:
                 kmer_block* block_ptr = task.kmer_blocks[block_index];
                 for (uint64_t index = 0; index < block_ptr->count; ++index)
                 {
-                    const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
+                    const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                    const unsigned prefix = (src[0] >> shift) & mask;
                     thread_local_block_prefix_counts[prefix]++;
                 }
             }
@@ -877,14 +915,33 @@ private:
                     thread_local_block_prefix_sums[prefix - 1] + thread_local_block_prefix_counts[prefix - 1];
             }
 
-            for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; ++block_index)
+            if (child_empty)
             {
-                kmer_block* block_ptr = task.kmer_blocks[block_index];
-                for (uint64_t index = 0; index < block_ptr->count; ++index)
+                for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; ++block_index)
                 {
-                    const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
-                    const uint64_t pos = thread_local_block_prefix_sums[prefix]++;
-                    std::memcpy((thread_local_block_for_copy.data() + (pos) * kmer_bytes()), (block_ptr->k_mers.data() + (index) * kmer_bytes()), kmer_bytes());
+                    kmer_block* block_ptr = task.kmer_blocks[block_index];
+                    for (uint64_t index = 0; index < block_ptr->count; ++index)
+                    {
+                        const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                        const unsigned prefix = (src[0] >> shift) & mask;
+                        const auto pos = thread_local_block_prefix_sums[prefix]++;
+                        thread_local_block_for_copy[pos] = 0;
+                    }
+                }
+            }
+            else
+            {
+                for (uint64_t block_index = cur_block_index; block_index < block_index_boundary; ++block_index)
+                {
+                    kmer_block* block_ptr = task.kmer_blocks[block_index];
+                    for (uint64_t index = 0; index < block_ptr->count; ++index)
+                    {
+                        const auto* src = block_ptr->k_mers.data() + index * parent_bytes;
+                        const unsigned prefix = (src[0] >> shift) & mask;
+                        const auto pos = thread_local_block_prefix_sums[prefix]++;
+                        std::memcpy(thread_local_block_for_copy.data() + pos * child_bytes,
+                            src + cut, child_bytes);
+                    }
                 }
             }
 
@@ -924,7 +981,7 @@ private:
 
         if (existing_child_slab == nullptr)
         {
-            const uint64_t capacity = get_block_capacity();
+            const uint64_t capacity = get_block_capacity(t.depth);
 
             uint64_t incoming_kmers = 0;
             for (uint64_t block_index = 0; block_index < t.count; ++block_index)
@@ -969,9 +1026,9 @@ private:
 
                     if (first_copy > 0) [[likely]]
                     {
-                        std::memcpy(current_node->active_block->k_mers.data() + current_node->active_block->count * kmer_bytes(),
+                        std::memcpy(current_node->active_block->k_mers.data() + current_node->active_block->count * key_ops.bytes(t.depth),
                             input_kmer_block->k_mers.data(),
-                            first_copy * kmer_bytes());
+                            first_copy * key_ops.bytes(t.depth));
                         current_node->active_block->count += first_copy;
                     }
 
@@ -983,8 +1040,8 @@ private:
                         current_node->kmer_blocks[current_node->count++] = new_block;
 
                         std::memcpy(new_block->k_mers.data(),
-                            input_kmer_block->k_mers.data() + first_copy * kmer_bytes(),
-                            remaining * kmer_bytes());
+                            input_kmer_block->k_mers.data() + first_copy * key_ops.bytes(t.depth),
+                            remaining * key_ops.bytes(t.depth));
                         new_block->count += remaining;
                     }
 
@@ -1098,7 +1155,7 @@ private:
             }
             else
             {
-                sort_and_export_leaf(current, writer);
+                sort_and_export_leaf(current, frame.depth, writer);
             }
         }
     }*/
@@ -1146,19 +1203,19 @@ public:
                         insert_kmer_in_task_to_node_hash_map_with_local_hash_map(task);
                         current->count = 0;
                         current->active_block = nullptr;
-                        export_hash_map(writer, hash_map);
+                        export_hash_map(writer, current, frame.depth, hash_map);
                     }
                     else
                     {
                         // Non-full node: export as regular leaf
-                        sort_and_export_leaf(current, writer);
+                        sort_and_export_leaf(current, frame.depth, writer);
                     }
                 }
                 else {
                     if (hash_map != nullptr)
                     {
                         // Edge case: has hash map but no pending k-mers in blocks, still need to export hash map contents
-                        export_hash_map(writer, hash_map);
+                        export_hash_map(writer, current, frame.depth, hash_map);
                     }
                 }
                 continue;
@@ -1196,7 +1253,7 @@ public:
             }
             else
             {
-                sort_and_export_leaf(current, writer);
+                sort_and_export_leaf(current, frame.depth, writer);
             }
         }
     }
@@ -1206,9 +1263,10 @@ private:
     {
         for (uint64_t index = 0; index < block_ptr->count; index++)
         {
-            const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * kmer_bytes()), depth);
+            const uint64_t prefix = get_node_prefix((block_ptr->k_mers.data() + (index) * key_ops.bytes(depth)), depth);
             const uint64_t pos = thread_local_block_prefix_sums[prefix];
-            std::memcpy((thread_local_block_for_copy.data() + (pos) * kmer_bytes()), (block_ptr->k_mers.data() + (index) * kmer_bytes()), kmer_bytes());
+            key_ops.write_child(thread_local_block_for_copy.data() + pos * key_ops.bytes(depth + 1),
+                block_ptr->k_mers.data() + index * key_ops.bytes(depth), depth);
             thread_local_block_prefix_sums[prefix]++;
         }
     }
@@ -1219,7 +1277,7 @@ private:
 
         uint64_t block_for_copy_offset = in_block_for_copy_offset;
         uint64_t remaining = thread_local_block_prefix_counts[prefix];
-        const uint32_t capacity = get_block_capacity();
+        const uint32_t capacity = get_block_capacity(current_depth + 1);
         bool enqueue_required = false;
 
         uint64_t block_original_count;
@@ -1298,9 +1356,9 @@ private:
                 active_block->count += this_copy;
             }
 
-            std::memcpy(active_block->k_mers.data() + block_original_count * kmer_bytes(),
-                thread_local_block_for_copy.data() + block_for_copy_offset * kmer_bytes(),
-                static_cast<size_t>(this_copy) * kmer_bytes());
+            std::memcpy(active_block->k_mers.data() + block_original_count * key_ops.bytes(current_depth + 1),
+                thread_local_block_for_copy.data() + block_for_copy_offset * key_ops.bytes(current_depth + 1),
+                static_cast<size_t>(this_copy) * key_ops.bytes(current_depth + 1));
 
             block_for_copy_offset += this_copy;
             remaining -= this_copy;
@@ -1383,6 +1441,8 @@ private:
                     try {
                         void* memory = memory_pool->allocate();
                         slab = new (memory) node<CountType>[1ULL << (2 * NODE_BASES)]();
+                        for (uint32_t c = 0; c < (1U << (2 * NODE_BASES)); ++c)
+                            slab[c].prefix_code = (parent->prefix_code << 4) | c;
                         parent->children_ptr.store(slab, std::memory_order_release);
                         return slab;
                     } catch (...) {
@@ -1419,7 +1479,7 @@ private:
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
                     try {
                         void* memory = ConcurrentOpenAddressHashMap<CountType>::get_map_metadata_mem();
-                        map = new (memory) ConcurrentOpenAddressHashMap<CountType>(capacity);
+                        map = new (memory) ConcurrentOpenAddressHashMap<CountType>(capacity, count_max, key_ops.bytes(MAX_DEPTH - 1));
                         parent->hash_map.store(map, std::memory_order_release);
                         return map;
                     } catch (...) {
@@ -1432,7 +1492,8 @@ private:
         }
     }
 
-    void append_export_record(FinalDrainWriter& writer, const unsigned char* key, const uint32_t count)
+    void append_export_record(FinalDrainWriter& writer, const unsigned char* key, const uint32_t count,
+        const node<CountType>* source, uint32_t depth)
     {
         if (count < filter_min)
         {
@@ -1445,10 +1506,12 @@ private:
             return;
         }
 
-        writer.write_kmer_record(key, count);
+        std::array<unsigned char, (MAX_K + 3) / 4> full_key;
+        key_ops.restore_full_key(full_key.data(), key, source->prefix_code, depth);
+        writer.write_kmer_record(full_key.data(), count);
     }
 
-    void sort_and_export_leaf(node<CountType>* leaf, FinalDrainWriter& writer)
+    void sort_and_export_leaf(node<CountType>* leaf, uint32_t depth, FinalDrainWriter& writer)
     {
         if (leaf->count == 0)
         {
@@ -1461,11 +1524,11 @@ private:
         {
             kmer_block* block = leaf->kmer_blocks[block_index];
             for (uint32_t i = 0; i < block->count; ++i) sort_indices[i] = i;
-            const size_t bytes = key_ops.bytes();
+            const size_t bytes = key_ops.bytes(depth);
             std::sort(sort_indices.begin(), sort_indices.begin() + block->count,
                 [&](uint32_t a, uint32_t b) {
                     return key_ops.compare(block->k_mers.data() + a * bytes,
-                        block->k_mers.data() + b * bytes) < 0;
+                        block->k_mers.data() + b * bytes, depth) < 0;
                 });
             for (uint32_t i = 0; i < block->count; ++i)
                 std::memcpy(sort_scratch.data() + i * bytes,
@@ -1492,29 +1555,29 @@ private:
             uint64_t min_pos = 0;
             for (uint64_t i = 1; i < active_cursor_count; ++i)
             {
-                const unsigned char* lhs = (cursors[i].block->k_mers.data() + (cursors[i].index) * kmer_bytes());
-                const unsigned char* rhs = (cursors[min_pos].block->k_mers.data() + (cursors[min_pos].index) * kmer_bytes());
-                if (key_ops.compare(lhs, rhs) < 0)
+                const unsigned char* lhs = (cursors[i].block->k_mers.data() + (cursors[i].index) * key_ops.bytes(depth));
+                const unsigned char* rhs = (cursors[min_pos].block->k_mers.data() + (cursors[min_pos].index) * key_ops.bytes(depth));
+                if (key_ops.compare(lhs, rhs, depth) < 0)
                 {
                     min_pos = i;
                 }
             }
 
-            const unsigned char* current_key = (cursors[min_pos].block->k_mers.data() + (cursors[min_pos].index) * kmer_bytes());
+            const unsigned char* current_key = (cursors[min_pos].block->k_mers.data() + (cursors[min_pos].index) * key_ops.bytes(depth));
             if (!has_prev) [[unlikely]]
             {
                 prev_key = current_key;
                 prev_count = 1;
                 has_prev = true;
             }
-            else if (key_ops.equal(current_key, prev_key))
+            else if (key_ops.equal(current_key, prev_key, depth))
             {
                 ++prev_count;
             }
             else
             {
                 prev_count = std::min(prev_count, static_cast<uint32_t>(count_max));
-                append_export_record(writer, prev_key, prev_count);
+                append_export_record(writer, prev_key, prev_count, leaf, depth);
                 prev_key = current_key;
                 prev_count = 1;
             }
@@ -1530,7 +1593,7 @@ private:
         if (has_prev) [[likely]]
         {
             prev_count = std::min(prev_count, static_cast<uint32_t>(count_max));
-            append_export_record(writer, prev_key, prev_count);
+            append_export_record(writer, prev_key, prev_count, leaf, depth);
         }
 
         for (uint64_t i = 0; i < block_count; ++i)
@@ -1542,12 +1605,13 @@ private:
         leaf->active_block = nullptr;
     }
 
-    void export_hash_map(FinalDrainWriter& writer, ConcurrentOpenAddressHashMap<CountType>* hash_map)
+    void export_hash_map(FinalDrainWriter& writer, const node<CountType>* source, uint32_t depth,
+        ConcurrentOpenAddressHashMap<CountType>* hash_map)
     {
         hash_map->for_each_entry(
             [&](const unsigned char* key, const uint32_t count)
             {
-                append_export_record(writer, key, count);
+                append_export_record(writer, key, count, source, depth);
             });
 #ifdef TEST_MODE
         hash_map->count_to_histogram();
@@ -1586,9 +1650,11 @@ private:
     // 辅助函数
     // ==========================================
 
-    static size_t get_block_capacity()
+    static size_t get_block_capacity(uint32_t depth = 0)
     {
-        return (KMER_BLOCK_SIZE - sizeof(uint32_t)) / kmer_bytes();
+        const size_t full = kmer_bytes();
+        const size_t removed = std::min(full, size_t{1} + depth / 2);
+        return sizeof(kmer_block::k_mers) / std::max(size_t{1}, full - removed);
     }
 
     static uint64_t get_root_prefix(const unsigned char* val) noexcept
