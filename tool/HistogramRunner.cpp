@@ -2,6 +2,7 @@
 #include "CompactRecordReader.h"
 #include "HighFrequencyThreadPool.h"
 #include "LowFrequencyThreadPool.h"
+#include "KtpInput.h"
 
 #include <fstream>
 #include <iostream>
@@ -211,10 +212,10 @@ namespace
     int run(const Options& options)
     {
         RecordLayout layout(options.k_len, options.count_bytes);
-        uint64_t high_bytes = file_size(options.tmp_dir + "high.bin", layout.record_bytes);
+        uint64_t high_bytes = ktpinput::legacy_bytes(options.tmp_dir + "high.bin", layout.record_bytes);
         const bool include_singletons = in_range(1, options.min_freq, options.max_freq);
         uint64_t low_bytes = options.is_precise || include_singletons
-            ? file_size(options.tmp_dir + "low.bin", layout.key_bytes) : 0;
+            ? ktpinput::legacy_bytes(options.tmp_dir + "low.bin", layout.key_bytes) : 0;
         uint64_t records = high_bytes / layout.record_bytes;
         size_t buckets = static_cast<size_t>(static_cast<uint64_t>(options.max_freq) - options.min_freq + 1);
         uint64_t fixed = fixed_memory_bytes(options.max_threads, buckets);

@@ -23,6 +23,7 @@
 
 #include "FlatConcurrentHashMap.h"
 #include "Partition.h"
+#include "KtpInput.h"
 
 namespace
 {
@@ -593,10 +594,10 @@ namespace
         return bytes_per_kmer;
     }
 
-    // Read compact k-mer records from file and expand to full ExportRecord<N>
+    // 把内存里的旧布局记录展开成 ExportRecord<N>（KTP1 已由 ktpinput::load 解码）
     template <uint32_t N>
-    static uint64_t read_compact_high_records(
-        int fd, uint64_t file_offset, uint64_t count,
+    static uint64_t unpack_high_records(
+        const char* base, uint64_t file_offset, uint64_t count,
         ExportRecord<N>* out, uint32_t k_len, uint32_t count_bytes)
     {
         const uint64_t full_words = k_len / BASES_PER_U64T;
@@ -605,33 +606,35 @@ namespace
         const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
         const uint64_t compact_rec = kmer_bytes + count_bytes;
 
-        const size_t total_bytes = static_cast<size_t>(count * compact_rec);
-        std::vector<char> buf(total_bytes);
-        ssize_t n = ::pread(fd, buf.data(), total_bytes,
-                            static_cast<off_t>(file_offset * compact_rec));
-        if (n != static_cast<ssize_t>(total_bytes))
-        {
-            std::cerr << "short read reading compact high records\n";
-            exit(-1);
-        }
-
         for (uint64_t i = 0; i < count; ++i)
         {
-            const char* src = buf.data() + i * compact_rec;
+            const char* src = base + (file_offset + i) * compact_rec;
             ExportRecord<N>& dst = out[i];
             dst.key.reset();
             std::memcpy(dst.key.data.data(), src, full_words * sizeof(uint64_t));
+            // GetKmer 现在把每个 64 位字 bswap 后按大端落盘，这里要还原
+            for (uint64_t w = 0; w < full_words; ++w)
+                dst.key.data[w] = __builtin_bswap64(dst.key.data[w]);
             if (tail_bytes > 0)
             {
-                uint64_t tail = 0;
-                std::memcpy(reinterpret_cast<char*>(&tail) + (8 - tail_bytes),
-                            src + full_words * sizeof(uint64_t), tail_bytes);
-                dst.key.data[full_words] = tail;
+                if (tail_bytes == 8)
+                {
+                    uint64_t tail = 0;
+                    std::memcpy(&tail, src + full_words * sizeof(uint64_t), 8);
+                    dst.key.data[full_words] = __builtin_bswap64(tail);
+                }
+                else
+                {
+                    uint64_t tail = 0;
+                    std::memcpy(reinterpret_cast<char*>(&tail) + (8 - tail_bytes),
+                                src + full_words * sizeof(uint64_t), tail_bytes);
+                    dst.key.data[full_words] = tail;
+                }
             }
             dst.count = 0;
             std::memcpy(&dst.count, src + kmer_bytes, count_bytes);
         }
-        return total_bytes;
+        return count * compact_rec;
     }
 
     // collect high file data
@@ -645,32 +648,19 @@ namespace
         std::vector<RootFileInfo> files;
 
         std::string path = high_filename(tmp_dir);
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "failed to open " << path << ": " << std::strerror(errno) << '\n';
+        uint64_t records = 0;
+        try {
+            records = ktpinput::records_of(path, compact_rec);
+        } catch (const std::exception& error) {
+            std::cerr << "failed to stat " << path << ": " << error.what() << '\n';
             exit(-1);
         }
-        struct stat st{};
-        if (::fstat(fd, &st) != 0)
-        {
-            std::cerr << "failed to stat " << path << ": " << std::strerror(errno) << '\n';
-            ::close(fd);
-            exit(-1);
-        }
-        ::close(fd);
-        uint64_t size = static_cast<uint64_t>(st.st_size);
-        if (size == 0)
+        if (records == 0)
         {
             std::cerr << "empty high.bin file\n";
             exit(-1);
         }
-        if (size % compact_rec != 0)
-        {
-            std::cerr << "bad high file size: " << path << '\n';
-            exit(-1);
-        }
-        uint64_t records = size / compact_rec;
+        uint64_t size = records * compact_rec;
         total_records += records;
         files.push_back({std::move(path), records, size});
 
@@ -699,20 +689,16 @@ namespace
                 if (index >= files.size())
                     break;
                 const RootFileInfo &info = files[index];
-                int fd = ::open(info.filename.c_str(), O_RDONLY);
-                if (fd < 0)
-                {
-                    std::cerr << "open: " << info.filename << '\n';
-                    exit(-1);
-                }
+                const uint64_t compact_rec = packed_kmer_bytes<N>(k_len) + count_bytes;
+                auto view = ktpinput::load(info.filename, k_len, count_bytes, compact_rec);
 
                 uint64_t remaining = info.record_count;
                 uint64_t offset = 0;
                 while (remaining > 0)
                 {
                     uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                    uint64_t bytes = read_compact_high_records<N>(fd, offset, batch,
-                                                                  buffer.data(), k_len, count_bytes);
+                    uint64_t bytes = unpack_high_records<N>(view.data, offset, batch,
+                                                            buffer.data(), k_len, count_bytes);
                     for (uint64_t i = 0; i < batch; ++i)
                         if (in_range(buffer[i].count, min_freq, max_freq))
                             hash_map.insert_unique(buffer[i].key, buffer[i].count);
@@ -720,7 +706,6 @@ namespace
                     offset += batch;
                     progress->add(bytes);
                 }
-                ::close(fd);
             }
         };
 
@@ -745,25 +730,9 @@ namespace
                                  ProgressPrinter *progress,
                                  AsyncWriter *writer)
     {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "open low.bin failed\n";
-            exit(-1);
-        }
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-        if (mapped == MAP_FAILED)
-        {
-            std::cerr << "mmap low.bin failed\n";
-            exit(-1);
-        }
+        auto view = ktpinput::load(low_path, k_len, 0, packed_bytes);
+        const uint64_t total_kmers = view.records();
+        const char* mapped = view.data;
 
         const uint64_t full_data_words = k_len / BASES_PER_U64T;
         const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
@@ -786,12 +755,20 @@ namespace
             for (uint64_t i = start; i < end; ++i) {
                 const char* record = mapped + i * packed_bytes;
                 uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
+                if (full_bytes > 0) {
                     std::memcpy(key.data.data(), record, full_bytes);
+                    for (uint64_t w = 0; w < full_data_words; ++w)
+                        key.data[w] = __builtin_bswap64(key.data[w]);
+                }
                 if (tail_bytes > 0) {
                     uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
+                    if (tail_bytes == 8) {
+                        std::memcpy(&tail, record + full_bytes, 8);
+                        tail = __builtin_bswap64(tail);
+                    } else {
+                        std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
+                                    record + full_bytes, tail_bytes);
+                    }
                     key.data[full_data_words] = tail;
                     for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
                 } else {
@@ -816,7 +793,7 @@ namespace
         }
         for (auto &w : workers)
             w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
+
     }
 
     // process low.bin
@@ -832,15 +809,9 @@ namespace
                                          uint32_t count_max,
                                          ProgressPrinter *progress)
     {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
+        auto view = ktpinput::load(low_path, k_len, 0, packed_bytes);
+        const uint64_t total_kmers = view.records();
+        const char* mapped = view.data;
 
         const uint64_t full_data_words = k_len / BASES_PER_U64T;
         const uint64_t tail_bytes = (2ULL * (k_len % BASES_PER_U64T) + 7) / 8;
@@ -865,12 +836,20 @@ namespace
             for (uint64_t i = start; i < end; ++i) {
                 const char* record = mapped + i * packed_bytes;
                 uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
+                if (full_bytes > 0) {
                     std::memcpy(key.data.data(), record, full_bytes);
+                    for (uint64_t w = 0; w < full_data_words; ++w)
+                        key.data[w] = __builtin_bswap64(key.data[w]);
+                }
                 if (tail_bytes > 0) {
                     uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
+                    if (tail_bytes == 8) {
+                        std::memcpy(&tail, record + full_bytes, 8);
+                        tail = __builtin_bswap64(tail);
+                    } else {
+                        std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
+                                    record + full_bytes, tail_bytes);
+                    }
                     key.data[full_data_words] = tail;
                     for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
                 } else {
@@ -895,7 +874,7 @@ namespace
         }
         for (auto &w : workers)
             w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
+
 
         uint64_t total = 0;
         for (auto &v : high_results)
@@ -1061,9 +1040,9 @@ namespace
                   << std::endl;
 
         // Phase 1: Partition high.bin and low.bin
-        const auto high_counts = partition::partition_high_file<N>(
-            opts.tmp_dir, P, opts.k_len);
-        const auto low_counts = partition::partition_low_file<N>(
+        const auto high_counts = partition::partition_high_file(
+            opts.tmp_dir, P, opts.k_len, opts.count_bytes);
+        const auto low_counts = partition::partition_low_file(
             opts.tmp_dir, P, opts.k_len);
 
         // Phase 2: Process each partition independently
@@ -1222,10 +1201,8 @@ namespace
                 std::cerr << "open low.bin failed\n";
                 exit(-1);
             }
-            struct stat st{};
-            ::fstat(fd, &st);
             ::close(fd);
-            low_bytes = static_cast<uint64_t>(st.st_size);
+            low_bytes = ktpinput::legacy_bytes(low_path, pkb);
             if (low_bytes % pkb != 0)
             {
                 std::cerr << "low.bin size error\n";
@@ -1279,6 +1256,13 @@ namespace
         (void)collect_high_files<N>(opts.tmp_dir, total_high_records, opts.k_len, opts.count_bytes);
 
         // Memory check
+        // 调试：强制走 partitioned 路径，便于验证 KTP1 分区读取
+        if (std::getenv("DUMP_FORCE_PARTITION") != nullptr)
+        {
+            std::cout << "DUMP_FORCE_PARTITION set, using partitioned mode" << std::endl;
+            return run_partitioned_precise<N>(opts);
+        }
+
         uint64_t estimated_mem = FlatConcurrentHashMap<N>::required_mmap_bytes(total_high_records);
         if (estimated_mem > opts.max_memory_bytes)
         {
@@ -1326,19 +1310,15 @@ namespace
                     if (index >= high_files.size())
                         break;
                     const RootFileInfo &info = high_files[index];
-                    int fd = ::open(info.filename.c_str(), O_RDONLY);
-                    if (fd < 0)
-                    {
-                        std::cerr << "open: " << info.filename << '\n';
-                        exit(-1);
-                    }
+                    const uint64_t compact_rec = packed_kmer_bytes<N>(opts.k_len) + opts.count_bytes;
+                    auto view = ktpinput::load(info.filename, opts.k_len, opts.count_bytes, compact_rec);
                     uint64_t remaining = info.record_count;
                     uint64_t offset = 0;
                     while (remaining > 0)
                     {
                         uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        uint64_t bytes = read_compact_high_records<N>(
-                            fd, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
+                        uint64_t bytes = unpack_high_records<N>(
+                            view.data, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 local.push_back(buffer[i]);
@@ -1346,7 +1326,6 @@ namespace
                         offset += batch;
                         progress.add(bytes);
                     }
-                    ::close(fd);
                 }
             };
             std::vector<std::thread> workers;
@@ -1387,19 +1366,15 @@ namespace
                     if (index >= high_files.size())
                         break;
                     const RootFileInfo &info = high_files[index];
-                    int fd = ::open(info.filename.c_str(), O_RDONLY);
-                    if (fd < 0)
-                    {
-                        std::cerr << "open: " << info.filename << '\n';
-                        exit(-1);
-                    }
+                    const uint64_t compact_rec = packed_kmer_bytes<N>(opts.k_len) + opts.count_bytes;
+                    auto view = ktpinput::load(info.filename, opts.k_len, opts.count_bytes, compact_rec);
                     uint64_t remaining = info.record_count;
                     uint64_t offset = 0;
                     while (remaining > 0)
                     {
                         uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        uint64_t bytes = read_compact_high_records<N>(
-                            fd, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
+                        uint64_t bytes = unpack_high_records<N>(
+                            view.data, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 line_writer.write_line(buffer[i].key, buffer[i].count);
@@ -1407,7 +1382,6 @@ namespace
                         offset += batch;
                         progress.add(bytes);
                     }
-                    ::close(fd);
                 }
             };
             std::vector<std::thread> workers;
