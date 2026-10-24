@@ -133,7 +133,10 @@ namespace partition
     // 按 key 的前 P 位取分区号（key 按字节大端解释，与 dump 的排序一致）
     inline uint64_t extract_prefix(const uint8_t* key, uint32_t bits) noexcept
     {
-        return ktp::get_bits_uint(key, 0, bits);
+        uint64_t value = 0;
+        for (uint32_t i = 0; i < bits; ++i)
+            value = (value << 1) | ((key[i >> 3] >> (7 - (i & 7))) & 1u);
+        return value;
     }
 
     // 顺序遍历输入记录；KTP1 走解码器，旧格式走 mmap。

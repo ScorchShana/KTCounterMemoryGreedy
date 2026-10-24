@@ -32,7 +32,7 @@ public:
 
     FinalDrainWriterThread(uint32_t block_size, uint32_t producer_count)
         : pool_(block_size, producer_count),
-          ktp_(std::make_unique<ktp::Writer>(k_length, /*has_counts=*/true)) {
+          ktp_(std::make_unique<ktp::Writer>(temp_dir + "high.final.tmp", k_length, /*has_counts=*/true)) {
     }
 
     auto* pool() { return &pool_; }
@@ -49,7 +49,7 @@ public:
         {
             ktp_written_ = true;
             try {
-                ktp_->write(temp_dir + "high.final.tmp");
+                ktp_->finish();
             } catch (...) {
                 if (RunState::active) RunState::active->fail(std::current_exception(), "final writer");
                 throw;

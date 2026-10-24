@@ -1,77 +1,59 @@
 #ifndef KTP_FORMAT_HEADER
 #define KTP_FORMAT_HEADER
 
-// KTP1（v2）：中间 k-mer 记录格式，块内排序 + 前缀编码，支持任意 k（1..128）。
+// KTP1：中间 k-mer 记录文件，只按块排序 + 前缀编码。
 //
-// 背景：build/tmp/{low,high}.bin 原来是“定长 key + count”的顺序文件，相邻记录
-// 基本不共享前缀。KTP1 写出时按 key 高 B 位分桶，桶内每 block_records 条排序后
-// 做前缀编码，读端按同一规则解码还原。
+// 写端按到达顺序攒满 block_records 条记录后：块内排序 → 首条写满 key 位，
+// 其余只写与上一条的差异后缀 → 追加到文件。写端内存只有一块。
 //
-// 文件布局（全部小端）：
-//   [0, 64)              header
-//   [64, 64+8*(NB+1))    u64 bucket_offset[]
-//   [.., +4*NB)          u32 bucket_count[]
-//   data                 bucket sections
+// 布局（小端）：
+//   [0, 32)         header
+//   [32, table)     blocks
+//   [table, EOF)    u64 block_offset[n_blocks + 1]
 //
-// header（64 B）：
+// header（32 B）：
 //   char[4] magic = "KTP1"
-//   u32 version   = 2
 //   u32 k
-//   u32 key_bytes            ceil(k/4)，即每条 key 的字节数
-//   u32 bucket_bits  B（2..min(12, 8*key_bytes)）
-//   u32 sh_bits              “额外共享前缀位数/2”字段的位宽
 //   u32 block_records
 //   u32 has_counts
-//   u32 mode       = 1（block-sorted）
-//   u32 reserved
 //   u64 n_records
-//   u64 n_buckets
+//   u32 reserved[2]
 //
-// bucket section：
-//   u32 count; u32 key_stream_bytes; u8 key_bits[]; [counts varint...]
+// block：
+//   u32 key_stream_bytes; u8 key_bits[]; [counts varint...]
 //
-// key 编码（key 当作不透明的 key_bytes*8 位、按字节大端解释）：
-//   bucket = key 的前 B 位
-//   每组第一条：写 bucket 之后的 (key_bits-B) 位
-//   其余：写 sh_bits 位的 (额外共享位数/2)，再写剩余后缀位
-//   共享位数按 2 bit 粒度向下取整
-//
-// key 的字节布局由写端决定，本格式只保证逐字节还原。
+// 块内前缀编码：
+//   extra = 与上一条 key 的前导相同位数（2 bit 粒度向下取整）
+//   首条：写满 key_bits 位
+//   其余：写 sh_bits 位的 extra/2，再写 key_bits-extra 位后缀
+//   sh_bits 由 key_bits 推导，不落盘。
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <functional>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <utility>
 #include <vector>
-
-#include <fstream>
 
 namespace ktp {
 
-constexpr uint32_t kFormatVersion = 2;
-constexpr uint32_t kHeaderBytes = 64;
-constexpr uint32_t kMinBucketBits = 2;
-constexpr uint32_t kMaxBucketBits = 12;
+constexpr uint32_t kHeaderBytes = 32;
 constexpr uint32_t kMaxK = 128;
 constexpr uint32_t kMaxKeyBytes = (kMaxK + 3) / 4;   // 32
-constexpr uint32_t kDefaultBucketBits = 6;
 constexpr uint32_t kDefaultBlockRecords = 16384;
-
-using KeyBuf = std::array<uint8_t, kMaxKeyBytes>;
 
 inline uint32_t key_bytes_for(uint32_t k) noexcept { return (k + 3) / 4; }
 inline bool supported_k(uint32_t k) noexcept { return k >= 1 && k <= kMaxK; }
 
-// ── 位操作 ────────────────────────────────────────────────────────────────
+// 从 data 的 bit 位取一位（MSB-first）
 inline uint8_t get_bit(const uint8_t* data, unsigned bit) noexcept
 {
     return static_cast<uint8_t>((data[bit >> 3] >> (7 - (bit & 7))) & 1u);
@@ -82,19 +64,6 @@ inline void set_bit(uint8_t* data, unsigned bit, uint8_t value) noexcept
     const uint8_t mask = static_cast<uint8_t>(1u << (7 - (bit & 7)));
     if (value) data[bit >> 3] = static_cast<uint8_t>(data[bit >> 3] | mask);
     else data[bit >> 3] = static_cast<uint8_t>(data[bit >> 3] & ~mask);
-}
-
-inline uint32_t get_bits_uint(const uint8_t* data, unsigned start, unsigned count) noexcept
-{
-    uint32_t value = 0;
-    for (unsigned i = 0; i < count; ++i) value = (value << 1) | get_bit(data, start + i);
-    return value;
-}
-
-inline void put_bits_uint(uint8_t* data, unsigned start, unsigned count, uint32_t value) noexcept
-{
-    for (unsigned i = 0; i < count; ++i)
-        set_bit(data, start + i, static_cast<uint8_t>((value >> (count - 1 - i)) & 1u));
 }
 
 inline unsigned shared_bits(const uint8_t* a, const uint8_t* b, unsigned bits) noexcept
@@ -120,12 +89,6 @@ inline unsigned bits_for_value(unsigned max_value) noexcept
     return bits;
 }
 
-inline unsigned sh_field_bits(unsigned key_bits, unsigned bucket_bits) noexcept
-{
-    const unsigned max_extra = key_bits - bucket_bits;
-    return bits_for_value(max_extra / 2);
-}
-
 class BitWriter
 {
 public:
@@ -136,8 +99,7 @@ public:
         while (bits > 0) {
             const unsigned room = 64 - used_;
             const unsigned take = std::min(bits, room);
-            const unsigned shift = bits - take;
-            const uint64_t chunk = (value >> shift) & mask64(take);
+            const uint64_t chunk = (value >> (bits - take)) & mask(take);
             acc_ = take == 64 ? chunk : ((acc_ << take) | chunk);
             used_ += take;
             bits -= take;
@@ -148,15 +110,12 @@ public:
         }
     }
 
-    // 从 data 的 start 位开始写 count 位（MSB-first）
+    // 从 data 的 start 位开始写 count 位；源对齐的部分按整字节批量写
     void put_bits(const uint8_t* data, unsigned start, unsigned count)
     {
         unsigned i = 0;
         while (i < count && ((start + i) & 7) != 0) { put(get_bit(data, start + i), 1); ++i; }
-        while (i + 8 <= count) {
-            put(data[(start + i) >> 3], 8);
-            i += 8;
-        }
+        while (i + 8 <= count) { put(data[(start + i) >> 3], 8); i += 8; }
         while (i < count) { put(get_bit(data, start + i), 1); ++i; }
     }
 
@@ -169,7 +128,7 @@ public:
     }
 
 private:
-    static uint64_t mask64(unsigned bits) noexcept
+    static uint64_t mask(unsigned bits) noexcept
     {
         return bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
     }
@@ -191,11 +150,8 @@ public:
         while (bits > 0) {
             const size_t byte = bit_ >> 3;
             const unsigned offset = static_cast<unsigned>(bit_ & 7);
-            const unsigned available = 8 - offset;
-            const unsigned take = std::min(bits, available);
-            const unsigned shift = available - take;
-            const unsigned chunk = (data_[byte] >> shift) & ((1u << take) - 1u);
-            value = (value << take) | chunk;
+            const unsigned take = std::min(bits, 8 - offset);
+            value = (value << take) | ((data_[byte] >> (8 - offset - take)) & ((1u << take) - 1u));
             bit_ += take;
             bits -= take;
         }
@@ -204,18 +160,7 @@ public:
 
     void get_bits_into(uint8_t* out, unsigned start, unsigned count)
     {
-        unsigned i = 0;
-        while (i < count && ((start + i) & 7) != 0) { set_bit(out, start + i, static_cast<uint8_t>(get(1))); ++i; }
-        while (i + 8 <= count) {
-            const uint8_t byte = static_cast<uint8_t>(get(8));
-            if ((start + i) & 7) {
-                for (unsigned b = 0; b < 8; ++b) set_bit(out, start + i + b, static_cast<uint8_t>((byte >> (7 - b)) & 1u));
-            } else {
-                out[(start + i) >> 3] = byte;
-            }
-            i += 8;
-        }
-        while (i < count) { set_bit(out, start + i, static_cast<uint8_t>(get(1))); ++i; }
+        for (unsigned i = 0; i < count; ++i) set_bit(out, start + i, static_cast<uint8_t>(get(1)));
     }
 
 private:
@@ -224,202 +169,144 @@ private:
     size_t bit_ = 0;
 };
 
-struct Header
-{
-    uint32_t k = 0;
-    uint32_t key_bytes = 0;
-    uint32_t bucket_bits = 0;
-    uint32_t sh_bits = 0;
-    uint32_t block_records = 0;
-    uint32_t has_counts = 0;
-    uint64_t records = 0;
-    uint64_t buckets = 0;
-};
-
+// 流式写端：只保留一个块的内存。
 class Writer
 {
 public:
-    Writer(uint32_t k, bool has_counts, uint32_t bucket_bits = kDefaultBucketBits,
+    Writer(const std::string& path, uint32_t k, bool has_counts,
            uint32_t block_records = kDefaultBlockRecords)
+        : path_(path), k_(k), key_bytes_(key_bytes_for(k)), key_bits_(8 * key_bytes_),
+          block_records_(block_records), sh_bits_(bits_for_value(key_bits_ / 2)),
+          has_counts_(has_counts)
     {
-        if (!supported_k(k)) throw std::runtime_error("KTP1 writer: k out of range");
-        header_.k = k;
-        header_.key_bytes = key_bytes_for(k);
-        header_.bucket_bits = std::min(bucket_bits, 8u * header_.key_bytes);
-        if (header_.bucket_bits < kMinBucketBits || header_.bucket_bits > kMaxBucketBits)
-            throw std::runtime_error("KTP1 writer: bucket_bits out of range");
-        header_.block_records = block_records;
-        if (block_records == 0) throw std::runtime_error("KTP1 writer: block_records must be > 0");
-        header_.has_counts = has_counts ? 1u : 0u;
-        header_.buckets = 1ull << header_.bucket_bits;
-        header_.sh_bits = sh_field_bits(8u * header_.key_bytes, header_.bucket_bits);
-        buckets_.resize(static_cast<size_t>(header_.buckets));
+        if (!supported_k(k) || block_records_ == 0)
+            throw std::runtime_error("KTP1 writer: invalid k or block_records");
+        out_.open(path, std::ios::binary | std::ios::trunc);
+        if (!out_) throw std::runtime_error("KTP1 writer: cannot open " + path);
+        const uint8_t zeros[kHeaderBytes]{};
+        write_raw(zeros, kHeaderBytes);
+        block_.reserve(block_records_);
     }
+
+    Writer(const Writer&) = delete;
+    Writer& operator=(const Writer&) = delete;
 
     void add(const void* raw_key, uint32_t count = 1)
     {
-        if (finished_) throw std::runtime_error("KTP1 writer: add() after write()");
+        if (finished_) throw std::runtime_error("KTP1 writer: add() after finish()");
         Rec rec{};
-        std::memcpy(rec.key.data(), raw_key, header_.key_bytes);
+        std::memcpy(rec.key.data(), raw_key, key_bytes_);
         rec.count = count;
-        const uint32_t bucket = bucket_of(rec.key.data());
-        buckets_[bucket].push_back(rec);
-        ++header_.records;
+        block_.push_back(rec);
+        if (block_.size() == block_records_) flush_block();
     }
 
-    // 便捷重载：仅 k<=32（key_bytes<=8）时可用，按大端 8 字节写入
-    void add_u64(uint64_t key, uint32_t count = 1)
+    void finish()
     {
-        if (header_.key_bytes != 8) throw std::runtime_error("KTP1 writer: add_u64 requires k<=32");
-        uint8_t bytes[8];
-        for (unsigned i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(key >> (8 * (7 - i)));
-        add(bytes, count);
-    }
-
-    [[nodiscard]] uint64_t records() const noexcept { return header_.records; }
-    [[nodiscard]] uint32_t key_bytes() const noexcept { return header_.key_bytes; }
-
-    uint64_t write(const std::string& path)
-    {
-        if (finished_) throw std::runtime_error("KTP1 writer: write() called twice");
+        if (finished_) throw std::runtime_error("KTP1 writer: finish() called twice");
+        flush_block();
         finished_ = true;
 
-        const uint32_t nb = static_cast<uint32_t>(header_.buckets);
-        std::vector<uint8_t> file;
-        file.resize(kHeaderBytes + 8ull * (nb + 1) + 4ull * nb, 0);
-
-        std::vector<uint64_t> offsets(nb + 1, 0);
-        std::vector<uint32_t> counts(nb, 0);
-        std::vector<uint8_t> section;
-
-        for (uint32_t b = 0; b < nb; ++b) {
-            offsets[b] = file.size();
-            counts[b] = static_cast<uint32_t>(buckets_[b].size());
-            if (buckets_[b].empty()) continue;
-            section.clear();
-            encode_bucket(b, section);
-            file.insert(file.end(), section.begin(), section.end());
-            std::vector<Rec>().swap(buckets_[b]);
-        }
-        offsets[nb] = file.size();
-
-        write_header(file.data());
-        for (uint32_t b = 0; b <= nb; ++b) put_u64(file.data() + kHeaderBytes + 8ull * b, offsets[b]);
-        const size_t count_table = kHeaderBytes + 8ull * (nb + 1);
-        for (uint32_t b = 0; b < nb; ++b) put_u32(file.data() + count_table + 4ull * b, counts[b]);
-
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("KTP1 writer: cannot open " + path);
-        out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
-        out.flush();   // 缓冲写要到 flush 才能发现 /dev/full 之类的 I/O 错误
-        if (!out) throw std::runtime_error("KTP1 writer: write failed " + path);
-        out.close();
-        if (!out) throw std::runtime_error("KTP1 writer: close failed " + path);
-        return file.size();
+        const uint64_t table_offset = static_cast<uint64_t>(out_.tellp());
+        offsets_.push_back(table_offset);
+        for (const uint64_t offset : offsets_) write_u64(offset);
+        write_header(table_offset);
+        out_.flush();
+        if (!out_) throw std::runtime_error("KTP1 writer: write failed " + path_);
+        out_.close();
     }
 
 private:
     struct Rec
     {
-        KeyBuf key{};
+        std::array<uint8_t, kMaxKeyBytes> key{};
         uint32_t count = 0;
-        uint32_t pad = 0;
     };
 
-    [[nodiscard]] uint32_t bucket_of(const uint8_t* key) const noexcept
+    void flush_block()
     {
-        return get_bits_uint(key, 0, header_.bucket_bits);
-    }
-
-    void encode_bucket(uint32_t b, std::vector<uint8_t>& out)
-    {
-        auto& recs = buckets_[b];
-        const unsigned key_bits = 8u * header_.key_bytes;
-        const unsigned base_width = key_bits - header_.bucket_bits;
-
-        const auto less = [this](const Rec& a, const Rec& c) {
-            const int cmp = std::memcmp(a.key.data(), c.key.data(), header_.key_bytes);
-            if (cmp != 0) return cmp < 0;
-            return a.count < c.count;
-        };
-        for (size_t base = 0; base < recs.size(); base += header_.block_records) {
-            const size_t end = std::min(recs.size(), base + header_.block_records);
-            std::sort(recs.begin() + base, recs.begin() + end, less);
-        }
+        if (block_.empty()) return;
+        const size_t count = block_.size();
+        std::sort(block_.begin(), block_.end(), [this](const Rec& a, const Rec& b) {
+            const int cmp = std::memcmp(a.key.data(), b.key.data(), key_bytes_);
+            return cmp != 0 ? cmp < 0 : a.count < b.count;
+        });
 
         std::vector<uint8_t> keys;
-        keys.reserve(recs.size() * ((base_width + 7) / 8) + 64);
         BitWriter writer(keys);
-        const unsigned sh_bits = header_.sh_bits;
-
-        KeyBuf prev{};
-        for (size_t base = 0; base < recs.size(); base += header_.block_records) {
-            const size_t end = std::min(recs.size(), base + header_.block_records);
-            for (size_t i = base; i < end; ++i) {
-                const uint8_t* v = recs[i].key.data();
-                if (i == base) {
-                    writer.put_bits(v, header_.bucket_bits, base_width);
-                } else {
-                    unsigned shared = shared_bits(prev.data(), v, key_bits);
-                    shared &= ~1u;   // 2 bit 粒度
-                    unsigned extra = shared > header_.bucket_bits ? shared - header_.bucket_bits : 0u;
-                    extra = std::min(extra, base_width);
-                    extra &= ~1u;
-                    const unsigned width = base_width - extra;
-                    writer.put(extra / 2, sh_bits);
-                    writer.put_bits(v, key_bits - width, width);
-                }
-                std::memcpy(prev.data(), v, header_.key_bytes);
+        std::array<uint8_t, kMaxKeyBytes> prev{};
+        for (size_t i = 0; i < count; ++i) {
+            const uint8_t* key = block_[i].key.data();
+            if (i == 0) {
+                writer.put_bits(key, 0, key_bits_);
+            } else {
+                const unsigned shared = std::min(shared_bits(prev.data(), key, key_bits_) & ~1u, key_bits_);
+                writer.put(shared / 2, sh_bits_);
+                writer.put_bits(key, shared, key_bits_ - shared);
             }
+            std::memcpy(prev.data(), key, key_bytes_);
         }
         writer.flush();
 
-        append_u32(out, static_cast<uint32_t>(recs.size()));
-        append_u32(out, static_cast<uint32_t>(keys.size()));
-        out.insert(out.end(), keys.begin(), keys.end());
-
-        if (header_.has_counts) {
-            for (const Rec& rec : recs) {
-                uint32_t value = rec.count;
-                while (value >= 0x80) {
-                    out.push_back(static_cast<uint8_t>(value | 0x80));
-                    value >>= 7;
-                }
-                out.push_back(static_cast<uint8_t>(value));
-            }
+        offsets_.push_back(static_cast<uint64_t>(out_.tellp()));
+        write_u32(static_cast<uint32_t>(keys.size()));
+        write_raw(keys.data(), keys.size());
+        if (has_counts_) {
+            for (const Rec& rec : block_) write_varint(rec.count);
         }
+        records_ += count;
+        block_.clear();
     }
 
-    void write_header(uint8_t* p) const
+    void write_header(uint64_t table_offset)
     {
-        std::memset(p, 0, kHeaderBytes);
-        std::memcpy(p, "KTP1", 4);
-        put_u32(p + 4, kFormatVersion);
-        put_u32(p + 8, header_.k);
-        put_u32(p + 12, header_.key_bytes);
-        put_u32(p + 16, header_.bucket_bits);
-        put_u32(p + 20, header_.sh_bits);
-        put_u32(p + 24, header_.block_records);
-        put_u32(p + 28, header_.has_counts);
-        put_u32(p + 32, 1);   // mode = block-sorted
-        put_u64(p + 40, header_.records);
-        put_u64(p + 48, header_.buckets);
+        uint8_t header[kHeaderBytes]{};
+        std::memcpy(header, "KTP1", 4);
+        put_u32(header + 4, k_);
+        put_u32(header + 8, block_records_);
+        put_u32(header + 12, has_counts_ ? 1u : 0u);
+        put_u64(header + 16, records_);
+        out_.seekp(0);
+        write_raw(header, kHeaderBytes);
+        out_.seekp(table_offset);
+        if (!out_) throw std::runtime_error("KTP1 writer: header failed " + path_);
     }
 
-    static void append_u32(std::vector<uint8_t>& out, uint32_t v)
+    void write_u32(uint32_t v)
     {
-        out.push_back(static_cast<uint8_t>(v));
-        out.push_back(static_cast<uint8_t>(v >> 8));
-        out.push_back(static_cast<uint8_t>(v >> 16));
-        out.push_back(static_cast<uint8_t>(v >> 24));
+        uint8_t bytes[4];
+        put_u32(bytes, v);
+        write_raw(bytes, 4);
+    }
+
+    void write_u64(uint64_t v)
+    {
+        uint8_t bytes[8];
+        put_u64(bytes, v);
+        write_raw(bytes, 8);
+    }
+
+    void write_varint(uint32_t value)
+    {
+        uint8_t bytes[5];
+        unsigned n = 0;
+        while (value >= 0x80) {
+            bytes[n++] = static_cast<uint8_t>(value | 0x80);
+            value >>= 7;
+        }
+        bytes[n++] = static_cast<uint8_t>(value);
+        write_raw(bytes, n);
+    }
+
+    void write_raw(const void* data, size_t bytes)
+    {
+        out_.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        if (!out_) throw std::runtime_error("KTP1 writer: write failed " + path_);
     }
 
     static void put_u32(uint8_t* p, uint32_t v) noexcept
     {
-        p[0] = static_cast<uint8_t>(v);
-        p[1] = static_cast<uint8_t>(v >> 8);
-        p[2] = static_cast<uint8_t>(v >> 16);
-        p[3] = static_cast<uint8_t>(v >> 24);
+        for (unsigned i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
     }
 
     static void put_u64(uint8_t* p, uint64_t v) noexcept
@@ -427,8 +314,17 @@ private:
         for (unsigned i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
     }
 
-    Header header_{};
-    std::vector<std::vector<Rec>> buckets_;
+    std::string path_;
+    std::ofstream out_;
+    uint32_t k_ = 0;
+    uint32_t key_bytes_ = 0;
+    uint32_t key_bits_ = 0;
+    uint32_t block_records_ = 0;
+    uint32_t sh_bits_ = 0;
+    bool has_counts_ = false;
+    uint64_t records_ = 0;
+    std::vector<Rec> block_;
+    std::vector<uint64_t> offsets_;
     bool finished_ = false;
 };
 
@@ -438,12 +334,6 @@ public:
     Reader() = default;
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
-    Reader(Reader&& other) noexcept { move_from(other); }
-    Reader& operator=(Reader&& other) noexcept
-    {
-        if (this != &other) { release(); move_from(other); }
-        return *this;
-    }
     ~Reader() { release(); }
 
     void open(const std::string& path)
@@ -458,82 +348,52 @@ public:
         void* mapping = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (mapping == MAP_FAILED) throw std::runtime_error("KTP1 reader: mmap failed " + path);
         data_ = static_cast<const uint8_t*>(mapping);
-        try {
-            parse();
-        } catch (...) {
-            release();
-            throw;
-        }
+        try { parse(); } catch (...) { release(); throw; }
     }
 
-    [[nodiscard]] uint64_t records() const noexcept { return header_.records; }
-    [[nodiscard]] uint32_t k() const noexcept { return header_.k; }
-    [[nodiscard]] uint32_t key_bytes() const noexcept { return header_.key_bytes; }
-    [[nodiscard]] bool has_counts() const noexcept { return header_.has_counts != 0; }
+    [[nodiscard]] uint64_t records() const noexcept { return records_; }
+    [[nodiscard]] uint32_t k() const noexcept { return k_; }
+    [[nodiscard]] uint32_t key_bytes() const noexcept { return key_bytes_; }
+    [[nodiscard]] bool has_counts() const noexcept { return has_counts_; }
 
-    // 回调里的 key 指针只在回调期间有效
     void decode_all(const std::function<void(const uint8_t*, uint32_t)>& callback) const
     {
-        for (uint32_t b = 0; b < header_.buckets; ++b) {
-            if (bucket_counts_[b] == 0) continue;
-            decode_bucket(b, 0, std::numeric_limits<uint64_t>::max(), callback);
-        }
+        for (uint64_t b = 0; b < n_blocks_; ++b) decode_block(b, 0, block_size(b), callback);
     }
 
     void decode_range(uint64_t first, uint64_t count,
                       const std::function<void(const uint8_t*, uint32_t)>& callback) const
     {
-        if (first > header_.records || count > header_.records - first) throw std::out_of_range("KTP1: range");
-        if (count == 0) return;
-        uint64_t index = first;
+        if (first > records_ || count > records_ - first) throw std::out_of_range("KTP1: range");
         uint64_t remaining = count;
-        uint32_t b = bucket_of_record(index);
+        uint64_t index = first;
         while (remaining > 0) {
-            const uint64_t in_bucket = std::min<uint64_t>(remaining, prefix_[b + 1] - index);
-            decode_bucket(b, index - prefix_[b], in_bucket, callback);
-            index += in_bucket;
-            remaining -= in_bucket;
-            ++b;
+            const uint64_t block = index / block_records_;
+            const uint64_t local = index % block_records_;
+            const uint64_t take = std::min(remaining, block_size(block) - local);
+            decode_block(block, local, take, callback);
+            index += take;
+            remaining -= take;
         }
     }
 
     // 还原成旧格式字节流（key_bytes 字节 + count 小端 count_bytes 字节）
     std::vector<char> to_legacy(uint32_t count_bytes) const
     {
-        std::vector<char> out(static_cast<size_t>(header_.records) * (header_.key_bytes + count_bytes));
+        std::vector<char> out(static_cast<size_t>(records_) * (key_bytes_ + count_bytes));
         char* cursor = out.data();
-        const uint32_t kb = header_.key_bytes;
-        const bool counts = header_.has_counts;
         decode_all([&](const uint8_t* key, uint32_t count) {
-            std::memcpy(cursor, key, kb);
-            cursor += kb;
-            if (counts && count_bytes) {
-                for (uint32_t i = 0; i < count_bytes; ++i)
-                    *cursor++ = static_cast<char>((count >> (8 * i)) & 0xffu);
-            }
+            std::memcpy(cursor, key, key_bytes_);
+            cursor += key_bytes_;
+            for (uint32_t i = 0; i < count_bytes; ++i) *cursor++ = static_cast<char>(count >> (8 * i));
         });
         return out;
     }
 
 private:
-    [[nodiscard]] uint32_t bucket_of_record(uint64_t index) const
+    [[nodiscard]] uint64_t block_size(uint64_t block) const noexcept
     {
-        const auto it = std::upper_bound(prefix_.begin(), prefix_.end(), index);
-        return static_cast<uint32_t>(it - prefix_.begin() - 1);
-    }
-
-    void move_from(Reader& other) noexcept
-    {
-        fd_ = other.fd_;
-        data_ = other.data_;
-        size_ = other.size_;
-        header_ = other.header_;
-        bucket_offsets_ = std::move(other.bucket_offsets_);
-        bucket_counts_ = std::move(other.bucket_counts_);
-        prefix_ = std::move(other.prefix_);
-        other.fd_ = -1;
-        other.data_ = nullptr;
-        other.size_ = 0;
+        return block + 1 < n_blocks_ ? block_records_ : records_ - block * block_records_;
     }
 
     void release() noexcept
@@ -547,95 +407,60 @@ private:
 
     void parse()
     {
-        const uint8_t* p = data_;
-        if (std::memcmp(p, "KTP1", 4) != 0) throw std::runtime_error("KTP1: bad magic");
-        if (get_u32(p + 4) != kFormatVersion) throw std::runtime_error("KTP1: unsupported version");
-        header_.k = get_u32(p + 8);
-        header_.key_bytes = get_u32(p + 12);
-        header_.bucket_bits = get_u32(p + 16);
-        header_.sh_bits = get_u32(p + 20);
-        header_.block_records = get_u32(p + 24);
-        header_.has_counts = get_u32(p + 28);
-        header_.records = get_u64(p + 40);
-        header_.buckets = get_u64(p + 48);
-        if (!supported_k(header_.k)) throw std::runtime_error("KTP1: bad k");
-        if (header_.key_bytes != key_bytes_for(header_.k)) throw std::runtime_error("KTP1: bad key_bytes");
-        if (header_.bucket_bits < kMinBucketBits || header_.bucket_bits > kMaxBucketBits ||
-            header_.bucket_bits > 8 * header_.key_bytes)
-            throw std::runtime_error("KTP1: bad bucket_bits");
-        if (header_.block_records == 0) throw std::runtime_error("KTP1: bad block_records");
-        if (header_.buckets != (1ull << header_.bucket_bits)) throw std::runtime_error("KTP1: bucket mismatch");
+        if (std::memcmp(data_, "KTP1", 4) != 0) throw std::runtime_error("KTP1: bad magic");
+        k_ = get_u32(data_ + 4);
+        block_records_ = get_u32(data_ + 8);
+        has_counts_ = get_u32(data_ + 12) != 0;
+        records_ = get_u64(data_ + 16);
+        key_bytes_ = key_bytes_for(k_);
+        sh_bits_ = bits_for_value(8 * key_bytes_ / 2);
+        if (!supported_k(k_) || block_records_ == 0) throw std::runtime_error("KTP1: bad header");
 
-        const uint32_t nb = static_cast<uint32_t>(header_.buckets);
-        const size_t count_table = kHeaderBytes + 8ull * (nb + 1);
-        if (size_ < count_table + 4ull * nb) throw std::runtime_error("KTP1: truncated table");
+        n_blocks_ = records_ == 0 ? 0 : (records_ + block_records_ - 1) / block_records_;
+        const uint64_t table_bytes = 8ull * (n_blocks_ + 1);
+        if (size_ < kHeaderBytes + table_bytes) throw std::runtime_error("KTP1: truncated");
+        table_offset_ = size_ - table_bytes;
 
-        bucket_offsets_.resize(nb + 1);
-        for (uint32_t b = 0; b <= nb; ++b) bucket_offsets_[b] = get_u64(p + kHeaderBytes + 8ull * b);
-        bucket_counts_.resize(nb);
-        prefix_.assign(nb + 1, 0);
-        uint64_t sum = 0;
-        for (uint32_t b = 0; b < nb; ++b) {
-            bucket_counts_[b] = get_u32(p + count_table + 4ull * b);
-            sum += bucket_counts_[b];
-            prefix_[b + 1] = sum;
-        }
-        if (sum != header_.records) throw std::runtime_error("KTP1: record count mismatch");
-        const uint64_t data_start = count_table + 4ull * nb;
-        if (bucket_offsets_.front() != data_start) throw std::runtime_error("KTP1: bad data offset");
-        if (bucket_offsets_.back() != size_) throw std::runtime_error("KTP1: bad length");
-        for (uint32_t b = 0; b < nb; ++b)
-            if (bucket_offsets_[b] > bucket_offsets_[b + 1]) throw std::runtime_error("KTP1: bad offsets");
+        offsets_.resize(n_blocks_ + 1);
+        for (uint64_t b = 0; b <= n_blocks_; ++b) offsets_[b] = get_u64(data_ + table_offset_ + 8 * b);
+        if (offsets_.front() != kHeaderBytes || offsets_.back() != table_offset_)
+            throw std::runtime_error("KTP1: bad block table");
     }
 
-    void decode_bucket(uint32_t b, uint64_t skip, uint64_t limit,
-                       const std::function<void(const uint8_t*, uint32_t)>& callback) const
+    void decode_block(uint64_t block, uint64_t skip, uint64_t limit,
+                      const std::function<void(const uint8_t*, uint32_t)>& callback) const
     {
-        const uint8_t* section = data_ + bucket_offsets_[b];
-        const uint32_t count = get_u32(section);
-        const uint32_t key_stream_bytes = get_u32(section + 4);
-        const uint8_t* key_stream = section + 8;
-        if (bucket_offsets_[b] + 8ull + key_stream_bytes > size_) throw std::runtime_error("KTP1: truncated section");
-        BitReader reader(key_stream, key_stream_bytes);
+        const uint8_t* section = data_ + offsets_[block];
+        const uint32_t stream_bytes = get_u32(section);
+        const uint8_t* key_stream = section + 4;
+        if (offsets_[block] + 4ull + stream_bytes > table_offset_) throw std::runtime_error("KTP1: bad block");
+        BitReader reader(key_stream, stream_bytes);
+        const uint8_t* counts = key_stream + stream_bytes;
+        const uint64_t key_bits = 8 * key_bytes_;
+        const unsigned sh_bits = sh_bits_;
 
-        const unsigned key_bits = 8u * header_.key_bytes;
-        const unsigned base_width = key_bits - header_.bucket_bits;
-        const unsigned sh_bits = header_.sh_bits;
-        KeyBuf key{};
-        put_bits_uint(key.data(), 0, header_.bucket_bits, b);
-        const uint8_t* counts = section + 8 + key_stream_bytes;
+        std::array<uint8_t, kMaxKeyBytes> key{};
         size_t counts_pos = 0;
-
-        uint64_t emitted = 0;
-        for (uint32_t i = 0; i < count && emitted < limit; ++i) {
-            if ((i % header_.block_records) == 0) {
-                KeyBuf fresh{};
-                put_bits_uint(fresh.data(), 0, header_.bucket_bits, b);
-                reader.get_bits_into(fresh.data(), header_.bucket_bits, base_width);
-                key = fresh;
+        for (uint64_t i = 0; i < skip + limit; ++i) {
+            if (i == 0) {
+                reader.get_bits_into(key.data(), 0, key_bits);
             } else {
                 const unsigned extra = 2 * static_cast<unsigned>(reader.get(sh_bits));
-                if (extra > base_width) throw std::runtime_error("KTP1: bad prefix length");
-                const unsigned width = base_width - extra;
-                reader.get_bits_into(key.data(), header_.bucket_bits + extra, width);
+                if (extra > key_bits) throw std::runtime_error("KTP1: bad prefix");
+                reader.get_bits_into(key.data(), extra, key_bits - extra);
             }
-            uint32_t value = 1;
-            if (header_.has_counts) {
-                uint64_t v = 0;
-                unsigned shift = 0;
-                for (;;) {
+            uint32_t count = 1;
+            if (has_counts_) {
+                uint64_t value = 0;
+                for (unsigned shift = 0;; shift += 7) {
                     const uint8_t byte = counts[counts_pos++];
-                    v |= static_cast<uint64_t>(byte & 0x7f) << shift;
+                    value |= static_cast<uint64_t>(byte & 0x7f) << shift;
                     if ((byte & 0x80) == 0) break;
-                    shift += 7;
-                    if (shift > 28) throw std::runtime_error("KTP1: varint overflow");
+                    if (shift > 28) throw std::runtime_error("KTP1: bad varint");
                 }
-                value = static_cast<uint32_t>(v);
+                count = static_cast<uint32_t>(value);
             }
-            if (i >= skip) {
-                callback(key.data(), value);
-                ++emitted;
-            }
+            if (i >= skip) callback(key.data(), count);
         }
     }
 
@@ -651,13 +476,18 @@ private:
         return v;
     }
 
-    Header header_{};
     int fd_ = -1;
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
-    std::vector<uint64_t> bucket_offsets_;
-    std::vector<uint32_t> bucket_counts_;
-    std::vector<uint64_t> prefix_;
+    uint32_t k_ = 0;
+    uint32_t key_bytes_ = 0;
+    uint32_t block_records_ = 0;
+    uint32_t sh_bits_ = 0;
+    bool has_counts_ = false;
+    uint64_t records_ = 0;
+    uint64_t n_blocks_ = 0;
+    uint64_t table_offset_ = 0;
+    std::vector<uint64_t> offsets_;
 };
 
 inline bool is_ktp_file(const std::string& path)

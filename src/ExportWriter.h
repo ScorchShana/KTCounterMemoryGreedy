@@ -169,7 +169,7 @@ private:
     {
         if (!ktp_ || ktp_written_) return;
         ktp_written_ = true;
-        ktp_->write(filename_);
+        ktp_->finish();
     }
     bool normal_step()
     {
@@ -310,7 +310,7 @@ public:
           io_(ops ? *ops : IoOps{}), filename_(filename), output_kind_(kind), lifetime_(lifetime)
     {
         if (kind == OutputKind::FinalLow)
-            ktp_ = std::make_unique<ktp::Writer>(k_length, /*has_counts=*/false);
+            ktp_ = std::make_unique<ktp::Writer>(filename, k_length, /*has_counts=*/false);
         if (!ktp_) {
             const std::string path = kind == OutputKind::Pending ? filename + ".0" : filename;
             fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
