@@ -21,8 +21,8 @@ public:
     struct IoOps {
         int (*submit)(aiocb*) = ::aio_write;
         int (*error)(const aiocb*) = ::aio_error;
-        ssize_t (*result)(aiocb*) = ::aio_return;
-        int (*suspend)(const aiocb* const[], int, const timespec*) = ::aio_suspend;
+        ssize_t(*result)(aiocb*) = ::aio_return;
+        int (*suspend)(const aiocb* const [], int, const timespec*) = ::aio_suspend;
         int (*close)(int) = ::close;
     };
 private:
@@ -59,12 +59,14 @@ private:
     size_t held_offset_ = 0;
     bool normal_empty_ = false;
     bool normal_detached_ = false;
-    std::atomic<bool> normal_drained_{false};
-    std::atomic<bool> finish_requested_{false};
+    std::atomic<bool> normal_drained_{ false };
+    std::atomic<bool> finish_requested_{ false };
     std::thread worker;
 
     [[noreturn]] static void io_error(const char* operation)
-    { throw std::system_error(errno ? errno : EIO, std::generic_category(), operation); }
+    {
+        throw std::system_error(errno ? errno : EIO, std::generic_category(), operation);
+    }
 
     void close_file()
     {
@@ -251,11 +253,11 @@ private:
     {
         auto finish = [this](aiocb& cb, bool& is_active) {
             if (!is_active) return;
-            const aiocb* list[] = {&cb};
+            const aiocb* list[] = { &cb };
             while (io_.error(&cb) == EINPROGRESS) io_.suspend(list, 1, nullptr);
             io_.result(&cb);
             is_active = false;
-        };
+            };
         for (size_t i = 0; i < NUM_AIO_BUFFERS; ++i) finish(cbs[i], active[i]);
         for (auto& slot : borrowed_) {
             finish(slot.cb, slot.active);
@@ -278,8 +280,8 @@ public:
         ConcurrentMemoryPool* memory = nullptr, const IoOps* ops = nullptr,
         ReclaimLifetime lifetime = ReclaimLifetime::InputOnly)
         : ring_memory_pool(pool), memory_pool_(memory),
-          state_(memory ? &memory->run_state() : RunState::active ? RunState::active : &local_state_),
-          io_(ops ? *ops : IoOps{}), filename_(filename), output_kind_(kind), lifetime_(lifetime)
+        state_(memory ? &memory->run_state() : RunState::active ? RunState::active : &local_state_),
+        io_(ops ? *ops : IoOps{}), filename_(filename), output_kind_(kind), lifetime_(lifetime)
     {
         const std::string path = kind == OutputKind::Pending ? filename + ".0" : filename;
         fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -321,7 +323,8 @@ public:
         finish_reclaim();
         if (worker.joinable()) worker.join();
         cleanup_aio();
-        try { close_file(); } catch (...) { state_->fail(std::current_exception(), "pending close"); }
+        try { close_file(); }
+        catch (...) { state_->fail(std::current_exception(), "pending close"); }
         for (char* buffer : buffers) ::free(buffer);
     }
 };
