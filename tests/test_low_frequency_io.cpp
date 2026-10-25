@@ -2,10 +2,14 @@
 #include "../src/LowFrequencyParser.h"
 #include "../src/ExportWriter.h"
 #include "../src/ParserThreadPool.h"
+#include "low_msd_test_helpers.h"
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <condition_variable>
+#include <mutex>
+#include <chrono>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <vector>
@@ -154,12 +158,7 @@ void check_io(const std::filesystem::path& directory, uint32_t k, size_t count,
     for (uint64_t i = 0; i < pending.shard_count(); ++i)
         require(!std::filesystem::exists(input_path.string() + "." + std::to_string(i)), "reader retained a consumed shard");
     require(parsers.get_total_read_kmer() == 0, "second pass changed the FASTQ input count");
-    std::ifstream out(output_path, std::ios::binary);
-    std::vector<uint8_t> output((std::istreambuf_iterator<char>(out)), {});
-    require(output.size() == expected.size() * width, "partial output record");
-    std::vector<std::vector<uint8_t>> actual;
-    for (size_t pos = 0; pos < output.size(); pos += width)
-        actual.emplace_back(output.begin() + pos, output.begin() + pos + width);
+    auto actual = low_msd_test::read(output_path, width);
     std::sort(expected.begin(), expected.end());
     std::sort(actual.begin(), actual.end());
     require(actual == expected, "output multiset differs");
@@ -320,6 +319,124 @@ int fail_close(int fd)
     return -1;
 }
 
+// A deterministic AIO double keeps both output slots in flight. The snapshot
+// is compared at aio_return, after more input has been collected and encoded.
+struct SlowAio {
+    struct Write { aiocb* cb; std::vector<uint8_t> bytes; };
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<Write> writes;
+    size_t submissions = 0, returns = 0, peak = 0;
+    bool release = false, overwritten = false;
+    int failure = 0;
+};
+SlowAio* slow_aio;
+int slow_submit(aiocb* cb)
+{
+    auto& io = *slow_aio;
+    std::lock_guard lock(io.mutex);
+    ++io.submissions;
+    if (io.failure == 1 && io.submissions == 2) { errno = EIO; return -1; }
+    const auto* data = static_cast<const uint8_t*>(const_cast<const void*>(cb->aio_buf));
+    io.writes.push_back({cb, std::vector<uint8_t>(data, data + cb->aio_nbytes)});
+    io.peak = std::max(io.peak, io.writes.size());
+    io.changed.notify_all();
+    return 0;
+}
+int slow_error(const aiocb*)
+{
+    std::lock_guard lock(slow_aio->mutex);
+    if ((!slow_aio->release && !slow_aio->failure)
+        || (slow_aio->failure == 1 && slow_aio->submissions < 2)) return EINPROGRESS;
+    return slow_aio->failure == 3 ? EIO : 0;
+}
+ssize_t slow_result(aiocb* cb)
+{
+    auto& io = *slow_aio;
+    std::lock_guard lock(io.mutex);
+    auto found = std::find_if(io.writes.begin(), io.writes.end(),
+        [cb](const auto& write) { return write.cb == cb; });
+    if (found == io.writes.end()) { io.overwritten = true; return -1; }
+    const void* data = const_cast<const void*>(cb->aio_buf);
+    if (found->bytes.size() != cb->aio_nbytes || std::memcmp(data, found->bytes.data(), found->bytes.size()))
+        io.overwritten = true;
+    const ssize_t bytes = ::pwrite(cb->aio_fildes, data, cb->aio_nbytes, cb->aio_offset);
+    io.writes.erase(found);
+    ++io.returns;
+    return io.failure == 2 && bytes > 0 ? bytes - 1 : bytes;
+}
+int slow_suspend(const aiocb* const[], int, const timespec*) { return 0; }
+
+void check_final_aio(const std::filesystem::path& directory, int failure)
+{
+    k_length = 55;
+    const size_t width = kmer_bytes();
+    const size_t batch = msd_prefix::batch_records(width);
+    const size_t count = 3 * batch + 17;
+    RunState state;
+    ActiveRunScope scope(state);
+    SlowAio io;
+    io.failure = failure;
+    slow_aio = &io;
+    ExportWriter::IoOps ops;
+    ops.submit = slow_submit; ops.error = slow_error; ops.result = slow_result; ops.suspend = slow_suspend;
+    if (failure == 4) ops.close = fail_close;
+    RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> exports(65536, 1);
+    const auto path = directory / ("final-aio-" + std::to_string(failure));
+    ExportWriter writer(&exports, path.string(), ExportWriter::OutputKind::FinalLow, nullptr, &ops);
+    std::vector<std::vector<uint8_t>> expected;
+    expected.reserve(count);
+    for (size_t pos = 0; pos < count;) {
+        char* block;
+        exports.producer_dequeue(block);
+        const size_t take = std::min(count - pos, exports.blockSize() / width);
+        for (size_t i = 0; i < take; ++i) {
+            std::vector<uint8_t> key(width, 0x51);
+            uint64_t id = pos + i;
+            std::memcpy(key.data() + 3, &id, sizeof(id));
+            std::memcpy(block + i * width, key.data(), width);
+            expected.push_back(std::move(key));
+        }
+        exports.producer_enqueue({block, take});
+        pos += take;
+    }
+    exports.producer_set_finished();
+    writer.start();
+    if (!failure) {
+        bool occupied;
+        {
+            std::unique_lock lock(io.mutex);
+            occupied = io.changed.wait_for(lock, std::chrono::seconds(5), [&] { return io.submissions >= 2; });
+        }
+        // Let the writer reach its wait with a third full input batch. Slots
+        // must remain untouched until we explicitly permit completion.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        bool waited;
+        {
+            std::lock_guard lock(io.mutex);
+            waited = occupied && io.submissions == 2 && io.returns == 0;
+            io.release = true;
+        }
+        require(waited, "FinalLow did not wait for both busy slots");
+    }
+    bool rejected = false;
+    try { writer.join(); } catch (const std::exception&) { rejected = true; }
+    require(rejected == bool(failure) && state.failed() == bool(failure), "FinalLow failure propagation");
+    require(io.writes.empty() && !io.overwritten && io.peak <= 2, "AIO buffer reused before collection or leaked");
+    if (!failure) {
+        require(io.submissions == 4 && io.returns == 4 && io.peak == 2, "full/tail batches or slot reuse differ");
+        auto actual = low_msd_test::read(path, width, 37);
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+        require(actual == expected, "slow AIO changed full or tail batch multiset");
+        require(std::filesystem::file_size(path) < count * width, "compressible output did not shrink");
+        char* block;
+        size_t returned = 0;
+        while (exports.producer_try_dequeue(block)) ++returned;
+        require(returned == exports.capacity(), "FinalLow did not return input blocks");
+    }
+}
+
 void check_rotation_error(const std::filesystem::path& directory, bool close_error)
 {
     k_length = 41;
@@ -392,6 +509,7 @@ int main()
     try {
         // Fork error cases before POSIX AIO starts helper threads in this process.
         check_errors(directory);
+        for (int failure = 0; failure <= 4; ++failure) check_final_aio(directory, failure);
         for (int failure = 0; failure < 3; ++failure) check_reader_lifecycle(directory, failure);
         check_invalid_middle_shard(directory, true);
         check_invalid_middle_shard(directory, false);

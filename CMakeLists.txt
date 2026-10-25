@@ -331,3 +331,7 @@ if(PYTHON3_EXECUTABLE)
     add_test(NAME FirstPoolFailureTest COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_first_pool_failures.py $<TARGET_FILE:Tree>)
     set_tests_properties(FirstPoolFailureTest PROPERTIES TIMEOUT 75 RUN_SERIAL TRUE)
 endif()
+
+add_executable(msd_prefix_codec_test tests/test_msd_prefix_codec.cpp)
+add_test(NAME MsdPrefixCodecTest COMMAND msd_prefix_codec_test)
+set_tests_properties(MsdPrefixCodecTest PROPERTIES TIMEOUT 60)

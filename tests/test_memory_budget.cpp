@@ -1,4 +1,5 @@
 #include "../src/MemoryBudget.h"
+#include "../src/MsdPrefixCodec.h"
 #include "../src/ConcurrentMemoryPool.h"
 
 #include <iostream>
@@ -32,8 +33,19 @@ int main()
         require(rings.peak_bytes > rings.run_data, "RingPool object metadata missing");
         require(rings.peak_bytes == std::max({rings.run_bytes, rings.replay_bytes, rings.final_bytes}),
             "RingPool peak must use simultaneous lifetimes");
-        require(main_pool_budget(1) == ((1ULL << 30) - rings.peak_bytes - 4 * mib) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
-            "main pool deduction/alignment");
+        constexpr size_t pending_buffers = EXPORT_WRITER_BUFFER_BYTES * EXPORT_WRITER_BUFFER_COUNT;
+        require(msd_prefix::FINAL_LOW_BUFFER_BYTES == 8 * mib, "FinalLow four-buffer budget");
+        const size_t peak = std::max({rings.run_bytes + pending_buffers,
+            rings.replay_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES,
+            rings.final_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES});
+        require(main_pool_budget(1) == ((1ULL << 30) - peak) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
+            "main pool stage peak deduction/alignment");
+        for (uint64_t gib : {1U, 2U, 350U}) {
+            const size_t main = main_pool_budget(gib);
+            require(main % HUGE_PAGE_SIZE == 0 && main + peak <= gib * (1ULL << 30)
+                && gib * (1ULL << 30) - main - peak < HUGE_PAGE_SIZE,
+                "writer buffers escaped original memory limit");
+        }
         require(bloom_bytes(4096) == 2 * 4096 * sizeof(std::atomic<uint64_t>), "Bloom needs two words per bin");
         bool overflow = false;
         try { (void)bloom_bytes(4096, SIZE_MAX); } catch (const std::overflow_error&) { overflow = true; }

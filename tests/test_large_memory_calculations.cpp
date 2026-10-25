@@ -52,7 +52,7 @@ int main()
             "NUMA proportional multiplication overflowed");
         require(proportional_size(UINT64_MAX, 3, 3) == UINT64_MAX, "NUMA whole share overflowed");
         for (uint64_t gib : {8192ULL, 16384ULL, 65536ULL})
-            require(main_pool_budget(gib) == (gib << 30) - 945815552ULL,
+            require(main_pool_budget(gib) == (gib << 30) - 950009856ULL,
                 "large main-pool budget truncated");
         require(arena_watermark(8ULL << 40, 5) == 439806328832ULL
             && arena_watermark(8ULL << 40, 8) == 703688867840ULL, "8 TiB watermark calculation truncated");

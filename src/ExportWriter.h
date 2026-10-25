@@ -5,6 +5,7 @@
 #include "RingMemoryPool.h"
 #include "ConcurrentMemoryPool.h"
 #include "SpinBackoff.h"
+#include "MsdPrefixCodec.h"
 #include <aio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -52,6 +53,8 @@ private:
     std::array<bool, NUM_AIO_BUFFERS> active{};
     std::array<char*, NUM_AIO_BUFFERS> buffers{};
     std::array<size_t, NUM_AIO_BUFFERS> used{};
+    uint8_t* low_input_ = nullptr;
+    uint8_t* low_scratch_ = nullptr;
     std::array<BorrowedWrite, FIRST_AIO_SLOTS> borrowed_{};
     size_t current = 0;
     int next_arena_ = 0;
@@ -249,6 +252,65 @@ private:
             else backoff.backoff();
         }
     }
+    void final_low_loop()
+    {
+        const size_t capacity = msd_prefix::batch_records(record_bytes) * record_bytes;
+        size_t filled = 0;
+        bool closing = false;
+        SpinBackoff<> backoff;
+        for (;;) {
+            state_->check();
+            if (!closing && ring_memory_pool->producer_finished()) {
+                closing = true;
+                normal_empty_ = false;
+            }
+            bool worked = harvest();
+            if (!held_.data) {
+                if (ring_memory_pool->consumer_try_dequeue(held_)) {
+                    held_offset_ = 0;
+                    normal_empty_ = false;
+                    worked = true;
+                } else normal_empty_ = true;
+            }
+            if (held_.data) {
+                const size_t bytes = std::min(held_.length * record_bytes - held_offset_, capacity - filled);
+                if (bytes) {
+                    auto* block = reinterpret_cast<ExportBlock*>(held_.data);
+                    std::memcpy(low_input_ + filled, block->k_mers.data() + held_offset_, bytes);
+                    filled += bytes;
+                    held_offset_ += bytes;
+                    worked = true;
+                }
+                if (held_offset_ == held_.length * record_bytes && ring_memory_pool->consumer_try_enqueue(held_.data)) {
+                    held_ = {};
+                    worked = true;
+                }
+            }
+            if (filled == capacity || (filled && closing && normal_empty_ && !held_.data)) {
+                if (active[current]) current = (current + 1) % NUM_AIO_BUFFERS;
+                if (!active[current]) {
+                    const size_t bytes = msd_prefix::encode(low_input_, low_scratch_,
+                        static_cast<uint32_t>(filled / record_bytes), record_bytes,
+                        reinterpret_cast<uint8_t*>(buffers[current]));
+                    submit(cbs[current], buffers[current], bytes);
+                    active[current] = true;
+                    filled = 0;
+                    current = (current + 1) % NUM_AIO_BUFFERS;
+                    worked = true;
+                }
+            }
+            if (closing && normal_empty_ && !held_.data && !filled && !any_active()) {
+                for (char*& buffer : buffers) { ::free(buffer); buffer = nullptr; }
+                ::free(low_input_); low_input_ = nullptr;
+                ::free(low_scratch_); low_scratch_ = nullptr;
+                normal_drained_.store(true, std::memory_order_release);
+                state_->notify();
+                return;
+            }
+            if (worked) backoff.reset();
+            else backoff.backoff();
+        }
+    }
     void cleanup_aio() noexcept
     {
         auto finish = [this](aiocb& cb, bool& is_active) {
@@ -266,7 +328,10 @@ private:
     }
     void writer_entry() noexcept
     {
-        try { writer_loop(); }
+        try {
+            if (output_kind_ == OutputKind::FinalLow) final_low_loop();
+            else writer_loop();
+        }
         catch (...) { state_->fail(std::current_exception(), "pending writer"); }
         cleanup_aio();
         if (memory_pool_) {
@@ -295,6 +360,14 @@ public:
             void* storage = nullptr;
             if (posix_memalign(&storage, PAGE_SIZE, RAW_BUFFER_SIZE)) throw std::bad_alloc();
             buffer = static_cast<char*>(storage);
+        }
+        if (output_kind_ == OutputKind::FinalLow) {
+            static_assert(RAW_BUFFER_SIZE == msd_prefix::BUFFER_BYTES && NUM_AIO_BUFFERS == 2);
+            void* storage = nullptr;
+            if (posix_memalign(&storage, PAGE_SIZE, msd_prefix::BUFFER_BYTES)) throw std::bad_alloc();
+            low_input_ = static_cast<uint8_t*>(storage);
+            if (posix_memalign(&storage, PAGE_SIZE, msd_prefix::BUFFER_BYTES)) throw std::bad_alloc();
+            low_scratch_ = static_cast<uint8_t*>(storage);
         }
         if (memory_pool_) memory_pool_->set_spill_service(true);
         try { worker = std::thread(&ExportWriter::writer_entry, this); }
@@ -326,6 +399,8 @@ public:
         try { close_file(); }
         catch (...) { state_->fail(std::current_exception(), "pending close"); }
         for (char* buffer : buffers) ::free(buffer);
+        ::free(low_input_);
+        ::free(low_scratch_);
     }
 };
 #endif

@@ -1,3 +1,4 @@
+#include "low_msd_test_helpers.h"
 #include "../src/FastqClassifier.h"
 #include "../src/ConcurrentFirstBlockRing.h"
 #include "../src/FastqParser.h"
@@ -855,13 +856,8 @@ void check_late_reconcile(Shared& shared, uint32_t k)
     require(classifier.low_records_scanned == 3 && classifier.low_records_recovered == 2,
         "pending query conservation failed");
     if constexpr (WRITE_LOW) {
-        require(std::filesystem::file_size(output_path) == width, "low output lost its singleton");
-        std::ifstream out(output_path, std::ios::binary);
-        std::array<uint8_t, 32> record{};
-        out.read(reinterpret_cast<char*>(record.data()), width);
-        Key key(kmer_bytes());
-        std::memcpy(key.data(), record.data(), width);
-        require(key == pending[1], "low output contains the wrong key");
+        const auto actual = low_msd_test::read(output_path, width);
+        require(actual.size() == 1 && actual[0] == pending[1], "low output contains the wrong singleton");
     } else {
         exported.clear();
         collect_exports(shared, exported);
@@ -955,9 +951,7 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     require(Access::pending(classifier) == 0, "second-stage FIRST drain left staged records");
     require(classifier.repeat_query_count == runtime_queries + total, "FIRST records were lost or queried twice");
     if constexpr (WRITE_LOW) {
-        std::ifstream input(final_path, std::ios::binary);
-        Key key(kmer_bytes());
-        while (input.read(reinterpret_cast<char*>(key.data()), key.size())) ++actual_low[key];
+        for (const auto& key : low_msd_test::read(final_path, kmer_bytes())) ++actual_low[key];
         require(actual_low == expected_low, "final low lost or duplicated terminal singleton records");
     } else {
         collect_exports(shared, actual_low);
@@ -1470,9 +1464,7 @@ void check_memory_first_batches(Shared& shared, bool keep_singletons)
         std::map<Key, uint64_t> actual_low, expected_low;
         for (const auto& key : first) expected_low[key] = 1;
         for (const auto& key : repeated) expected_low.erase(key);
-        std::ifstream input(directory.path / "low", std::ios::binary);
-        Key key(kmer_bytes());
-        while (input.read(reinterpret_cast<char*>(key.data()), key.size())) ++actual_low[key];
+        for (const auto& key : low_msd_test::read(directory.path / "low", kmer_bytes())) ++actual_low[key];
         require(actual_low == expected_low, "memory FIRST final low multiset changed");
     }
     std::map<Key, uint64_t> actual, expected;
