@@ -1,4 +1,5 @@
 #include "../src/NewKmerTree.h"
+#include "high_prefix_test_helpers.h"
 
 #include <iostream>
 #include <map>
@@ -110,15 +111,14 @@ template<typename T> void check(uint32_t k, uint32_t cap)
             const auto saturated = std::min<uint64_t>(count, cap);
             if (minimum <= saturated && saturated <= filter_max) reference[key] = saturated;
         }
-        auto collect = [&](Counts& result) {
+        auto collect = [&](Counts& result, uint32_t depth) {
             content_type content;
-            const size_t stride = kmer_bytes() + count_max_bytes;
             while (output.consumer_try_dequeue(content)) {
-                require(content.length % stride == 0, "partial exported record");
-                for (size_t pos = 0; pos < content.length; pos += stride) {
-                    const auto* key = reinterpret_cast<const unsigned char*>(content.data + pos);
-                    uint32_t count = 0; std::memcpy(&count, key + kmer_bytes(), count_max_bytes);
-                    require(result.emplace(Key(key, key + kmer_bytes()), count).second, "duplicate export");
+                for (const auto& record : high_prefix_test::decode(
+                        {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+                    require(record.prefix_bytes == std::min(size_t{1} + depth / 2, kmer_bytes() - 1),
+                        "export did not use the node's complete prefix bytes");
+                    require(result.emplace(record.key, record.count).second, "duplicate export");
                 }
                 output.consumer_enqueue(content.data);
             }
@@ -132,7 +132,7 @@ template<typename T> void check(uint32_t k, uint32_t cap)
             small_map.increment(bytes.data(), value, unique);
             { FinalDrainWriter writer(&output);
               KmerTreeAllocationTestAccess::export_map(tree, writer, &owner, MAX_DEPTH - 1, &small_map); writer.close(); }
-            collect(hashed);
+            collect(hashed, MAX_DEPTH - 1);
             size_t which = 0;
             for (uint32_t depth : {0u, MAX_DEPTH - 1}) {
                 node<T> leaf; leaf.prefix_code = prefix(key, depth);
@@ -147,7 +147,7 @@ template<typename T> void check(uint32_t k, uint32_t cap)
                 }
                 { FinalDrainWriter writer(&output);
                   KmerTreeAllocationTestAccess::export_leaf(tree, &leaf, depth, writer); writer.close(); }
-                collect(sorted[which++]);
+                collect(sorted[which++], depth);
             }
         }
         require(hashed == reference && sorted[0] == reference && sorted[1] == reference,

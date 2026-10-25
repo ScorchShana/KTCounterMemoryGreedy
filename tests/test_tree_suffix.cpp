@@ -1,4 +1,5 @@
 #include "../src/NewKmerTree.h"
+#include "high_prefix_test_helpers.h"
 #include <cstddef>
 #include <iostream>
 #include <map>
@@ -126,12 +127,9 @@ template<class T> void tree_path(uint32_t k, uint32_t cap)
     for (const auto& [key, count] : truth) expected[key] = std::min<uint64_t>(count, cap);
     content_type content;
     while (output.consumer_try_dequeue(content)) {
-        const size_t stride = kmer_bytes() + count_max_bytes;
-        require(content.length % stride == 0, "partial full-key output");
-        for (size_t pos = 0; pos < content.length; pos += stride) {
-            const auto* data = reinterpret_cast<const unsigned char*>(content.data + pos);
-            uint32_t count = 0; std::memcpy(&count, data + kmer_bytes(), count_max_bytes);
-            require(actual.emplace(Key(data, data + kmer_bytes()), count).second, "duplicate reconstructed key");
+        for (const auto& record : high_prefix_test::decode(
+                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+            require(actual.emplace(record.key, record.count).second, "duplicate reconstructed key");
         }
         output.consumer_enqueue(content.data);
     }

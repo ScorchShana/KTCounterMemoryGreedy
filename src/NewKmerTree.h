@@ -1518,6 +1518,8 @@ private:
             return;
         }
 
+        writer.begin_node(static_cast<uint8_t>(std::min(key_ops.removed_bytes(depth), key_ops.bytes() - 1)));
+
         const uint64_t block_count = leaf->count;
 
         for (uint64_t block_index = 0; block_index < block_count; ++block_index)
@@ -1608,6 +1610,7 @@ private:
     void export_hash_map(FinalDrainWriter& writer, const node<CountType>* source, uint32_t depth,
         ConcurrentOpenAddressHashMap<CountType>* hash_map)
     {
+        writer.begin_node(static_cast<uint8_t>(std::min(key_ops.removed_bytes(depth), key_ops.bytes() - 1)));
         hash_map->for_each_entry(
             [&](const unsigned char* key, const uint32_t count)
             {

@@ -1,4 +1,5 @@
 #include "low_msd_test_helpers.h"
+#include "high_prefix_test_helpers.h"
 #include "../src/FastqClassifier.h"
 #include "../src/ConcurrentFirstBlockRing.h"
 #include "../src/FastqParser.h"
@@ -1035,16 +1036,12 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
     filter_min = saved_min;
     filter_max = saved_max;
 
-    const size_t record_bytes = kmer_bytes() + count_max_bytes;
     std::map<Key, uint32_t> actual;
     content_type content;
     while (output.consumer_try_dequeue(content)) {
-        require(content.length % record_bytes == 0, "final drain wrote a partial record");
-        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-            uint32_t count = 0;
-            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-            require(actual.emplace(key, count).second, "final drain duplicated a key");
+        for (const auto& record : high_prefix_test::decode(
+                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+            require(actual.emplace(record.key, record.count).second, "final drain duplicated a key");
         }
         output.consumer_enqueue(content.data);
     }
@@ -1141,14 +1138,12 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                         "final drain emitted the wrong unique count");
                     std::map<Key, uint32_t> actual;
                     content_type content;
-                    const size_t record_bytes = kmer_bytes() + count_max_bytes;
                     while (output.consumer_try_dequeue(content)) {
-                        require(content.length % record_bytes == 0, "final drain emitted a partial record");
-                        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-                            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-                            uint32_t count = 0;
-                            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-                            require(actual.emplace(key, count).second, "final drain emitted a duplicate key");
+                        for (const auto& record : high_prefix_test::decode(
+                                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+                            require(record.prefix_bytes == std::min(size_t{1} + depth / 2, kmer_bytes() - 1),
+                                "drain did not select the node prefix length");
+                            require(actual.emplace(record.key, record.count).second, "final drain emitted a duplicate key");
                         }
                         output.consumer_enqueue(content.data);
                     }
@@ -1191,15 +1186,11 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
     }
     content_type content;
     size_t output_blocks = 0;
-    const size_t record_bytes = kmer_bytes() + count_max_bytes;
     while (output.consumer_try_dequeue(content)) {
         ++output_blocks;
-        require(content.length % record_bytes == 0, "large drain emitted a partial record");
-        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-            uint32_t count = 0;
-            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-            require(actual.emplace(key, count).second, "large drain emitted a duplicate key");
+        for (const auto& record : high_prefix_test::decode(
+                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+            require(actual.emplace(record.key, record.count).second, "large drain emitted a duplicate key");
         }
         output.consumer_enqueue(content.data);
     }

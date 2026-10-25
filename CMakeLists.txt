@@ -131,6 +131,11 @@ endif()
 add_test(NAME TreeSuffixTest COMMAND tree_suffix_test)
 set_tests_properties(TreeSuffixTest PROPERTIES TIMEOUT 120)
 
+add_executable(final_drain_prefix_test tests/test_final_drain_prefix.cpp)
+target_link_libraries(final_drain_prefix_test pthread rt atomic)
+add_test(NAME FinalDrainPrefixTest COMMAND final_drain_prefix_test)
+set_tests_properties(FinalDrainPrefixTest PROPERTIES TIMEOUT 120)
+
 add_executable(export_reader_test tests/test_export_reader.cpp)
 target_link_libraries(export_reader_test rt)
 target_link_libraries(export_reader_test pthread)
@@ -257,6 +262,8 @@ add_test(NAME GetKmerTest COMMAND get_kmer_test)
 set_tests_properties(GetKmerTest PROPERTIES TIMEOUT 30)
 find_program(PYTHON3_EXECUTABLE NAMES python3)
 if(PYTHON3_EXECUTABLE)
+    add_test(NAME HighPrefixDecoderTest
+        COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/high_prefix_format.py)
     add_test(NAME ClassifierEndToEndTest
         COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_classifier_end_to_end.py
             $<TARGET_FILE:Tree>)
