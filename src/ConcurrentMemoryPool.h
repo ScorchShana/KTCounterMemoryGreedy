@@ -78,6 +78,8 @@ constexpr size_t proportional_size(size_t total, size_t share, size_t sum) noexc
 
 constexpr size_t arena_watermark(size_t capacity, size_t percent)
 {
+    // Keep 5%/8% for small Arenas; above 100 GiB cap Low/High at 5/8 GiB.
+    capacity = std::min<size_t>(capacity, 100ULL << 30);
     return align_up(capacity / 100 * percent + (capacity % 100 * percent + 99) / 100, HUGE_PAGE_SIZE);
 }
 
@@ -130,46 +132,28 @@ struct FreeBlock
 // 使用 alignas 避免伪共享
 struct alignas(CACHE_LINE_SIZE) Arena
 {
-    enum class Mode : uint64_t { Grow, Closing, Reclaim, Resetting };
-    enum class Request : uint8_t { Idle, Waiting, Granted, Impossible };
-    static constexpr uint64_t PAGE_MASK = (1ULL << 52) - 1;
-    static constexpr uint64_t ACTIVE_UNIT = 1ULL << 52;
-    static constexpr uint64_t ACTIVE_MASK = 511ULL << 52;
-    static constexpr uint64_t PRIORITY = 1ULL << 61;
-    static constexpr uint64_t MODE_MASK = 3ULL << 62;
-    static constexpr uint64_t SEGMENT_PAGES = FIRST_SEGMENT_SIZE / BLOCK_SIZE;
-#ifdef TEST_MODE
-    // Deterministic scheduling points; absent from production builds.
-    inline static void (*after_tree_charge)() = nullptr;
-    inline static void (*after_first_charge)() = nullptr;
-    inline static void (*after_frontier_advance)() = nullptr;
-    inline static void (*before_pending_admission)() = nullptr;
-    inline static void (*before_claim_cas)() = nullptr;
-    inline static void (*after_done)() = nullptr;
-    inline static void (*after_completion_sequence)() = nullptr;
-#endif
-    static constexpr Mode mode(uint64_t word) noexcept { return static_cast<Mode>(word >> 62); }
-    static constexpr uint64_t with_mode(uint64_t word, Mode next) noexcept
-    { return (word & ~MODE_MASK) | (static_cast<uint64_t>(next) << 62); }
-
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> admission_word{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> tree_offset{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> first_offset{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> claim_offset{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> completion_sequence{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> scan_reclaim_goal_pages{0};
-    alignas(CACHE_LINE_SIZE) std::mutex control_mutex;
-    alignas(CACHE_LINE_SIZE) std::atomic<Request> request{ Request::Idle };
-    size_t pending_bytes = 0;
-    char* reserved_result = nullptr;
+    enum class Mode : uint8_t { Grow, Reclaim };
+    struct Waiter {
+        size_t bytes;
+        Waiter* previous = nullptr;
+        Waiter* next = nullptr;
+    };
+    // All mutable ordinary fields below belong to mutex. Descriptor publication
+    // alone is lock-free; it never authorizes reuse of segment storage.
+    std::mutex mutex;
+    uint64_t tree_end = 0, first_begin = 0, claim_cursor = 0;
+    Mode mode = Mode::Grow;
+    Waiter* wait_head = nullptr;
+    Waiter* wait_tail = nullptr;
     bool permanently_frozen = false;
     bool explicit_drain = false;
     bool hard_reclaim = false;
+    std::atomic<bool> reclaim_hint{false};
     std::atomic<MemoryPressure> pressure_hint{MemoryPressure::Normal};
     std::atomic<uint64_t> pressure_generation{0};
-    alignas(CACHE_LINE_SIZE) FreeBlock* central_free_list = nullptr;
-    std::mutex mutex;
-    alignas(CACHE_LINE_SIZE) void* start_addr = nullptr;
+    std::atomic<uint64_t> scan_reclaim_goal_pages{0};
+    FreeBlock* central_free_list = nullptr;
+    void* start_addr = nullptr;
     void* end_addr = nullptr;
     uint64_t capacity = 0;
     size_t low = 0, high = 0;
@@ -179,64 +163,37 @@ struct alignas(CACHE_LINE_SIZE) Arena
     void initialize(uint64_t bytes) noexcept
     {
         capacity = bytes;
-        tree_offset.store(0, std::memory_order_relaxed);
-        first_offset.store(bytes, std::memory_order_relaxed);
-        claim_offset.store(bytes, std::memory_order_relaxed);
-        admission_word.store(bytes / BLOCK_SIZE, std::memory_order_relaxed);
+        tree_end = 0;
+        first_begin = claim_cursor = bytes;
     }
-
-    // Credit is charged before address assignment. The cursor RMW carries the
-    // reclaimed-prefix synchronization when earlier credit holders arrive late.
-    bool try_reserve_tree(uint64_t bytes, uint64_t& offset, bool pending = false) noexcept
+    uint64_t available_tree_bytes(const Waiter* waiter = nullptr) const noexcept
     {
-        const uint64_t pages = bytes / BLOCK_SIZE;
-        uint64_t word = admission_word.load(std::memory_order_acquire);
-        for (;;) {
-            if (!pages || (word & PAGE_MASK) < pages || (!pending && (word & PRIORITY))) return false;
-            uint64_t next = word - pages;
-            if (mode(word) == Mode::Grow && (next & PAGE_MASK) <= low / BLOCK_SIZE)
-                next = with_mode(next, Mode::Closing);
-            if (admission_word.compare_exchange_weak(word, next, std::memory_order_acq_rel, std::memory_order_acquire)) break;
-        }
-#ifdef TEST_MODE
-        if (after_tree_charge) after_tree_charge();
-#endif
-        offset = tree_offset.fetch_add(bytes, std::memory_order_acq_rel);
+        const uint64_t gap = first_begin - tree_end;
+        if (!wait_head || wait_head == waiter) return gap;
+        return gap > wait_head->bytes ? gap - wait_head->bytes : 0;
+    }
+    bool try_reserve_tree(uint64_t bytes, uint64_t& offset, const Waiter* waiter = nullptr) noexcept
+    {
+        if (!bytes || bytes > available_tree_bytes(waiter)) return false;
+        offset = tree_end;
+        tree_end += bytes;
         return true;
     }
-
-    bool try_begin_first(uint64_t& offset) noexcept
+    void enqueue(Waiter& waiter) noexcept
     {
-        uint64_t word = admission_word.load(std::memory_order_acquire);
-        for (;;) {
-            if (mode(word) != Mode::Grow || (word & PRIORITY)
-                || (word & PAGE_MASK) < SEGMENT_PAGES + high / BLOCK_SIZE) return false;
-            if ((word & ACTIVE_MASK) == ACTIVE_MASK) { word = admission_word.load(std::memory_order_acquire); continue; }
-            const uint64_t next = word - SEGMENT_PAGES + ACTIVE_UNIT;
-            if (admission_word.compare_exchange_weak(word, next, std::memory_order_acq_rel, std::memory_order_acquire)) break;
-        }
-#ifdef TEST_MODE
-        if (after_first_charge) after_first_charge();
-#endif
-        offset = first_offset.fetch_sub(FIRST_SEGMENT_SIZE, std::memory_order_relaxed) - FIRST_SEGMENT_SIZE;
-        return true;
+        waiter.previous = wait_tail;
+        waiter.next = nullptr;
+        if (wait_tail) wait_tail->next = &waiter;
+        else wait_head = &waiter;
+        wait_tail = &waiter;
     }
-
-    bool enter_reclaim() noexcept
+    void remove(Waiter& waiter) noexcept
     {
-        uint64_t word = admission_word.load(std::memory_order_acquire);
-        for (;;) {
-            if (mode(word) != Mode::Reclaim || (word & ACTIVE_MASK) == ACTIVE_MASK) return false;
-            if (admission_word.compare_exchange_weak(word, word + ACTIVE_UNIT,
-                std::memory_order_acq_rel, std::memory_order_acquire)) return true;
-        }
-    }
-    void leave_short() noexcept { admission_word.fetch_sub(ACTIVE_UNIT, std::memory_order_release); }
-    void set_mode(Mode next) noexcept
-    {
-        uint64_t word = admission_word.load(std::memory_order_acquire);
-        while (!admission_word.compare_exchange_weak(word, with_mode(word, next),
-            std::memory_order_acq_rel, std::memory_order_acquire)) {}
+        if (waiter.previous) waiter.previous->next = waiter.next;
+        else wait_head = waiter.next;
+        if (waiter.next) waiter.next->previous = waiter.previous;
+        else wait_tail = waiter.previous;
+        waiter.previous = waiter.next = nullptr;
     }
     bool contains(void* ptr) const { return ptr >= start_addr && ptr < end_addr; }
     size_t block_count() const { return capacity / BLOCK_SIZE; }
@@ -288,6 +245,8 @@ struct ThreadLocalCache
     FirstSegmentRef first_ref{};
     unsigned char* first_data = nullptr;
     size_t first_count = 0;
+    int first_rejected_arena = -1;
+    uint64_t first_rejected_generation = 0;
     bool file_started = false;
     uintptr_t file_range_begin = 0;
     size_t file_range_bytes = 0;
@@ -351,14 +310,11 @@ public:
     struct RamReserveResult { RamReserveStatus status; size_t acquired; };
     RamReserveResult try_reserve_ram_pages(std::span<void*> out) noexcept;
     void release_ram_pages(std::span<void* const> pages) noexcept;
+    void clear_scan_reclaim_goals() noexcept;
 
     MemoryPressure pressure(int index) const noexcept
     {
-        const Arena& arena = arenas_[index];
-        const uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-        if ((word & Arena::PRIORITY) || Arena::mode(word) != Arena::Mode::Grow) return MemoryPressure::Hard;
-        const uint64_t gap = (word & Arena::PAGE_MASK) * BLOCK_SIZE;
-        return gap >= arena.high ? MemoryPressure::Normal : gap <= arena.low ? MemoryPressure::Hard : MemoryPressure::Soft;
+        return arenas_[index].pressure_hint.load(std::memory_order_acquire);
     }
     uint64_t pressure_generation(int index) const noexcept { return arenas_[index].pressure_generation.load(std::memory_order_acquire); }
     size_t segment_capacity() const noexcept { return memory_size_ / FIRST_SEGMENT_SIZE; }
@@ -419,8 +375,6 @@ private:
 
     char* bump_allocate_from_arena(Arena& arena, size_t bytes, bool try_only = false);
 
-    FreeBlock* batch_allocate_from_bump(Arena& arena, size_t& out_count, FreeBlock** out_tail, bool try_only);
-
     // 批量归还块到 Arena
     void batch_deallocate_to_arena(Arena& arena, FreeBlock* head, FreeBlock* tail, size_t count);
 
@@ -444,11 +398,10 @@ private:
     RunState* state_;
     std::atomic<bool> spill_service_{false}, first_frozen_{false};
     int node_ids_[MAX_NUMA_NODES]{};
-    void update_pressure(Arena& arena) noexcept; // control_mutex held
+    void update_pressure(Arena& arena) noexcept; // Arena mutex held
     bool begin_first_segment(int index, FirstSegmentRef& ref, unsigned char*& records) noexcept;
     void seal_first_segment(const FirstSegmentRef& ref, size_t count) noexcept;
-    void publish_first_prefix(Arena& arena) noexcept; // Reclaim short protection or exclusive Resetting
-    void service_pending(Arena& arena) noexcept; // control_mutex held
+    bool publish_first_prefix(Arena& arena) noexcept; // Arena mutex held; at most 64 descriptors
     FirstClaimStatus claim_first_in_arena(int index, FirstConsumer consumer, FirstSegmentView& out) noexcept;
     void* wait_allocate(size_t bytes, int preferred = -1);
     void* allocate_small(bool try_only) noexcept;
@@ -542,58 +495,40 @@ inline bool ThreadLocalCache::release(bool try_only)
         return true;
 
     pool->seal_thread_first();
-    // Pool changes are cold, but try allocation must not wait while flushing
-    // an old pool. Acquire everything before modifying the TLS lists.
-    std::unique_lock<std::mutex> locks[MAX_NUMA_NODES];
+    // Transfer one Arena at a time. On a failed try-lock, pages not yet
+    // transferred remain in this cache, still bound to the old pool.
     for (int i = 0; i < pool->num_arenas_; ++i) {
-        locks[i] = std::unique_lock(pool->arenas_[i].mutex, std::defer_lock);
-        if (try_only) { if (!locks[i].try_lock()) return false; }
-        else locks[i].lock();
+        bool local = false;
+        for (auto* block = local_free_stack; block; block = block->next)
+            if (pool->arenas_[i].contains(block)) { local = true; break; }
+        auto& remote = remote_lists[i];
+        if (!local && !remote.head) continue;
+        auto& arena = pool->arenas_[i];
+        std::unique_lock lock(arena.mutex, std::defer_lock);
+        if (try_only) { if (!lock.try_lock()) return false; }
+        else lock.lock();
+        auto** link = &local_free_stack;
+        while (*link) {
+            auto* block = *link;
+            if (!arena.contains(block)) { link = &block->next; continue; }
+            *link = block->next;
+            --local_free_count;
+            block->next = arena.central_free_list;
+            arena.central_free_list = block;
+        }
+        if (remote.head) {
+            auto* tail = remote.head;
+            while (tail->next) tail = tail->next;
+            tail->next = arena.central_free_list;
+            arena.central_free_list = remote.head;
+            remote.head = nullptr;
+            remote.count = 0;
+        }
     }
     std::unique_lock file_lock(pool->file_mutex_, std::defer_lock);
     if (file_free_stack) {
         if (try_only) { if (!file_lock.try_lock()) return false; }
         else file_lock.lock();
-    }
-
-    // 归还本地空闲栈中的所有块
-    while (local_free_stack)
-    {
-        FreeBlock* block = local_free_stack;
-        local_free_stack = block->next;
-        local_free_count--;
-
-        // 直接归还到对应的 Arena
-        int arena_idx = pool->find_arena_index(block);
-        if (arena_idx >= 0 && arena_idx < pool->num_arenas_)
-        {
-            Arena& arena = pool->arenas_[arena_idx];
-            block->next = arena.central_free_list;
-            arena.central_free_list = block;
-        }
-    }
-
-    // 归还所有远程链表中的块
-    for (int i = 0; i < MAX_NUMA_NODES; ++i)
-    {
-        RemoteListHead& rl = remote_lists[i];
-        if (rl.head)
-        {
-            if (i < pool->num_arenas_)
-            {
-                Arena& arena = pool->arenas_[i];
-                // 将整个链表挂到中央空闲链表
-                FreeBlock* tail = rl.head;
-                while (tail->next)
-                {
-                    tail = tail->next;
-                }
-                tail->next = arena.central_free_list;
-                arena.central_free_list = rl.head;
-            }
-            rl.head = nullptr;
-            rl.count = 0;
-        }
     }
 
     if (file_free_stack) {
@@ -607,6 +542,7 @@ inline bool ThreadLocalCache::release(bool try_only)
     file_started = false;
     file_range_begin = 0;
     file_range_bytes = 0;
+    first_rejected_arena = -1;
     pool = nullptr;
     local_arena = nullptr;
     local_arena_index = -1;
@@ -664,6 +600,7 @@ inline ConcurrentMemoryPool::~ConcurrentMemoryPool()
         tls.first_data = nullptr;
         tls.first_count = 0;
         tls.first_ref = {};
+        tls.first_rejected_arena = -1;
         tls.pool = nullptr;
         tls.file_free_stack = nullptr;
         tls.file_free_count = 0;
@@ -1072,12 +1009,26 @@ inline void ConcurrentMemoryPool::perform_first_touch(size_t num_threads)
 
 inline void ConcurrentMemoryPool::update_pressure(Arena& arena) noexcept
 {
-    const uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-    const uint64_t gap = (word & Arena::PAGE_MASK) * BLOCK_SIZE;
-    if (word & Arena::PRIORITY) arena.hard_reclaim = true;
-    else if (gap >= arena.high) arena.hard_reclaim = false;
+    assert(arena.tree_end <= arena.first_begin && arena.first_begin <= arena.claim_cursor
+        && arena.claim_cursor <= arena.capacity);
+    const uint64_t gap = arena.first_begin - arena.tree_end;
+    // Grow above High already has Normal pressure and cleared hysteresis.
+    // Avoid rewriting/rechecking snapshots on ordinary unpressured refills.
+    if (arena.mode == Arena::Mode::Grow && gap >= arena.high && !arena.wait_head
+        && !arena.permanently_frozen && !arena.explicit_drain
+        && !arena.scan_reclaim_goal_pages.load(std::memory_order_acquire)) return;
+    if (gap >= arena.high) arena.hard_reclaim = false;
     else if (gap <= arena.low) arena.hard_reclaim = true;
-    const MemoryPressure next = (word & Arena::PRIORITY) ? MemoryPressure::Hard
+    if (arena.first_begin == arena.capacity) arena.explicit_drain = false;
+    const bool reclaim = arena.permanently_frozen || arena.explicit_drain || arena.wait_head
+        || arena.scan_reclaim_goal_pages.load(std::memory_order_acquire) || arena.hard_reclaim;
+    if (arena.mode == Arena::Mode::Grow && reclaim) arena.mode = Arena::Mode::Reclaim;
+    else if (arena.mode == Arena::Mode::Reclaim && !reclaim && gap >= arena.high
+        && arena.first_begin == arena.claim_cursor) arena.mode = Arena::Mode::Grow;
+    const bool reclaiming = arena.mode == Arena::Mode::Reclaim;
+    if (arena.reclaim_hint.load(std::memory_order_relaxed) != reclaiming)
+        arena.reclaim_hint.store(reclaiming, std::memory_order_release);
+    const MemoryPressure next = arena.mode == Arena::Mode::Reclaim || arena.wait_head ? MemoryPressure::Hard
         : gap >= arena.high ? MemoryPressure::Normal : gap <= arena.low ? MemoryPressure::Hard : MemoryPressure::Soft;
     if (arena.pressure_hint.load(std::memory_order_relaxed) != next) {
         arena.pressure_hint.store(next, std::memory_order_release);
@@ -1085,78 +1036,55 @@ inline void ConcurrentMemoryPool::update_pressure(Arena& arena) noexcept
     }
 }
 
-inline char* ConcurrentMemoryPool::bump_allocate_from_arena(Arena& arena, size_t bytes, bool /*try_only*/)
+inline char* ConcurrentMemoryPool::bump_allocate_from_arena(Arena& arena, size_t bytes, bool try_only)
 {
     if (!bytes || bytes > SIZE_MAX - (BLOCK_SIZE - 1)) return nullptr;
+    std::unique_lock lock(arena.mutex, std::defer_lock);
+    if (try_only) { if (!lock.try_lock()) return nullptr; }
+    else lock.lock();
     uint64_t offset;
     if (!arena.try_reserve_tree(align_up(bytes, BLOCK_SIZE), offset)) return nullptr;
+    update_pressure(arena);
     return static_cast<char*>(arena.start_addr) + offset;
-}
-
-inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, size_t& out_count, FreeBlock** out_tail, bool try_only)
-{
-    const uint64_t available = arena.admission_word.load(std::memory_order_acquire) & Arena::PAGE_MASK;
-    out_count = std::min<uint64_t>(out_count, available);
-    if (!out_count) return nullptr;
-    char* cursor = bump_allocate_from_arena(arena, out_count * BLOCK_SIZE, try_only);
-    if (!cursor) return nullptr;
-    auto* head = reinterpret_cast<FreeBlock*>(cursor);
-    FreeBlock* tail = head;
-    for (size_t i = 1; i < out_count; ++i) {
-        tail->next = reinterpret_cast<FreeBlock*>(cursor + i * BLOCK_SIZE);
-        tail = tail->next;
-    }
-    tail->next = nullptr;
-    *out_tail = tail;
-    return head;
 }
 
 inline size_t ConcurrentMemoryPool::batch_allocate_from_arena(Arena& arena, FreeBlock** out_head, FreeBlock** out_tail, size_t count, bool try_only)
 {
-    FreeBlock* head = nullptr;
-    FreeBlock* tail = nullptr;
-    size_t fetched = 0;
-
+    uint64_t offset = 0;
     {
         std::unique_lock lock(arena.mutex, std::defer_lock);
         if (try_only) { if (!lock.try_lock()) return 0; }
         else lock.lock();
-
-        if (arena.central_free_list)
-        {
-            head = arena.central_free_list;
-            tail = head;
-            fetched = 1;
-
-            while (tail->next && fetched < count)
-            {
-                tail = tail->next;
-                ++fetched;
-            }
-
-            // 更新中央链表
+        if (arena.central_free_list) {
+            auto* head = arena.central_free_list;
+            auto* tail = head;
+            size_t fetched = 1;
+            while (tail->next && fetched < count) { tail = tail->next; ++fetched; }
             arena.central_free_list = tail->next;
             tail->next = nullptr;
+            *out_head = head;
+            *out_tail = tail;
+            return fetched;
         }
+        count = std::min<uint64_t>(count, arena.available_tree_bytes() / BLOCK_SIZE);
+        if (!count) return 0;
+        const bool reserved = arena.try_reserve_tree(count * BLOCK_SIZE, offset);
+        assert(reserved); (void)reserved;
+        update_pressure(arena);
     }
-
-    if (fetched > 0)
-    {
-        *out_head = head;
-        *out_tail = tail;
-        return fetched;
+    // The address range is ours. Faulting and building the chain is outside
+    // the Arena lock, including the first refill's 128 pages.
+    char* cursor = static_cast<char*>(arena.start_addr) + offset;
+    auto* head = reinterpret_cast<FreeBlock*>(cursor);
+    auto* tail = head;
+    for (size_t i = 1; i < count; ++i) {
+        tail->next = reinterpret_cast<FreeBlock*>(cursor + i * BLOCK_SIZE);
+        tail = tail->next;
     }
-
-    size_t bump_count = count;
-    head = batch_allocate_from_bump(arena, bump_count, &tail, try_only);
-    if (!head)
-    {
-        return 0;
-    }
-
+    tail->next = nullptr;
     *out_head = head;
     *out_tail = tail;
-    return bump_count;
+    return count;
 }
 
 inline void ConcurrentMemoryPool::batch_deallocate_to_arena(Arena& arena, FreeBlock* head, FreeBlock* tail, size_t /*count*/)
@@ -1443,35 +1371,43 @@ inline int ConcurrentMemoryPool::arena_for_node(int node) const noexcept
 
 inline size_t ConcurrentMemoryPool::gap_bytes(int index) noexcept
 {
-    return (arenas_[index].admission_word.load(std::memory_order_acquire) & Arena::PAGE_MASK) * BLOCK_SIZE;
+    auto& arena = arenas_[index];
+    std::lock_guard lock(arena.mutex);
+    return arena.first_begin - arena.tree_end;
 }
 
 inline bool ConcurrentMemoryPool::begin_first_segment(int index, FirstSegmentRef& ref, unsigned char*& records) noexcept
 {
     Arena& arena = arenas_[index];
-    uint64_t offset;
-    if (!arena.try_begin_first(offset)) {
+    std::unique_lock lock(arena.mutex);
+    // Protected mutations already refresh mode/pressure. Only the external
+    // Scan demand hint can have changed without this lock.
+    if (arena.scan_reclaim_goal_pages.load(std::memory_order_acquire)) update_pressure(arena);
+    const uint64_t gap = arena.first_begin - arena.tree_end;
+    if (arena.mode != Arena::Mode::Grow || arena.permanently_frozen || arena.wait_head
+        || gap < FIRST_SEGMENT_SIZE || gap - FIRST_SEGMENT_SIZE < arena.high) {
 #ifdef TEST_MODE
-        const auto word = arena.admission_word.load(std::memory_order_relaxed);
-        if (first_frozen_.load(std::memory_order_relaxed)) first_rejected_frozen.fetch_add(1, std::memory_order_relaxed);
-        else if (word & Arena::PRIORITY) first_rejected_tree.fetch_add(1, std::memory_order_relaxed);
+        if (arena.permanently_frozen) first_rejected_frozen.fetch_add(1, std::memory_order_relaxed);
+        else if (arena.wait_head) first_rejected_tree.fetch_add(1, std::memory_order_relaxed);
         else first_rejected_capacity.fetch_add(1, std::memory_order_relaxed);
 #endif
         return false;
     }
+    const uint64_t offset = arena.first_begin - FIRST_SEGMENT_SIZE;
     const uint64_t slot = offset / FIRST_SEGMENT_SIZE;
     auto& descriptor = arena.segments[slot];
-    const uint64_t generation = descriptor.tag.load(std::memory_order_acquire) >> 3;
+    const uint64_t generation = descriptor.tag.load(std::memory_order_relaxed) >> 3;
     if (generation == FirstSegmentDescriptor::MAX_GENERATION) {
-        arena.leave_short();
+        lock.unlock();
         try { throw std::overflow_error("FIRST generation exhausted"); }
         catch (...) { state_->fail(std::current_exception(), "FIRST generation"); }
         return false;
     }
     descriptor.tag.store(FirstSegmentDescriptor::make_tag(generation + 1, FirstSegmentState::Filling), std::memory_order_relaxed);
+    arena.first_begin = arena.claim_cursor = offset;
     ref = {static_cast<uint32_t>(index), slot, generation + 1};
     records = reinterpret_cast<unsigned char*>(descriptor.data);
-    arena.leave_short();
+    update_pressure(arena);
     return true;
 }
 
@@ -1496,7 +1432,30 @@ inline bool ConcurrentMemoryPool::cache_first_record(int index, const unsigned c
         tls.local_arena_index = get_thread_arena_index();
         tls.local_arena = &arenas_[tls.local_arena_index];
     }
-    if (!tls.first_data && !begin_first_segment(index, tls.first_ref, tls.first_data)) return false;
+    if (!tls.first_data) {
+        auto& arena = arenas_[index];
+        // In Grow, only FIRST reclamation can increase the gap; its intervening
+        // Reclaim/Hard transition changes pressure_generation. Remember only
+        // capacity denials, never mutex contention or a Hard-mode rejection.
+        const uint64_t generation = arena.pressure_generation.load(std::memory_order_acquire);
+        if (tls.first_rejected_arena == index && tls.first_rejected_generation == generation) {
+#ifdef TEST_MODE
+            first_rejected_capacity.fetch_add(1, std::memory_order_relaxed);
+#endif
+            return false;
+        }
+        if (!arenas_initialized_.load(std::memory_order_acquire)) return false;
+        if (!begin_first_segment(index, tls.first_ref, tls.first_data)) {
+            if (arena.pressure_hint.load(std::memory_order_acquire) != MemoryPressure::Hard && !state_->failed()) {
+                tls.first_rejected_arena = index;
+                // Snapshot before admission: completion after a denial must
+                // invalidate it, even when it races this TLS bookkeeping.
+                tls.first_rejected_generation = generation;
+            }
+            return false;
+        }
+        tls.first_rejected_arena = -1;
+    }
     std::memcpy(tls.first_data + tls.first_count * kmer_bytes(), record, kmer_bytes());
     if (++tls.first_count == first_segment_record_capacity()) seal_thread_first();
     return true;
@@ -1518,10 +1477,7 @@ inline void ConcurrentMemoryPool::seal_thread_first_if_reclaiming() noexcept
 {
     const auto& tls = tls_cache_;
     if (tls.pool != this || !tls.first_data) return;
-    // Soft pressure does not need this already charged segment. Only its
-    // owner publishes it, including when reclamation starts during a wait.
-    const uint64_t word = arenas_[tls.first_ref.arena_index].admission_word.load(std::memory_order_acquire);
-    if ((word & Arena::PRIORITY) || Arena::mode(word) != Arena::Mode::Grow) seal_thread_first();
+    if (arenas_[tls.first_ref.arena_index].reclaim_hint.load(std::memory_order_acquire)) seal_thread_first();
 }
 
 inline ConcurrentMemoryPool::RamReserveResult ConcurrentMemoryPool::try_reserve_ram_pages(std::span<void*> out) noexcept
@@ -1550,64 +1506,77 @@ inline ConcurrentMemoryPool::RamReserveResult ConcurrentMemoryPool::try_reserve_
         }
     }
     bool busy = false;
+    int reclaim_arena = -1;
     for (int rank = 0; acquired < out.size() && rank < num_arenas_; ++rank) {
-        Arena& arena = arenas_[numa_distance_order_[tls.local_arena_index][rank]];
+        const int index = numa_distance_order_[tls.local_arena_index][rank];
+        Arena& arena = arenas_[index];
+        uint64_t offset = 0;
+        size_t count = 0;
         {
-            std::unique_lock central(arena.mutex, std::try_to_lock);
-            if (!central) { busy = true; continue; }
+            std::unique_lock lock(arena.mutex, std::try_to_lock);
+            if (!lock) { busy = true; continue; }
             while (acquired < out.size() && arena.central_free_list) {
                 auto* page = arena.central_free_list;
                 arena.central_free_list = page->next;
                 out[acquired++] = page;
             }
+            count = std::min<uint64_t>(out.size() - acquired, arena.available_tree_bytes() / BLOCK_SIZE);
+            if (count) {
+                const bool reserved = arena.try_reserve_tree(count * BLOCK_SIZE, offset);
+                assert(reserved); (void)reserved;
+                update_pressure(arena);
+            }
+            if (reclaim_arena < 0 && arena.first_begin < arena.capacity) reclaim_arena = index;
         }
-        if (acquired == out.size()) break;
-        const uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-        if (word & Arena::PRIORITY) { busy = true; continue; }
-        const size_t count = std::min<uint64_t>(out.size() - acquired, word & Arena::PAGE_MASK);
-        uint64_t offset;
-        if (count && arena.try_reserve_tree(count * BLOCK_SIZE, offset)) {
-            for (size_t i = 0; i < count; ++i) out[acquired++] = static_cast<char*>(arena.start_addr) + offset + i * BLOCK_SIZE;
-        } else if (count) busy = true;
+        for (size_t i = 0; i < count; ++i)
+            out[acquired++] = static_cast<char*>(arena.start_addr) + offset + i * BLOCK_SIZE;
     }
     if (acquired == out.size()) {
-        for (int i = 0; i < num_arenas_; ++i) {
-            uint64_t goal = arenas_[i].scan_reclaim_goal_pages.load(std::memory_order_relaxed);
-            if (goal) arenas_[i].scan_reclaim_goal_pages.compare_exchange_strong(goal, 0, std::memory_order_release, std::memory_order_relaxed);
-        }
+        clear_scan_reclaim_goals();
         return {RamReserveStatus::Ready, acquired};
     }
-    if (busy) return {RamReserveStatus::Busy, acquired};
-    // This is a progress hint only. Other scanners retry their true deficit;
-    // clearing/coalescing this hint never authorizes memory reuse or completion.
-    for (int rank = 0; rank < num_arenas_; ++rank) {
-        auto& arena = arenas_[numa_distance_order_[tls.local_arena_index][rank]];
-        if (arena.first_offset.load(std::memory_order_acquire) == arena.capacity) continue;
-        uint64_t goal = arena.scan_reclaim_goal_pages.load(std::memory_order_relaxed);
-        const uint64_t need = out.size() - acquired;
-        while (goal < need && !arena.scan_reclaim_goal_pages.compare_exchange_weak(goal, need,
-            std::memory_order_release, std::memory_order_relaxed)) {}
-        break;
+    const uint64_t need = out.size() - acquired;
+    // Update an existing deficit even on Busy; an incomplete resource check
+    // cannot create a new reclaim request. These atomics grant no ownership.
+    for (int i = 0; i < num_arenas_; ++i) {
+        if (arenas_[i].scan_reclaim_goal_pages.load(std::memory_order_relaxed))
+            arenas_[i].scan_reclaim_goal_pages.store(need, std::memory_order_release);
     }
+    if (busy) return {RamReserveStatus::Busy, acquired};
+    if (reclaim_arena >= 0) arenas_[reclaim_arena].scan_reclaim_goal_pages.store(need, std::memory_order_release);
     return {RamReserveStatus::NeedReclaim, acquired};
+}
+
+inline void ConcurrentMemoryPool::clear_scan_reclaim_goals() noexcept
+{
+    for (int i = 0; i < num_arenas_; ++i)
+        arenas_[i].scan_reclaim_goal_pages.store(0, std::memory_order_release);
 }
 
 inline void ConcurrentMemoryPool::release_ram_pages(std::span<void* const> pages) noexcept
 {
-    for (void* page : pages) deallocate(page);
+    FreeBlock* heads[MAX_NUMA_NODES]{};
+    FreeBlock* tails[MAX_NUMA_NODES]{};
+    for (void* page : pages) {
+        if (!page) continue;
+        const int index = find_arena_index(page);
+        assert(index >= 0);
+        auto* block = static_cast<FreeBlock*>(page);
+        block->next = heads[index];
+        heads[index] = block;
+        if (!tails[index]) tails[index] = block;
+    }
+    for (int i = 0; i < num_arenas_; ++i)
+        if (heads[i]) batch_deallocate_to_arena(arenas_[i], heads[i], tails[i], 0);
 }
 
 inline void ConcurrentMemoryPool::freeze_first()
 {
     for (int i = 0; i < num_arenas_; ++i) {
         auto& arena = arenas_[i];
-        {
-            std::lock_guard lock(arena.control_mutex);
-            arena.permanently_frozen = true;
-            const auto word = arena.admission_word.load(std::memory_order_acquire);
-            if (Arena::mode(word) == Arena::Mode::Grow) arena.set_mode(Arena::Mode::Closing);
-        }
-        poll_first_progress(i);
+        std::lock_guard lock(arena.mutex);
+        arena.permanently_frozen = true;
+        update_pressure(arena);
     }
     first_frozen_.store(true, std::memory_order_release);
 }
@@ -1621,164 +1590,78 @@ inline void ConcurrentMemoryPool::request_first_drain()
 #endif
     for (int i = 0; i < num_arenas_; ++i) {
         auto& arena = arenas_[i];
-        {
-            std::lock_guard lock(arena.control_mutex);
-            arena.explicit_drain = true;
-            if (Arena::mode(arena.admission_word.load(std::memory_order_acquire)) == Arena::Mode::Grow)
-                arena.set_mode(Arena::Mode::Closing);
-        }
-        poll_first_progress(i);
+        std::lock_guard lock(arena.mutex);
+        arena.explicit_drain = true;
+        update_pressure(arena);
     }
 }
 
-inline void ConcurrentMemoryPool::publish_first_prefix(Arena& arena) noexcept
+inline bool ConcurrentMemoryPool::publish_first_prefix(Arena& arena) noexcept
 {
-    uint64_t first = arena.first_offset.load(std::memory_order_acquire);
-    for (;;) {
-        const uint64_t limit = arena.claim_offset.load(std::memory_order_acquire);
-        uint64_t end = first;
-        while (end < limit && FirstSegmentDescriptor::state(arena.segments[end / FIRST_SEGMENT_SIZE].tag.load(
-            std::memory_order_acquire)) == FirstSegmentState::Done) end += FIRST_SEGMENT_SIZE;
-        if (end == first) return;
-        // Acquire the preceding publisher as credit can be spent on any part of
-        // the continuous prefix, including its earlier, not-yet-refunded part.
-        if (arena.first_offset.compare_exchange_weak(first, end, std::memory_order_acq_rel, std::memory_order_acquire)) {
-#ifdef TEST_MODE
-            if (Arena::after_frontier_advance) Arena::after_frontier_advance();
-#endif
-            arena.admission_word.fetch_add((end - first) / BLOCK_SIZE, std::memory_order_release);
-#ifdef TEST_MODE
-            returned_bytes.fetch_add(end - first, std::memory_order_relaxed);
-#endif
-            return;
-        }
+    const uint64_t first = arena.first_begin;
+    size_t checked = 0;
+    while (arena.first_begin < arena.claim_cursor && checked++ < 64) {
+        auto& descriptor = arena.segments[arena.first_begin / FIRST_SEGMENT_SIZE];
+        const uint64_t tag = descriptor.tag.load(std::memory_order_relaxed);
+        if (FirstSegmentDescriptor::state(tag) != FirstSegmentState::Done) break;
+        descriptor.tag.store(FirstSegmentDescriptor::make_tag(tag >> 3, FirstSegmentState::Retired), std::memory_order_relaxed);
+        arena.first_begin += FIRST_SEGMENT_SIZE;
     }
-}
-
-inline void ConcurrentMemoryPool::service_pending(Arena& arena) noexcept
-{
-    if (arena.request.load(std::memory_order_relaxed) != Arena::Request::Waiting) return;
-    uint64_t offset;
-    if (arena.try_reserve_tree(arena.pending_bytes, offset, true)) {
-        arena.reserved_result = static_cast<char*>(arena.start_addr) + offset;
-        arena.request.store(Arena::Request::Granted, std::memory_order_release);
-        arena.admission_word.fetch_and(~Arena::PRIORITY, std::memory_order_acq_rel);
-    } else {
-        // Read the frontier before the word: an acquire frontier publication
-        // also makes its earlier short-operation entry visible in the word.
-        const uint64_t first = arena.first_offset.load(std::memory_order_acquire);
-        const uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-        if (first == arena.capacity && !(word & Arena::ACTIVE_MASK)
-            && (word & Arena::PAGE_MASK) < arena.pending_bytes / BLOCK_SIZE) {
-            arena.request.store(Arena::Request::Impossible, std::memory_order_release);
-            arena.admission_word.fetch_and(~Arena::PRIORITY, std::memory_order_acq_rel);
-        }
-    }
+#ifdef TEST_MODE
+    returned_bytes.fetch_add(arena.first_begin - first, std::memory_order_relaxed);
+#else
+    (void)first;
+#endif
+    update_pressure(arena);
+    return arena.first_begin < arena.claim_cursor && checked > 64;
 }
 
 inline void ConcurrentMemoryPool::poll_first_progress(int index) noexcept
 {
     Arena& arena = arenas_[index];
-    std::unique_lock control(arena.control_mutex, std::try_to_lock);
-    if (!control) return;
-    update_pressure(arena);
-    uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-    auto mode = Arena::mode(word);
-    if (mode == Arena::Mode::Grow && (arena.permanently_frozen || arena.explicit_drain || arena.hard_reclaim
-        || (word & Arena::PRIORITY) || arena.scan_reclaim_goal_pages.load(std::memory_order_acquire))) {
-        arena.set_mode(Arena::Mode::Closing);
-        mode = Arena::Mode::Closing;
-    }
-    if (mode == Arena::Mode::Closing) {
-        if (arena.admission_word.load(std::memory_order_acquire) & Arena::ACTIVE_MASK) return;
-        arena.claim_offset.store(arena.first_offset.load(std::memory_order_acquire), std::memory_order_relaxed);
-        arena.set_mode(Arena::Mode::Reclaim);
-        mode = Arena::Mode::Reclaim;
-    }
-    if (mode == Arena::Mode::Reclaim) {
-        if (arena.enter_reclaim()) { publish_first_prefix(arena); arena.leave_short(); }
-        service_pending(arena);
-        word = arena.admission_word.load(std::memory_order_acquire);
-        const bool empty = arena.first_offset.load(std::memory_order_acquire) == arena.capacity;
-        if (empty || (!arena.permanently_frozen && !(word & Arena::PRIORITY)
-            && (word & Arena::PAGE_MASK) >= arena.high / BLOCK_SIZE
-            && arena.claim_offset.load(std::memory_order_acquire) == arena.first_offset.load(std::memory_order_acquire))) {
-            arena.set_mode(Arena::Mode::Resetting);
-            mode = Arena::Mode::Resetting;
-        }
-    }
-    if (mode == Arena::Mode::Resetting) {
-        if (arena.admission_word.load(std::memory_order_acquire) & Arena::ACTIVE_MASK) return;
-        publish_first_prefix(arena);
-        service_pending(arena);
-        if (arena.first_offset.load(std::memory_order_acquire) == arena.capacity) {
-            arena.explicit_drain = false;
-            arena.scan_reclaim_goal_pages.store(0, std::memory_order_release);
-        }
-        word = arena.admission_word.load(std::memory_order_acquire);
-        for (;;) {
-            const bool grow = !arena.permanently_frozen && !arena.explicit_drain && !(word & Arena::PRIORITY)
-                && (word & Arena::PAGE_MASK) >= arena.high / BLOCK_SIZE
-                && arena.claim_offset.load(std::memory_order_relaxed) == arena.first_offset.load(std::memory_order_relaxed);
-            const uint64_t next = Arena::with_mode(word, grow ? Arena::Mode::Grow : Arena::Mode::Reclaim);
-            if (arena.admission_word.compare_exchange_weak(word, next, std::memory_order_acq_rel, std::memory_order_acquire)) break;
-        }
-    }
-    update_pressure(arena);
+    if (!arena.reclaim_hint.load(std::memory_order_acquire)
+        && !arena.scan_reclaim_goal_pages.load(std::memory_order_acquire)) return;
+    std::unique_lock lock(arena.mutex, std::try_to_lock);
+    if (lock) update_pressure(arena);
 }
 
 inline ConcurrentMemoryPool::FirstClaimStatus ConcurrentMemoryPool::claim_first_in_arena(
     int index, FirstConsumer consumer, FirstSegmentView& out) noexcept
 {
     Arena& arena = arenas_[index];
-    poll_first_progress(index);
-    std::unique_lock control(arena.control_mutex, std::defer_lock);
+    // All protected causes of Reclaim publish the hint before unlocking.
+    // A quiet Grow Arena needs no consumer-side mutex traffic.
+    if (!arena.reclaim_hint.load(std::memory_order_acquire)
+        && !arena.scan_reclaim_goal_pages.load(std::memory_order_acquire)) return FirstClaimStatus::Busy;
+    std::unique_lock lock(arena.mutex, std::try_to_lock);
+    if (!lock) return FirstClaimStatus::Busy;
+    update_pressure(arena);
+    if (arena.mode != Arena::Mode::Reclaim || arena.claim_cursor == arena.capacity) return FirstClaimStatus::Busy;
     if (consumer == FirstConsumer::Spill) {
-        if (!control.try_lock()) return FirstClaimStatus::Busy;
-        update_pressure(arena);
-    }
-    if (!arena.enter_reclaim()) return FirstClaimStatus::Busy;
-    bool claimed = false;
-    uint64_t cursor = arena.claim_offset.load(std::memory_order_acquire);
-    for (;;) {
-        if (cursor >= arena.capacity) break;
-        if (consumer == FirstConsumer::Spill && !arena.explicit_drain) {
-            const uint64_t word = arena.admission_word.load(std::memory_order_acquire);
-            // Frozen FIRST cannot grow again. Refill hysteresis only serves
-            // input admission; scanning needs spill only for an actual deficit.
-            uint64_t goal = arena.hard_reclaim && !arena.permanently_frozen ? arena.high / BLOCK_SIZE : 0;
-            if (arena.request.load(std::memory_order_relaxed) == Arena::Request::Waiting)
-                goal = std::max<uint64_t>(goal, arena.pending_bytes / BLOCK_SIZE);
-            goal = std::max(goal, arena.scan_reclaim_goal_pages.load(std::memory_order_acquire));
-            const uint64_t first = arena.first_offset.load(std::memory_order_acquire);
-            const uint64_t claimed_end = arena.claim_offset.load(std::memory_order_acquire);
-            const uint64_t projected = (word & Arena::PAGE_MASK) + (claimed_end - first) / BLOCK_SIZE;
-            if (!goal || projected >= goal) break;
+        if (!spill_service_.load(std::memory_order_acquire)) return FirstClaimStatus::Busy;
+        if (!arena.explicit_drain) {
+            const uint64_t protected_bytes = arena.wait_head ? arena.wait_head->bytes : 0;
+            uint64_t goal = arena.hard_reclaim && !arena.permanently_frozen ? arena.high : 0;
+            goal = std::max(goal, protected_bytes);
+            const uint64_t scan_pages = arena.scan_reclaim_goal_pages.load(std::memory_order_acquire);
+            if (scan_pages) goal = std::max(goal, protected_bytes + scan_pages * BLOCK_SIZE);
+            const uint64_t projected_gap = arena.first_begin - arena.tree_end + arena.claim_cursor - arena.first_begin;
+            if (!goal || projected_gap >= goal) return FirstClaimStatus::Busy;
         }
-        auto& descriptor = arena.segments[cursor / FIRST_SEGMENT_SIZE];
-        const uint64_t tag = descriptor.tag.load(std::memory_order_acquire);
-        if (FirstSegmentDescriptor::state(tag) != FirstSegmentState::Sealed) break;
-#ifdef TEST_MODE
-        if (Arena::before_claim_cas) Arena::before_claim_cas();
-#endif
-        const uint64_t ticket = cursor;
-        if (!arena.claim_offset.compare_exchange_weak(cursor, ticket + FIRST_SEGMENT_SIZE,
-            std::memory_order_acq_rel, std::memory_order_acquire)) continue;
-        const auto state = consumer == FirstConsumer::Spill ? FirstSegmentState::Spilling : FirstSegmentState::Scanning;
-        uint64_t expected = tag;
-        const bool changed = descriptor.tag.compare_exchange_strong(expected,
-            FirstSegmentDescriptor::make_tag(tag >> 3, state), std::memory_order_acq_rel, std::memory_order_acquire);
-        assert(changed); (void)changed;
-        out = {{static_cast<uint32_t>(index), ticket / FIRST_SEGMENT_SIZE, tag >> 3},
-            reinterpret_cast<const unsigned char*>(descriptor.data), static_cast<size_t>(descriptor.record_count), consumer};
-        claimed = true;
-#ifdef TEST_MODE
-        if (consumer == FirstConsumer::Spill) spill_claims.fetch_add(1, std::memory_order_relaxed);
-#endif
-        break;
     }
-    arena.leave_short();
-    return claimed ? FirstClaimStatus::Data : FirstClaimStatus::Busy;
+    const uint64_t cursor = arena.claim_cursor;
+    auto& descriptor = arena.segments[cursor / FIRST_SEGMENT_SIZE];
+    const uint64_t tag = descriptor.tag.load(std::memory_order_acquire);
+    if (FirstSegmentDescriptor::state(tag) != FirstSegmentState::Sealed) return FirstClaimStatus::Busy;
+    const auto state = consumer == FirstConsumer::Spill ? FirstSegmentState::Spilling : FirstSegmentState::Scanning;
+    descriptor.tag.store(FirstSegmentDescriptor::make_tag(tag >> 3, state), std::memory_order_relaxed);
+    arena.claim_cursor += FIRST_SEGMENT_SIZE;
+    out = {{static_cast<uint32_t>(index), cursor / FIRST_SEGMENT_SIZE, tag >> 3},
+        reinterpret_cast<const unsigned char*>(descriptor.data), static_cast<size_t>(descriptor.record_count), consumer};
+#ifdef TEST_MODE
+    if (consumer == FirstConsumer::Spill) spill_claims.fetch_add(1, std::memory_order_relaxed);
+#endif
+    return FirstClaimStatus::Data;
 }
 
 inline ConcurrentMemoryPool::FirstClaimStatus ConcurrentMemoryPool::try_claim_first(
@@ -1789,7 +1672,14 @@ inline ConcurrentMemoryPool::FirstClaimStatus ConcurrentMemoryPool::try_claim_fi
         const int index = numa_distance_order_[preferred][rank];
         if (claim_first_in_arena(index, consumer, out) == FirstClaimStatus::Data) return FirstClaimStatus::Data;
     }
-    return first_frozen_.load(std::memory_order_acquire) && first_empty() ? FirstClaimStatus::Done : FirstClaimStatus::Busy;
+    if (!first_frozen_.load(std::memory_order_acquire)) return FirstClaimStatus::Busy;
+    // Final emptiness checking is also nonblocking, including an empty Arena.
+    for (int i = 0; i < num_arenas_; ++i) {
+        auto& arena = arenas_[i];
+        std::unique_lock lock(arena.mutex, std::try_to_lock);
+        if (!lock || arena.first_begin != arena.capacity) return FirstClaimStatus::Busy;
+    }
+    return FirstClaimStatus::Done;
 }
 
 inline bool ConcurrentMemoryPool::complete_first(const FirstSegmentView& view) noexcept
@@ -1798,28 +1688,24 @@ inline bool ConcurrentMemoryPool::complete_first(const FirstSegmentView& view) n
     if (ref.arena_index >= static_cast<uint32_t>(num_arenas_) || ref.segment_index >= arenas_[ref.arena_index].segment_capacity
         || !ref.generation || ref.generation > FirstSegmentDescriptor::MAX_GENERATION) return false;
     Arena& arena = arenas_[ref.arena_index];
+    std::unique_lock lock(arena.mutex);
     auto& descriptor = arena.segments[ref.segment_index];
     const auto state = view.consumer == FirstConsumer::Spill ? FirstSegmentState::Spilling : FirstSegmentState::Scanning;
-    uint64_t expected = FirstSegmentDescriptor::make_tag(ref.generation, state);
-    if (!descriptor.tag.compare_exchange_strong(expected, FirstSegmentDescriptor::make_tag(ref.generation, FirstSegmentState::Done),
-        std::memory_order_release, std::memory_order_relaxed)) return false;
-#ifdef TEST_MODE
-    if (Arena::after_done) Arena::after_done();
-#endif
-    arena.completion_sequence.fetch_add(1, std::memory_order_acq_rel);
-#ifdef TEST_MODE
-    if (Arena::after_completion_sequence) Arena::after_completion_sequence();
-#endif
-    if (arena.enter_reclaim()) { publish_first_prefix(arena); arena.leave_short(); }
+    if (descriptor.tag.load(std::memory_order_relaxed) != FirstSegmentDescriptor::make_tag(ref.generation, state)) return false;
+    descriptor.tag.store(FirstSegmentDescriptor::make_tag(ref.generation, FirstSegmentState::Done), std::memory_order_relaxed);
+    while (publish_first_prefix(arena)) {
+        lock.unlock();
+        lock.lock();
+    }
     return true;
 }
 
 inline bool ConcurrentMemoryPool::first_empty() noexcept
 {
     for (int i = 0; i < num_arenas_; ++i) {
-        const auto& arena = arenas_[i];
-        if (arena.first_offset.load(std::memory_order_acquire) != arena.capacity) return false;
-        if (arena.admission_word.load(std::memory_order_acquire) & Arena::ACTIVE_MASK) return false;
+        auto& arena = arenas_[i];
+        std::lock_guard lock(arena.mutex);
+        if (arena.first_begin != arena.capacity) return false;
     }
     return true;
 }
@@ -1835,7 +1721,10 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
 {
     state_->check();
     if (!bytes || bytes > SIZE_MAX - (BLOCK_SIZE - 1)) throw std::bad_alloc();
-    if (void* result = try_allocate_large(bytes)) return result;
+    if (!prepare_tls()) throw std::bad_alloc();
+    const int local = get_thread_arena_index();
+    for (int rank = 0; rank < num_arenas_; ++rank)
+        if (void* result = bump_allocate_from_arena(arenas_[numa_distance_order_[local][rank]], bytes)) return result;
     return wait_allocate(bytes);
 }
 
@@ -1846,7 +1735,7 @@ inline void* ConcurrentMemoryPool::wait_allocate(size_t bytes, int preferred)
     bytes = align_up(bytes, BLOCK_SIZE);
     const int local = preferred >= 0 ? preferred : get_thread_arena_index();
     int admitted = -1;
-    uint32_t impossible_arenas = 0;
+    Arena::Waiter waiter{bytes};
     SpinBackoff<> backoff;
 #ifdef TEST_MODE
     allocation_waits.fetch_add(1, std::memory_order_relaxed);
@@ -1866,77 +1755,71 @@ inline void* ConcurrentMemoryPool::wait_allocate(size_t bytes, int preferred)
     try {
         for (;;) {
             state_->check();
-            if (admitted >= 0) {
-                poll_first_progress(admitted);
-                Arena& arena = arenas_[admitted];
-                const auto request = arena.request.load(std::memory_order_acquire);
-                if (request == Arena::Request::Granted || request == Arena::Request::Impossible
-                    || !spill_service_.load(std::memory_order_acquire)) {
-                    std::lock_guard lock(arena.control_mutex);
-                    const auto current = arena.request.load(std::memory_order_acquire);
-                    char* result = current == Arena::Request::Granted ? arena.reserved_result : nullptr;
-                    arena.reserved_result = nullptr;
-                    arena.pending_bytes = 0;
-                    arena.request.store(Arena::Request::Idle, std::memory_order_release);
-                    arena.admission_word.fetch_and(~Arena::PRIORITY, std::memory_order_acq_rel);
-                    if (current == Arena::Request::Impossible) impossible_arenas |= 1u << admitted;
-                    admitted = -1;
-                    if (result) return result;
-                    if (preferred >= 0) throw std::bad_alloc();
-                    if (current == Arena::Request::Impossible) continue;
-                    break;
-                }
-            } else {
-                if (preferred < 0 && bytes == BLOCK_SIZE)
-                    if (void* result = allocate_small(false)) return result;
-                bool possible = false;
-                for (int rank = 0; rank < (preferred >= 0 ? 1 : num_arenas_); ++rank) {
-                    const int candidate = preferred >= 0 ? preferred : numa_distance_order_[local][rank];
-                    if (impossible_arenas & (1u << candidate)) continue;
-                    poll_first_progress(candidate);
-                    Arena& arena = arenas_[candidate];
-                    std::unique_lock lock(arena.control_mutex);
+            int candidate_to_wait = -1;
+            void* result = nullptr;
+            for (int rank = 0; rank < (preferred >= 0 ? 1 : num_arenas_); ++rank) {
+                const int candidate = preferred >= 0 ? preferred : numa_distance_order_[local][rank];
+                Arena& arena = arenas_[candidate];
+                std::unique_lock lock(arena.mutex);
+                // Independent free pages do not consume FIFO's continuous gap.
+                if (preferred < 0 && bytes == BLOCK_SIZE && arena.central_free_list) {
+                    auto* page = arena.central_free_list;
+                    arena.central_free_list = page->next;
+                    result = page;
+                } else {
                     uint64_t offset;
-                    if (arena.try_reserve_tree(bytes, offset)) return static_cast<char*>(arena.start_addr) + offset;
-#ifdef TEST_MODE
-                    if (Arena::before_pending_admission) Arena::before_pending_admission();
-#endif
-                    // Grow may move FIRST between separate frontier/word reads.
-                    // Only this monotone upper bound can reject before closing
-                    // growth. Precise credit exhaustion is decided by the
-                    // registered request in Reclaim, after short entries drain.
-                    if (bytes > arena.capacity - arena.tree_offset.load(std::memory_order_acquire)) continue;
-                    possible = true;
-                    if (spill_service_.load(std::memory_order_acquire) && arena.request.load(std::memory_order_relaxed) == Arena::Request::Idle) {
-                        arena.pending_bytes = bytes;
-                        arena.reserved_result = nullptr;
-                        arena.admission_word.fetch_or(Arena::PRIORITY, std::memory_order_acq_rel);
-                        arena.request.store(Arena::Request::Waiting, std::memory_order_release);
-                        if (Arena::mode(arena.admission_word.load(std::memory_order_acquire)) == Arena::Mode::Grow)
-                            arena.set_mode(Arena::Mode::Closing);
-                        admitted = candidate;
-                        break;
-                    }
+                    if (arena.try_reserve_tree(bytes, offset, candidate == admitted ? &waiter : nullptr))
+                        result = static_cast<char*>(arena.start_addr) + offset;
                 }
-                if (admitted >= 0) continue;
-                if (!possible || !spill_service_.load(std::memory_order_acquire)) {
-                    if (preferred >= 0) throw std::bad_alloc();
+                if (result) {
+                    if (candidate == admitted) { arena.remove(waiter); admitted = -1; }
+                    update_pressure(arena);
                     break;
                 }
+                const bool possible = bytes <= arena.capacity - arena.tree_end
+                    && (arena.first_begin < arena.capacity || arena.first_begin - arena.tree_end >= bytes);
+                if (candidate == admitted && (!possible || !spill_service_.load(std::memory_order_acquire))) {
+                    arena.remove(waiter);
+                    admitted = -1;
+                    update_pressure(arena);
+                }
+                if (candidate_to_wait < 0 && possible) candidate_to_wait = candidate;
+            }
+            if (result) {
+                if (admitted >= 0) {
+                    auto& arena = arenas_[admitted];
+                    std::lock_guard lock(arena.mutex);
+                    arena.remove(waiter);
+                    update_pressure(arena);
+                }
+                return result;
+            }
+            if (!spill_service_.load(std::memory_order_acquire) || candidate_to_wait < 0) break;
+            if (admitted < 0) {
+                auto& arena = arenas_[candidate_to_wait];
+                std::lock_guard lock(arena.mutex);
+                arena.enqueue(waiter);
+                admitted = candidate_to_wait;
+                update_pressure(arena);
             }
             backoff.backoff();
         }
     } catch (...) {
         if (admitted >= 0) {
             Arena& arena = arenas_[admitted];
-            std::lock_guard lock(arena.control_mutex);
-            arena.pending_bytes = 0;
-            arena.reserved_result = nullptr;
-            arena.request.store(Arena::Request::Idle, std::memory_order_release);
-            arena.admission_word.fetch_and(~Arena::PRIORITY, std::memory_order_acq_rel);
+            std::lock_guard lock(arena.mutex);
+            arena.remove(waiter);
+            update_pressure(arena);
         }
         throw;
     }
+    if (admitted >= 0) {
+        Arena& arena = arenas_[admitted];
+        std::lock_guard lock(arena.mutex);
+        arena.remove(waiter);
+        update_pressure(arena);
+    }
+    if (preferred >= 0) throw std::bad_alloc();
     // A freed page may have arrived while the pending request was being closed.
     if (preferred < 0 && bytes == BLOCK_SIZE)
         if (void* result = allocate_small(false)) return result;

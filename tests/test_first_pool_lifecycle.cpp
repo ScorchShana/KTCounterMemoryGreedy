@@ -19,15 +19,16 @@ struct ConcurrentMemoryPoolTestAccess
         pool.seal_first_segment({0, static_cast<uint64_t>(slot), segment->tag.load() >> 3}, pool.first_segment_record_capacity());
     }
     static size_t pending(ConcurrentMemoryPool& pool) {
-        std::lock_guard lock(pool.arenas_[0].control_mutex);
-        return pool.arenas_[0].pending_bytes;
+        std::lock_guard lock(pool.arenas_[0].mutex);
+        return pool.arenas_[0].wait_head ? pool.arenas_[0].wait_head->bytes : 0;
     }
     static Arena& arena(ConcurrentMemoryPool& pool) { return pool.arenas_[0]; }
     static void pressure(ConcurrentMemoryPool& pool, size_t gap, bool pending) {
         auto& arena = pool.arenas_[0];
-        std::lock_guard lock(arena.control_mutex);
-        arena.tree_offset.store(arena.first_offset.load() - gap);
-        arena.admission_word.store(gap / BLOCK_SIZE | (pending ? Arena::PRIORITY : 0));
+        std::lock_guard lock(arena.mutex);
+        arena.tree_end = arena.first_begin - gap;
+        static Arena::Waiter waiter{BLOCK_SIZE};
+        arena.wait_head = arena.wait_tail = pending ? &waiter : nullptr;
         pool.update_pressure(arena);
     }
 };
@@ -38,6 +39,7 @@ static void check_publication_without_progress_lock()
     ConcurrentMemoryPool pool(16ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(pool);
     pool.init_arenas();
+    pool.set_spill_service(true);
     std::vector<unsigned char> records(FIRST_SEGMENT_SIZE, 0x37);
     std::unique_lock held(pool.run_state().mutex);
     std::promise<void> published;
@@ -58,6 +60,7 @@ static void check_pressure_transitions()
     ConcurrentMemoryPool pool(64ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(pool);
     pool.init_arenas();
+    pool.set_spill_service(true);
     auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool);
     const auto generation = pool.pressure_generation(0);
     struct Case { size_t gap; bool pending; MemoryPressure pressure; bool reclaim; uint64_t changes; };
@@ -67,10 +70,10 @@ static void check_pressure_transitions()
         Case{arena.high - BLOCK_SIZE, false, MemoryPressure::Soft, false, 1},
         Case{arena.low, false, MemoryPressure::Hard, true, 2},
         Case{arena.low, false, MemoryPressure::Hard, true, 2},
-        Case{arena.low + BLOCK_SIZE, false, MemoryPressure::Soft, true, 3},
-        Case{arena.high, false, MemoryPressure::Normal, false, 4},
-        Case{arena.high, true, MemoryPressure::Hard, true, 5},
-        Case{arena.high, false, MemoryPressure::Normal, false, 6}}) {
+        Case{arena.low + BLOCK_SIZE, false, MemoryPressure::Hard, true, 2},
+        Case{arena.high, false, MemoryPressure::Normal, false, 3},
+        Case{arena.high, true, MemoryPressure::Hard, false, 4},
+        Case{arena.high, false, MemoryPressure::Normal, false, 5}}) {
         ConcurrentMemoryPoolTestAccess::pressure(pool, item.gap, item.pending);
         require(pool.pressure(0) == item.pressure && arena.hard_reclaim == item.reclaim,
             "pressure threshold or reclaim hysteresis changed");
@@ -85,6 +88,7 @@ static void check_writer_observes_publication()
     ConcurrentMemoryPool pool(16ULL << 20, &state);
     ConcurrentMemoryPoolTestAccess::single(pool);
     pool.init_arenas();
+    pool.set_spill_service(true);
     auto* segment = ConcurrentMemoryPoolTestAccess::filling(pool);
     std::memset(segment->data, 0x37, FIRST_SEGMENT_SIZE);
     ConcurrentMemoryPool::FirstSegmentView ref;
@@ -100,7 +104,7 @@ static void check_writer_observes_publication()
     require(pool.complete_first(ref), "spill completion rejected");
     require(pool.gap_bytes(0) == gap + FIRST_SEGMENT_SIZE, "return waited for an internal segment");
     // Pause publication again so Writer must poll without a progress notification.
-    { std::lock_guard lock(ConcurrentMemoryPoolTestAccess::arena(pool).control_mutex); segment->tag.store(FirstSegmentDescriptor::make_tag(segment->tag.load() >> 3, FirstSegmentState::Filling)); }
+    { std::lock_guard lock(ConcurrentMemoryPoolTestAccess::arena(pool).mutex); segment->tag.store(FirstSegmentDescriptor::make_tag(segment->tag.load() >> 3, FirstSegmentState::Filling)); }
     // Only FIRST spill is used; no ordinary Export block is published.
     RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> queue(BLOCK_SIZE, 1);
     const auto path = std::filesystem::temp_directory_path() / ("first-poll-" + std::to_string(getpid()));
@@ -165,7 +169,18 @@ int main()
         require(pool.try_allocate_large(BLOCK_SIZE) == nullptr, "bump stole pending request space");
         require(!cache_full_first(pool, 0, records.data()), "FIRST grew during pending request");
         ConcurrentMemoryPool::FirstSegmentView spill;
-        require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, spill) == ConcurrentMemoryPool::FirstClaimStatus::Data, "writer could not claim frontier");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        auto claim = ConcurrentMemoryPool::FirstClaimStatus::Busy;
+        while (std::chrono::steady_clock::now() < deadline) {
+            claim = pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, spill);
+            if (claim == ConcurrentMemoryPool::FirstClaimStatus::Data) break;
+            backoff.backoff();
+        }
+        if (claim != ConcurrentMemoryPool::FirstClaimStatus::Data) {
+            pool.run_state().fail(std::make_exception_ptr(std::runtime_error("writer could not claim frontier")), "test");
+            try { allocation.get(); } catch (const std::exception&) {}
+            throw std::runtime_error("writer could not claim frontier");
+        }
         require(pool.complete_first(spill), "spill completion rejected");
         require(allocation.get() != nullptr, "reserved allocation did not progress");
         pool.set_spill_service(false);

@@ -12,6 +12,7 @@ struct ConcurrentMemoryPoolTestAccess
     static void single(ConcurrentMemoryPool& p) { p.num_arenas_ = 1; p.cpus_per_node_[0] = p.total_cpus_ = 1; }
     static Arena& arena(ConcurrentMemoryPool& p) { return p.arenas_[0]; }
     static Arena& arena(ConcurrentMemoryPool& p, int i) { return p.arenas_[i]; }
+    static void refresh_locked(ConcurrentMemoryPool& p) { p.update_pressure(p.arenas_[0]); }
     static void two(ConcurrentMemoryPool& p) {
         p.num_arenas_ = p.total_cpus_ = 2;
         p.numa_available_ = false;
@@ -37,6 +38,7 @@ static void check_out_of_order_return()
     ConcurrentMemoryPool p(32ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     std::vector<unsigned char> bytes(FIRST_SEGMENT_SIZE, 0x6d);
     for (int i = 0; i < 3; ++i) require(cache_full_first(p, 0, bytes.data()), "fixture publication failed");
     p.freeze_first();
@@ -63,6 +65,7 @@ static void check_parallel_scan()
     ConcurrentMemoryPool p(64ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     constexpr size_t segments = 16;
     const size_t capacity = p.first_segment_record_capacity();
     std::vector<unsigned char> bytes(FIRST_SEGMENT_SIZE);
@@ -110,13 +113,15 @@ static void check_tls_partial_and_control_independence()
     ConcurrentMemoryPool p(16ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     const std::array<unsigned char, 9> record{1,2,3,4,5,6,7,8,9};
-    {
-        std::unique_lock held(ConcurrentMemoryPoolTestAccess::arena(p).control_mutex);
-        require(p.cache_first_record(0, record.data()), "FIRST fill waited for control lock");
-        require(p.try_allocate_large(BLOCK_SIZE), "Tree bump waited for control lock");
-    }
     require(p.cache_first_record(0, record.data()), "partial fill failed");
+    {
+        std::unique_lock held(ConcurrentMemoryPoolTestAccess::arena(p).mutex);
+        require(p.cache_first_record(0, record.data()), "held FIRST fill acquired Arena lock");
+        require(!p.try_allocate_large(BLOCK_SIZE), "try Tree bump ignored Arena lock");
+        p.seal_thread_first(); // Publication does not take the Arena lock.
+    }
     // Strict NUMA cannot satisfy this request, but must seal before failing.
     bool failed = false;
     try { p.allocate_large_from_numa(32ULL << 20, 0); }
@@ -134,6 +139,7 @@ static void check_partial_ram_reservation()
     ConcurrentMemoryPool p(8ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     const unsigned char record[9]{};
     require(p.cache_first_record(0, record), "RAM reserve FIRST fixture failed");
     void* tree = p.allocate_large_from_numa(p.gap_bytes(0), 0);
@@ -164,6 +170,7 @@ static void check_ready_scan_reservation_does_not_spill()
     ConcurrentMemoryPool p(32ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     std::vector<unsigned char> bytes(FIRST_SEGMENT_SIZE, 0x6d);
     for (int i = 0; i < 4; ++i) require(cache_full_first(p, 0, bytes.data()), "ready-scan FIRST fixture failed");
     auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
@@ -189,370 +196,383 @@ static void check_ready_scan_reservation_does_not_spill()
     require(!unnecessary_spill, "ready scan target pages still triggered spill to the high watermark");
 }
 
-// Relaxed scheduling flags deliberately add no happens-before edge between
-// source reads and the late allocator. That edge must come from the pool.
-struct Pause
-{
-    std::atomic<unsigned> calls{0};
-    std::atomic<bool> entered{false}, resume{false};
-    void stop_first() {
-        if (calls.fetch_add(1, std::memory_order_relaxed)) return;
-        entered.store(true, std::memory_order_relaxed);
-        while (!resume.load(std::memory_order_relaxed)) std::this_thread::yield();
-    }
-    void wait() { while (!entered.load(std::memory_order_relaxed)) std::this_thread::yield(); }
-};
-static Pause* pause_point;
-static void pause_once() { pause_point->stop_first(); }
-static Pause* pending_pause_point;
-static void pause_pending() { pending_pause_point->stop_first(); }
-
-static void check_late_tree_cursor()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    const unsigned char record[9]{0x6d};
-    require(p.cache_first_record(0, record), "late-cursor source fixture failed");
-    p.seal_thread_first();
-    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
-    uint64_t initial;
-    require(arena.try_reserve_tree(2ULL << 20, initial), "late-cursor initial allocation failed");
-    p.freeze_first();
-    View source;
-    require(p.try_claim_first(0, Consumer::Scan, source) == Status::Data, "late-cursor claim failed");
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_tree_charge = pause_once;
-    uint64_t late_offset = UINT64_MAX;
-    std::thread late([&] {
-        if (arena.try_reserve_tree(4ULL << 20, late_offset))
-            std::memset(static_cast<char*>(arena.start_addr) + late_offset, 0x39, 4ULL << 20);
-    });
-    pause.wait();
-    const auto last_read = *static_cast<const volatile unsigned char*>(source.records);
-    const bool completed = p.complete_first(source);
-    uint64_t early_offset = UINT64_MAX;
-    const bool allocated = arena.try_reserve_tree(2ULL << 20, early_offset);
-    pause.resume.store(true, std::memory_order_relaxed);
-    late.join();
-    Arena::after_tree_charge = nullptr;
-    require(last_read == 0x6d && completed && allocated, "late-cursor reclamation failed");
-    require(early_offset == (2ULL << 20) && late_offset == (4ULL << 20) && p.gap_bytes(0) == 0,
-        "charged addresses overlap or exceed the returned boundary");
-}
-
-static void check_delayed_refund_and_online_impossible()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    const unsigned char record[9]{0x6d};
-    require(p.cache_first_record(0, record), "delayed-refund fixture failed");
-    p.seal_thread_first();
-    p.allocate_large_from_numa(p.gap_bytes(0), 0);
-    p.freeze_first();
-    View source;
-    require(p.try_claim_first(0, Consumer::Scan, source) == Status::Data, "delayed-refund claim failed");
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_frontier_advance = pause_once;
-    auto completion = std::async(std::launch::async, [&] { return p.complete_first(source); });
-    pause.wait();
-    p.set_spill_service(true);
-    auto allocation = std::async(std::launch::async, [&] { return p.allocate_large_from_numa(1ULL << 20, 0); });
-    p.poll_first_progress(0);
-    const bool waited = allocation.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
-    const bool empty = p.first_empty();
-    const bool grew = p.cache_first_record(0, record);
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool completed = completion.get();
-    Arena::after_frontier_advance = nullptr;
-    void* result = allocation.get();
-    require(waited && !empty && !grew && completed && result,
-        "delayed refund reopened growth, lost credit, or prematurely rejected a live request");
-    require(p.gap_bytes(0) == (1ULL << 20), "delayed refund was not published exactly once");
-    bool impossible = false;
-    try { p.allocate_large_from_numa(2ULL << 20, 0); }
-    catch (const std::bad_alloc&) { impossible = true; }
-    require(impossible, "Impossible request waited for the spill service to stop");
-    p.set_spill_service(false);
-}
-
-static void check_delayed_first_address()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_first_charge = pause_once;
-    const unsigned char record[9]{0x6d};
-    auto owner = std::async(std::launch::async, [&] {
-        const bool accepted = p.cache_first_record(0, record);
-        p.seal_thread_first();
-        return accepted;
-    });
-    pause.wait();
-    p.request_first_drain();
-    View view;
-    const bool claimed = p.try_claim_first(0, Consumer::Spill, view) == Status::Data;
-    const bool empty = p.first_empty();
-    void* tree = p.try_allocate_large(6ULL << 20);
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool accepted = owner.get();
-    Arena::after_first_charge = nullptr;
-    require(!claimed && !empty && tree && accepted,
-        "mode switch lost a charged FIRST reservation or overlapped its address");
-    p.freeze_first();
-    require(p.try_claim_first(0, Consumer::Scan, view) == Status::Data && view.records[0] == 0x6d,
-        "Closing initialized the claim cursor before the reservation published");
-    require(p.complete_first(view) && p.first_empty(), "delayed FIRST address was not returned");
-}
-
-static void check_generation_limit()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    ConcurrentMemoryPoolTestAccess::exhaust_generation(p);
-    const unsigned char record[9]{};
-    const bool accepted = p.cache_first_record(0, record);
-    bool failed = false;
-    try { p.run_state().check(); }
-    catch (const std::overflow_error&) { failed = true; }
-    require(!accepted && failed && !(ConcurrentMemoryPoolTestAccess::arena(p).admission_word.load() & Arena::ACTIVE_MASK),
-        "generation limit wrapped or leaked the short-operation gate");
-}
-
-static void check_pending_during_first_address()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    p.set_spill_service(true);
-    Pause first_pause, pending_pause;
-    pause_point = &first_pause;
-    pending_pause_point = &pending_pause;
-    Arena::after_first_charge = pause_once;
-    const unsigned char record[9]{0x6d};
-    auto first = std::async(std::launch::async, [&] {
-        const bool ok = p.cache_first_record(0, record);
-        p.seal_thread_first();
-        return ok;
-    });
-    first_pause.wait();
-    Arena::before_pending_admission = pause_pending;
-    auto allocation = std::async(std::launch::async, [&]() -> void* {
-        try { return p.allocate_large_from_numa(7ULL << 20, 0); }
-        catch (const std::bad_alloc&) { return nullptr; }
-    });
-    pending_pause.wait();
-    first_pause.resume.store(true, std::memory_order_relaxed);
-    const bool cached = first.get();
-    Arena::after_first_charge = nullptr;
-    pending_pause.resume.store(true, std::memory_order_relaxed);
-    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
-    SpinBackoff<> backoff;
-    while (arena.request.load(std::memory_order_acquire) == Arena::Request::Idle
-        && allocation.wait_for(std::chrono::seconds(0)) != std::future_status::ready) backoff.backoff();
-    View source;
-    if (arena.request.load(std::memory_order_acquire) == Arena::Request::Waiting) {
-        while (p.try_claim_first(0, Consumer::Spill, source) != Status::Data) backoff.backoff();
-        p.complete_first(source);
-    }
-    void* result = allocation.get();
-    Arena::before_pending_admission = nullptr;
-    p.set_spill_service(false);
-    require(cached && result, "Grow snapshot rejected a reclaimable contiguous request");
-}
-
-static void check_registered_impossible_with_late_tree()
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    const unsigned char record[9]{};
-    require(p.cache_first_record(0, record), "registered Impossible fixture failed");
-    p.seal_thread_first();
-    p.set_spill_service(true);
-    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_tree_charge = pause_once;
-    auto late = std::async(std::launch::async, [&] {
-        uint64_t offset;
-        return arena.try_reserve_tree(4ULL << 20, offset);
-    });
-    pause.wait();
-    auto impossible = std::async(std::launch::async, [&] {
-        try { p.allocate_large_from_numa(7ULL << 20, 0); }
-        catch (const std::bad_alloc&) { return true; }
-        return false;
-    });
-    SpinBackoff<> backoff;
-    while (arena.request.load(std::memory_order_acquire) != Arena::Request::Waiting) backoff.backoff();
-    View source;
-    while (p.try_claim_first(0, Consumer::Spill, source) != Status::Data) backoff.backoff();
-    require(p.complete_first(source), "registered Impossible source completion failed");
-    const bool failed = impossible.get();
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool reserved = late.get();
-    Arena::after_tree_charge = nullptr;
-    p.set_spill_service(false);
-    require(failed && reserved && p.gap_bytes(0) == (4ULL << 20),
-        "registered Impossible depended on a late cursor or Writer shutdown");
-}
-
-static void check_impossible_retries_other_arena()
+static void check_nonblocking_and_normal_admission()
 {
     ConcurrentMemoryPool p(16ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    p.init_arenas();
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
+    for (bool first : {false, true}) {
+        std::promise<void> started;
+        std::unique_lock held(arena.mutex);
+        auto normal = std::async(std::launch::async, [&] {
+            started.set_value();
+            const unsigned char record[9]{};
+            if (first) { const bool ok = p.cache_first_record(0, record); p.seal_thread_first(); return ok; }
+            return p.allocate_large(BLOCK_SIZE) != nullptr;
+        });
+        started.get_future().wait();
+        const bool waited = normal.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+        held.unlock();
+        const bool succeeded = normal.get();
+        require(waited && succeeded, "normal admission mistook a busy Arena for exhaustion");
+    }
+    p.freeze_first();
+    View view;
+    while (p.try_claim_first(0, Consumer::Scan, view) == Status::Data) p.complete_first(view);
+    std::unique_lock held(arena.mutex);
+    auto nonblocking = std::async(std::launch::async, [&] {
+        std::array<void*, 1> pages;
+        p.poll_first_progress(0);
+        return p.try_allocate() == nullptr && p.try_allocate_large(BLOCK_SIZE) == nullptr
+            && p.try_reserve_ram_pages(pages).status == ConcurrentMemoryPool::RamReserveStatus::Busy
+            && p.try_claim_first(0, Consumer::Scan, view) == Status::Busy;
+    });
+    const bool immediate = nonblocking.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    held.unlock();
+    const bool result = nonblocking.get();
+    require(immediate && result, "Pool try path blocked, including frozen-empty claim checking");
+}
+
+static void check_bounded_prefix_and_generation()
+{
+    ConcurrentMemoryPool p(384ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    p.init_arenas();
+    const unsigned char record[9]{0x6d};
+    constexpr size_t count = 130;
+    for (size_t i = 0; i < count; ++i) {
+        require(p.cache_first_record(0, record), "long-prefix fixture failed");
+        p.seal_thread_first();
+    }
+    p.freeze_first();
+    std::array<View, count> views;
+    for (auto& view : views) require(p.try_claim_first(0, Consumer::Scan, view) == Status::Data, "long-prefix claim failed");
+    const auto gap = p.gap_bytes(0);
+    for (size_t i = count - 1; i; --i) require(p.complete_first(views[i]), "suffix completion failed");
+    require(p.gap_bytes(0) == gap, "noncontinuous Done suffix was returned");
+    require(p.complete_first(views[0]) && p.first_empty() && p.gap_bytes(0) == gap + count * FIRST_SEGMENT_SIZE,
+        "last completion stranded a Done prefix longer than 64 descriptors");
+    require(!p.complete_first(views[0]), "retired generation completed twice");
+
+    ConcurrentMemoryPool limited(16ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(limited);
+    limited.init_arenas();
+    ConcurrentMemoryPoolTestAccess::exhaust_generation(limited);
+    const auto before = limited.gap_bytes(0);
+    require(!limited.cache_first_record(0, record) && limited.run_state().failed()
+        && limited.gap_bytes(0) == before && limited.first_empty(), "generation overflow changed a boundary");
+}
+
+static void check_fifo_extra_gap_and_free_pages()
+{
+    ConcurrentMemoryPool p(32ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    p.init_arenas();
+    void* free_page = p.allocate_large_from_numa(BLOCK_SIZE, 0);
+    const unsigned char record[9]{};
+    require(p.cache_first_record(0, record), "FIFO fixture failed");
+    p.seal_thread_first();
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
+    Arena::Waiter head{p.gap_bytes(0) - 2 * BLOCK_SIZE}, tail{BLOCK_SIZE};
+    {
+        std::lock_guard lock(arena.mutex);
+        arena.enqueue(head);
+        arena.enqueue(tail);
+        ConcurrentMemoryPoolTestAccess::refresh_locked(p);
+    }
+    p.poll_first_progress(0);
+    require(p.pressure(0) == MemoryPressure::Hard, "FIFO pressure snapshot was not Hard");
+    require(p.try_allocate_large(2 * BLOCK_SIZE), "FIFO blocked surplus gap");
+    require(!p.try_allocate_large(BLOCK_SIZE), "bump stole FIFO head space");
+    require(!p.cache_first_record(0, record), "FIRST grew with a FIFO waiter");
+    p.release_ram_pages(std::span<void* const>(&free_page, 1));
+    require(p.try_allocate() == free_page, "FIFO blocked an independent free page");
+    {
+        std::lock_guard lock(arena.mutex);
+        uint64_t offset;
+        require(arena.try_reserve_tree(head.bytes, offset, &head), "FIFO head could not consume its protected gap");
+        arena.remove(head);
+        require(arena.wait_head == &tail && !tail.previous, "FIFO head removal damaged links");
+        arena.remove(tail);
+        ConcurrentMemoryPoolTestAccess::refresh_locked(p);
+        require(!arena.wait_head && !arena.wait_tail, "FIFO removal stranded a node");
+    }
+    p.poll_first_progress(0);
+}
+
+static size_t waiter_count(ConcurrentMemoryPool& p, int index = 0)
+{
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p, index);
+    std::lock_guard lock(arena.mutex);
+    size_t count = 0;
+    for (auto* waiter = arena.wait_head; waiter; waiter = waiter->next) ++count;
+    return count;
+}
+static void await_waiters(ConcurrentMemoryPool& p, size_t count)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (waiter_count(p) != count && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    if (waiter_count(p) != count) {
+        p.set_spill_service(false);
+        throw std::runtime_error("FIFO registration did not progress");
+    }
+}
+
+static void claim_after_contention(ConcurrentMemoryPool& p, int preferred, Consumer consumer, View& view)
+{
+    SpinBackoff<> backoff;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (p.try_claim_first(preferred, consumer, view) == Status::Data) return;
+        backoff.backoff();
+    }
+    // Failed assertions must not leave allocation futures waiting forever.
+    p.run_state().fail(std::make_exception_ptr(std::runtime_error("claim did not progress")), "test");
+    throw std::runtime_error("claim did not progress");
+}
+
+static void check_fifo_cancellation_and_remote_retry()
+{
+    for (bool failure : {false, true}) {
+        ConcurrentMemoryPool p(16ULL << 20);
+        ConcurrentMemoryPoolTestAccess::single(p);
+        p.init_arenas();
+        const unsigned char record[9]{};
+        require(p.cache_first_record(0, record), "FIFO cancellation fixture failed");
+        p.seal_thread_first();
+        p.allocate_large_from_numa(p.gap_bytes(0), 0);
+        p.set_spill_service(true);
+        std::array<std::future<bool>, 3> workers;
+        for (size_t i = 0; i < workers.size(); ++i) {
+            workers[i] = std::async(std::launch::async, [&] {
+                try { p.allocate_large_from_numa(BLOCK_SIZE, 0); return false; }
+                catch (const std::exception&) { return true; }
+            });
+            await_waiters(p, i + 1);
+        }
+        if (failure) p.run_state().fail(std::make_exception_ptr(std::runtime_error("injected")), "FIFO test");
+        else p.set_spill_service(false);
+        for (auto& worker : workers) require(worker.get(), "cancelled strict allocation succeeded");
+        require(waiter_count(p) == 0, "cancellation or failure left a FIFO node");
+    }
+    ConcurrentMemoryPool p(32ULL << 20);
     ConcurrentMemoryPoolTestAccess::two(p);
     p.init_arenas();
     const unsigned char record[9]{};
-    for (int i = 0; i < 2; ++i) {
-        require(p.cache_first_record(i, record), "two-Arena source fixture failed");
+    for (int index = 0; index < 2; ++index) {
+        require(p.cache_first_record(index, record), "remote retry fixture failed");
         p.seal_thread_first();
+        p.allocate_large_from_numa(p.gap_bytes(index), index);
     }
-    p.freeze_first();
     p.set_spill_service(true);
-    auto& local = ConcurrentMemoryPoolTestAccess::arena(p, 0);
-    auto& remote = ConcurrentMemoryPoolTestAccess::arena(p, 1);
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_tree_charge = pause_once;
-    auto late = std::async(std::launch::async, [&] {
-        uint64_t offset;
-        return local.try_reserve_tree(4ULL << 20, offset);
-    });
-    pause.wait();
-    auto allocation = std::async(std::launch::async, [&]() -> void* {
-        try { return p.allocate_large(7ULL << 20); }
-        catch (const std::bad_alloc&) { return nullptr; }
-    });
-    SpinBackoff<> backoff;
-    while (local.request.load(std::memory_order_acquire) != Arena::Request::Waiting) backoff.backoff();
-    View source;
-    while (p.try_claim_first(0, Consumer::Spill, source) != Status::Data) backoff.backoff();
-    p.complete_first(source);
-    while (remote.request.load(std::memory_order_acquire) != Arena::Request::Waiting
-        && allocation.wait_for(std::chrono::seconds(0)) != std::future_status::ready) backoff.backoff();
-    if (remote.request.load(std::memory_order_acquire) == Arena::Request::Waiting) {
-        while (p.try_claim_first(1, Consumer::Spill, source) != Status::Data) backoff.backoff();
-        p.complete_first(source);
-    }
-    void* result = allocation.get();
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool reserved = late.get();
-    Arena::after_tree_charge = nullptr;
+    p.freeze_first();
+    View local_source;
+    require(p.try_claim_first(0, Consumer::Scan, local_source) == Status::Data && local_source.ref.arena_index == 0,
+        "local source fixture selected the wrong Arena");
+    auto waiting = std::async(std::launch::async, [&] { return p.allocate_large(BLOCK_SIZE); });
+    await_waiters(p, 1);
+    View remote;
+    claim_after_contention(p, 1, Consumer::Scan, remote);
+    require(remote.ref.arena_index == 1,
+        "remote claim selected the wrong Arena");
+    require(p.complete_first(remote), "remote completion failed");
+    const bool ready = waiting.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
     p.set_spill_service(false);
-    require(reserved && result && remote.contains(result), "Impossible local request bypassed reclaimable remote RAM");
+    void* result = waiting.get();
+    require(ready && ConcurrentMemoryPoolTestAccess::arena(p, 1).contains(result) && !waiter_count(p),
+        "registered local waiter did not retry remote Arena or left its node");
+    require(p.complete_first(local_source), "local in-flight fixture cleanup failed");
 }
 
-static void check_claim_pause_and_generation_reuse()
+static void check_partial_tls_pool_switch()
 {
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    const unsigned char record[9]{0x6d};
-    require(p.cache_first_record(0, record), "claim-pause fixture failed");
-    p.seal_thread_first();
-    p.request_first_drain();
-    Pause pause;
-    pause_point = &pause;
-    Arena::before_claim_cas = pause_once;
-    View source;
-    auto claim = std::async(std::launch::async, [&] { return p.try_claim_first(0, Consumer::Spill, source); });
-    pause.wait();
-    p.poll_first_progress(0);
-    const bool grew = p.cache_first_record(0, record);
-    const bool empty = p.first_empty();
-    pause.resume.store(true, std::memory_order_relaxed);
-    const auto status = claim.get();
-    Arena::before_claim_cas = nullptr;
-    require(!grew && !empty && status == Status::Data && p.complete_first(source),
-        "paused claim permitted reset or lost ownership");
-    p.poll_first_progress(0);
-    require(p.cache_first_record(0, record), "growth did not reopen after claim completed");
-    p.seal_thread_first();
-    p.freeze_first();
-    View next;
-    require(p.try_claim_first(0, Consumer::Scan, next) == Status::Data
-        && next.ref.segment_index == source.ref.segment_index && next.ref.generation == source.ref.generation + 1,
-        "generation reuse did not preserve the slot identity");
-    require(!p.complete_first(source) && next.records[0] == 0x6d && p.complete_first(next),
-        "stale claim completed a reused generation");
-}
-
-static void check_completion_publication_pause(bool after_sequence)
-{
-    ConcurrentMemoryPool p(8ULL << 20);
-    ConcurrentMemoryPoolTestAccess::single(p);
-    p.init_arenas();
-    const unsigned char record[9]{0x6d};
-    for (int i = 0; i < 2; ++i) {
-        require(p.cache_first_record(0, record), "completion-pause fixture failed");
-        p.seal_thread_first();
-    }
-    p.freeze_first();
-    View a, b;
-    require(p.try_claim_first(0, Consumer::Scan, a) == Status::Data
-        && p.try_claim_first(0, Consumer::Scan, b) == Status::Data, "completion-pause claims failed");
-    Pause pause;
-    pause_point = &pause;
-    if (after_sequence) Arena::after_completion_sequence = pause_once;
-    else Arena::after_done = pause_once;
-    auto first = std::async(std::launch::async, [&] {
-        const auto last_read = *static_cast<const volatile unsigned char*>(a.records);
-        return last_read == 0x6d && p.complete_first(a);
+    ConcurrentMemoryPool old_pool(32ULL << 20), new_pool(8ULL << 20);
+    ConcurrentMemoryPoolTestAccess::two(old_pool);
+    ConcurrentMemoryPoolTestAccess::single(new_pool);
+    old_pool.init_arenas(); new_pool.init_arenas();
+    std::promise<void> prepared, attempt, retry;
+    std::promise<bool> partial;
+    auto attempt_signal = attempt.get_future();
+    auto retry_signal = retry.get_future();
+    auto partial_result = partial.get_future();
+    std::thread worker([&] {
+        old_pool.deallocate(old_pool.allocate());
+        old_pool.deallocate(old_pool.allocate_large_from_numa(BLOCK_SIZE, 1));
+        prepared.set_value();
+        attempt_signal.wait();
+        void* page = new_pool.try_allocate();
+        auto& tls = ConcurrentMemoryPool::get_thread_local_cache();
+        partial.set_value(!page && tls.pool == &old_pool && !tls.local_free_count && tls.remote_lists[1].count == 1);
+        retry_signal.wait();
+        if (!new_pool.try_allocate()) std::terminate();
     });
-    pause.wait();
-    const bool completed = p.complete_first(b);
-    const bool empty = p.first_empty();
-    const size_t bytes = p.gap_bytes(0);
-    void* reused = p.try_allocate_large(bytes);
-    if (reused) std::memset(reused, 0x39, bytes);
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool first_completed = first.get();
-    Arena::after_done = Arena::after_completion_sequence = nullptr;
-    require(completed && empty && bytes == (8ULL << 20) && reused && first_completed && p.gap_bytes(0) == 0,
-        "last completion missed publication or reused source twice");
+    prepared.get_future().wait();
+    std::unique_lock held(ConcurrentMemoryPoolTestAccess::arena(old_pool, 1).mutex);
+    attempt.set_value();
+    const bool immediate = partial_result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    held.unlock();
+    const bool transferred = partial_result.get();
+    retry.set_value(); worker.join();
+    require(immediate && transferred, "partial TLS pool switch lost ownership or waited on a busy Arena");
 }
 
-static void check_adjacent_frontier_publishers()
+static void check_scan_deficit_includes_fifo_and_inflight()
 {
-    ConcurrentMemoryPool p(8ULL << 20);
+    ConcurrentMemoryPool p(32ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
-    const unsigned char record[9]{0x6d};
-    for (int i = 0; i < 2; ++i) {
-        require(p.cache_first_record(0, record), "adjacent-frontier fixture failed");
+    p.set_spill_service(true);
+    const unsigned char record[9]{};
+    for (size_t i = 0; i < 4; ++i) {
+        require(p.cache_first_record(0, record), "projected-gap fixture failed");
         p.seal_thread_first();
     }
     p.allocate_large_from_numa(p.gap_bytes(0), 0);
     p.freeze_first();
-    View a, b;
-    require(p.try_claim_first(0, Consumer::Scan, a) == Status::Data
-        && p.try_claim_first(0, Consumer::Scan, b) == Status::Data, "adjacent-frontier claims failed");
-    Pause pause;
-    pause_point = &pause;
-    Arena::after_frontier_advance = pause_once;
-    auto first = std::async(std::launch::async, [&] {
-        const auto last_read = *static_cast<const volatile unsigned char*>(a.records);
-        return last_read == 0x6d && p.complete_first(a);
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
+    Arena::Waiter waiter{FIRST_SEGMENT_SIZE};
+    {
+        std::lock_guard lock(arena.mutex);
+        arena.enqueue(waiter);
+        ConcurrentMemoryPoolTestAccess::refresh_locked(p);
+    }
+    std::array<void*, 1> page;
+    require(p.try_reserve_ram_pages(page).status == ConcurrentMemoryPool::RamReserveStatus::NeedReclaim,
+        "Scan did not publish its actual deficit");
+    View first, second, none;
+    require(p.try_claim_first(0, Consumer::Spill, first) == Status::Data, "FIFO deficit did not authorize Spill");
+    require(p.try_claim_first(0, Consumer::Spill, second) == Status::Data,
+        "Scan counted FIFO-protected space as its own available page");
+    require(p.try_claim_first(0, Consumer::Spill, none) == Status::Busy,
+        "Spill ignored sufficient projected in-flight reclamation");
+    require(p.complete_first(first) && p.complete_first(second), "projected source completion failed");
+    require(p.try_reserve_ram_pages(page).status == ConcurrentMemoryPool::RamReserveStatus::Ready,
+        "Scan could not use surplus space outside the FIFO reservation");
+    p.release_ram_pages(page);
+    {
+        std::lock_guard lock(arena.mutex);
+        arena.remove(waiter);
+        ConcurrentMemoryPoolTestAccess::refresh_locked(p);
+    }
+    p.poll_first_progress(0);
+    require(p.try_claim_first(0, Consumer::Spill, none) == Status::Busy, "Ready Scan left frozen watermark Spill enabled");
+}
+
+static void check_completion_then_tree_overwrite()
+{
+    ConcurrentMemoryPool p(16ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    p.init_arenas();
+    const unsigned char record[9]{0x6d};
+    require(p.cache_first_record(0, record), "overwrite fixture failed");
+    p.seal_thread_first();
+    p.allocate_large_from_numa(p.gap_bytes(0), 0);
+    p.freeze_first();
+    View source;
+    require(p.try_claim_first(0, Consumer::Scan, source) == Status::Data, "overwrite claim failed");
+    std::barrier start(2);
+    auto allocator = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        void* memory;
+        while (!(memory = p.try_allocate_large(FIRST_SEGMENT_SIZE))) std::this_thread::yield();
+        std::memset(memory, 0x39, FIRST_SEGMENT_SIZE);
+        return memory;
     });
-    pause.wait();
-    const bool completed = p.complete_first(b);
-    // The second refund can be spent on the first publisher's source. Its CAS
-    // must acquire that earlier publication even though its refund is paused.
-    auto* earlier = p.try_allocate_large(FIRST_SEGMENT_SIZE);
-    const bool same = earlier == a.records;
-    if (earlier) std::memset(earlier, 0x39, FIRST_SEGMENT_SIZE);
-    pause.resume.store(true, std::memory_order_relaxed);
-    const bool first_completed = first.get();
-    Arena::after_frontier_advance = nullptr;
-    require(completed && same && first_completed && p.gap_bytes(0) == FIRST_SEGMENT_SIZE,
-        "adjacent publisher lost synchronization or refunded twice");
+    start.arrive_and_wait();
+    const auto last_read = *static_cast<const volatile unsigned char*>(source.records);
+    require(p.complete_first(source), "overwrite source completion failed");
+    require(allocator.get() == source.records && last_read == 0x6d && p.gap_bytes(0) == 0,
+        "Tree reused source before the consumer's last read or received the wrong boundary");
+    require(!p.complete_first(source), "stale completion refunded overwritten Tree memory");
+}
+
+static void check_fifo_handoff_after_middle_remote_success()
+{
+    ConcurrentMemoryPool p(32ULL << 20);
+    ConcurrentMemoryPoolTestAccess::two(p);
+    p.init_arenas();
+    const unsigned char record[9]{};
+    for (size_t i = 0; i < 2; ++i) {
+        require(p.cache_first_record(0, record), "FIFO handoff source setup failed");
+        p.seal_thread_first();
+    }
+    p.allocate_large_from_numa(p.gap_bytes(0), 0);
+    void* remote_page = p.allocate_large_from_numa(p.gap_bytes(1), 1);
+    p.set_spill_service(true);
+    std::array<std::future<void*>, 3> workers;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        workers[i] = std::async(std::launch::async, [&, i] { return p.allocate_large(i == 1 ? BLOCK_SIZE : FIRST_SEGMENT_SIZE); });
+        await_waiters(p, i + 1);
+    }
+    p.release_ram_pages(std::span<void* const>(&remote_page, 1));
+    const bool middle_ready = workers[1].wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    if (!middle_ready) p.set_spill_service(false);
+    void* middle = workers[1].get();
+    require(middle_ready && middle == remote_page && waiter_count(p) == 2, "remote success did not unlink the middle FIFO node");
+    p.freeze_first();
+    for (size_t index : {0ULL, 2ULL}) {
+        View source;
+        claim_after_contention(p, 0, Consumer::Spill, source);
+        require(p.complete_first(source), "FIFO handoff completion failed");
+        const bool ready = workers[index].wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+        if (!ready) p.set_spill_service(false);
+        void* result = workers[index].get();
+        require(ready && result == source.records, "later waiter stole the FIFO head's recovered range");
+    }
+    require(!waiter_count(p) && p.first_empty(), "successful FIFO handoff stranded a request or source");
+}
+
+static void check_first_capacity_denial_until_pressure_changes()
+{
+    ConcurrentMemoryPool p(32ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    p.init_arenas();
+    p.set_spill_service(true);
+    std::promise<void> denied, retry, recovered;
+    std::promise<bool> repeated, resumed;
+    auto retry_signal = retry.get_future();
+    auto recovered_signal = recovered.get_future();
+    auto repeated_result = repeated.get_future();
+    auto resumed_result = resumed.get_future();
+    std::thread owner([&] {
+        const unsigned char record[9]{};
+        while (p.cache_first_record(0, record)) p.seal_thread_first();
+        denied.set_value();
+        retry_signal.wait();
+        repeated.set_value(!p.cache_first_record(0, record));
+        recovered_signal.wait();
+        resumed.set_value(p.cache_first_record(0, record));
+        p.seal_thread_first();
+    });
+    denied.get_future().wait();
+    const auto generation = p.pressure_generation(0);
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(p);
+    std::unique_lock held(arena.mutex);
+    retry.set_value();
+    const bool immediate = repeated_result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    held.unlock();
+    const bool still_denied = repeated_result.get();
+    p.request_first_drain();
+    View source;
+    while (p.try_claim_first(0, Consumer::Spill, source) == Status::Data) p.complete_first(source);
+    const bool changed = p.pressure_generation(0) != generation;
+    recovered.set_value();
+    const bool admitted = resumed_result.get();
+    owner.join();
+    require(immediate && still_denied && changed && admitted,
+        "unchanged FIRST capacity denial contended again or did not retry after pressure changed");
+}
+
+static void check_first_denial_before_initialization()
+{
+    ConcurrentMemoryPool p(16ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(p);
+    const unsigned char record[9]{};
+    require(!p.cache_first_record(0, record), "FIRST admitted before Arena initialization");
+    p.init_arenas();
+    require(p.cache_first_record(0, record), "pre-initialization capacity denial survived initialized capacity");
+    p.seal_thread_first();
 }
 
 int main()
@@ -564,17 +584,16 @@ int main()
         check_tls_partial_and_control_independence();
         check_partial_ram_reservation();
         check_ready_scan_reservation_does_not_spill();
-        check_late_tree_cursor();
-        check_delayed_refund_and_online_impossible();
-        check_delayed_first_address();
-        check_generation_limit();
-        check_pending_during_first_address();
-        check_registered_impossible_with_late_tree();
-        check_impossible_retries_other_arena();
-        check_claim_pause_and_generation_reuse();
-        check_completion_publication_pause(false);
-        check_completion_publication_pause(true);
-        check_adjacent_frontier_publishers();
+        check_nonblocking_and_normal_admission();
+        check_bounded_prefix_and_generation();
+        check_fifo_extra_gap_and_free_pages();
+        check_fifo_cancellation_and_remote_retry();
+        check_partial_tls_pool_switch();
+        check_scan_deficit_includes_fifo_and_inflight();
+        check_completion_then_tree_overwrite();
+        check_fifo_handoff_after_middle_remote_success();
+        check_first_capacity_denial_until_pressure_changes();
+        check_first_denial_before_initialization();
         std::cout << "FirstMemoryScan tests passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

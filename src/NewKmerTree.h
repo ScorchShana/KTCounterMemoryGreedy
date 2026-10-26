@@ -100,6 +100,7 @@ public:
     {
         friend class KmerTree;
         ConcurrentMemoryPool* pool_ = nullptr;
+        KmerTree* tree_ = nullptr;
         std::array<void*, 772> pages_{};
         std::array<Task<CountType>, 305> tasks_{};
         size_t page_count_ = 0, task_count_ = 0, submitted_ = 0;
@@ -110,12 +111,16 @@ public:
         ~FirstScanBatch()
         {
             if (!pool_) return;
-            pool_->release_ram_pages(std::span<void* const>(pages_.data(), page_count_));
+            tree_->release_unused_first_scan_pages(*this);
             for (size_t t = submitted_; t < task_count_; ++t)
                 for (size_t b = 0; b < tasks_[t].count; ++b) pool_->deallocate(tasks_[t].kmer_blocks[b]);
         }
     };
 
+private:
+    std::atomic<FirstScanBatch*> scan_preparer_{nullptr};
+
+public:
     static size_t first_scan_page_bound(size_t records) noexcept
     {
         const size_t capacity = get_block_capacity();
@@ -124,14 +129,30 @@ public:
     ConcurrentMemoryPool::RamReserveStatus try_prepare_first_scan(FirstScanBatch& batch, size_t records)
     {
         assert(!batch.pool_ || batch.pool_ == memory_pool);
-        batch.pool_ = memory_pool;
+        memory_pool->run_state().check();
         const size_t bound = first_scan_page_bound(records);
         assert(bound <= batch.pages_.size());
-        if (batch.page_count_ >= bound) return ConcurrentMemoryPool::RamReserveStatus::Ready;
+        if (batch.page_count_ >= bound) {
+            if (scan_preparer_.load(std::memory_order_acquire) == &batch) {
+                memory_pool->clear_scan_reclaim_goals();
+                scan_preparer_.store(nullptr, std::memory_order_release);
+            }
+            return ConcurrentMemoryPool::RamReserveStatus::Ready;
+        }
+        FirstScanBatch* expected = nullptr;
+        if (!scan_preparer_.compare_exchange_strong(expected, &batch, std::memory_order_acq_rel, std::memory_order_acquire)
+            && expected != &batch) return ConcurrentMemoryPool::RamReserveStatus::Busy;
+        batch.pool_ = memory_pool;
+        batch.tree_ = this;
         const auto result = memory_pool->try_reserve_ram_pages(std::span<void*>(batch.pages_.data() + batch.page_count_, bound - batch.page_count_));
         batch.page_count_ += result.acquired;
+        if (result.status == ConcurrentMemoryPool::RamReserveStatus::Ready) {
+            memory_pool->clear_scan_reclaim_goals();
+            scan_preparer_.store(nullptr, std::memory_order_release);
+        }
         return result.status;
     }
+
     void append_first_scan_hits(FirstScanBatch& batch, const unsigned char* records, size_t count, node<CountType>* local_roots) noexcept
     {
         const size_t width = kmer_bytes();
@@ -188,6 +209,11 @@ public:
     {
         memory_pool->release_ram_pages(std::span<void* const>(batch.pages_.data(), batch.page_count_));
         batch.page_count_ = 0;
+        // Only the incomplete preparer may cancel its published demand.
+        if (scan_preparer_.load(std::memory_order_acquire) == &batch) {
+            memory_pool->clear_scan_reclaim_goals();
+            scan_preparer_.store(nullptr, std::memory_order_release);
+        }
     }
 
     static void initialize_worker()

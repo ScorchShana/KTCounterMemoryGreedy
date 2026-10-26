@@ -20,6 +20,7 @@ static void check_concurrent_publishers()
     ConcurrentMemoryPool p(64ULL << 20);
     ConcurrentMemoryPoolTestAccess::single(p);
     p.init_arenas();
+    p.set_spill_service(true);
     auto* descriptors = ConcurrentMemoryPoolTestAccess::arena(p).segments.get();
     std::array<std::future<void>, 4> publishers;
     for (size_t owner = 0; owner < publishers.size(); ++owner) publishers[owner] = std::async(std::launch::async, [&, owner] {
@@ -55,15 +56,13 @@ int main()
             ConcurrentMemoryPool p(32ULL << 20);
             ConcurrentMemoryPoolTestAccess::single(p);
             p.init_arenas();
+            p.set_spill_service(true);
             require(p.first_segment_record_capacity() == records && FIRST_SEGMENT_SIZE - records * kmer_bytes() == tail, "capacity or padding changed");
             std::vector<unsigned char> bytes(FIRST_SEGMENT_SIZE, 0x73);
             View stale;
             for (unsigned round = 0; round < 3; ++round) {
                 p.poll_first_progress(0);
-                {
-                    std::unique_lock control(ConcurrentMemoryPoolTestAccess::arena(p).control_mutex);
-                    require(cache_full_first(p, 0, bytes.data()), "normal FIRST publication waited on control");
-                }
+                require(cache_full_first(p, 0, bytes.data()), "normal FIRST publication failed");
                 p.request_first_drain();
                 View view;
                 require(p.try_claim_first(0, Consumer::Spill, view) == Status::Data && view.record_count == records, "valid segment not claimable");

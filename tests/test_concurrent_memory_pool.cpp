@@ -31,7 +31,7 @@ int main()
         auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool, 0);
         // A busy slow-path mutex must never make a try allocation wait.
         for (bool central : {false, true}) {
-            std::unique_lock held(central ? arena.mutex : arena.control_mutex);
+            std::unique_lock held(arena.mutex);
             std::promise<void*> returned;
             auto result = returned.get_future();
             std::thread attempt([&pool, central, &returned] {
@@ -40,7 +40,7 @@ int main()
             const bool immediate = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
             held.unlock();
             attempt.join();
-            require(immediate && (central ? result.get() == nullptr : result.get() != nullptr), "try allocation waited on a busy mutex");
+            require(immediate && result.get() == nullptr, "try allocation waited on a busy mutex");
         }
         {
             ConcurrentMemoryPool other(8ULL << 20);
@@ -78,7 +78,7 @@ int main()
         start.arrive_and_wait();
         std::vector<unsigned char> records(FIRST_SEGMENT_SIZE);
         while (cache_full_first(pool, 0, records.data())) {
-            const uint64_t slot = arena.first_offset.load() / FIRST_SEGMENT_SIZE;
+            const uint64_t slot = arena.first_begin / FIRST_SEGMENT_SIZE;
             first.push_back({0, slot, arena.segments[slot].tag.load() >> 3});
         }
         worker.join();
@@ -86,14 +86,14 @@ int main()
         require(unique.size() == tree.size(), "duplicate Tree pages");
         for (const auto& item : first) {
             const auto* segment = &arena.segments[item.segment_index];
-            require(segment && segment->data >= static_cast<char*>(arena.start_addr) + arena.first_offset, "missing FIRST segment");
+            require(segment && segment->data >= static_cast<char*>(arena.start_addr) + arena.first_begin, "missing FIRST segment");
             for (void* ptr : tree)
                 require(static_cast<char*>(ptr) + BLOCK_SIZE <= segment->data, "Tree overlaps FIRST");
         }
         require(pool.try_allocate_large(SIZE_MAX) == nullptr, "large overflow accepted");
         require(pool.try_allocate_large(capacity + BLOCK_SIZE) == nullptr, "impossible contiguous request accepted");
         // Consume the last partial refill, including the final single page.
-        size_t consumed = tree.size() + 1;
+        size_t consumed = tree.size();
         while (pool.try_allocate()) ++consumed;
         require(consumed * BLOCK_SIZE + first.size() * HUGE_PAGE_SIZE == capacity,
             "refill lost pages when fewer than a batch remained");

@@ -130,8 +130,8 @@ struct ConcurrentMemoryPoolTestAccess
         pool.file_end_ = static_cast<size_t>(std::numeric_limits<off_t>::max()) & ~(BLOCK_SIZE - 1);
     }
     static bool reservation_empty(ConcurrentMemoryPool& pool) {
-        std::lock_guard lock(pool.arenas_[0].control_mutex);
-        return !pool.arenas_[0].pending_bytes && !pool.arenas_[0].reserved_result;
+        std::lock_guard lock(pool.arenas_[0].mutex);
+        return !pool.arenas_[0].wait_head && !pool.arenas_[0].wait_tail;
     }
 };
 static void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }

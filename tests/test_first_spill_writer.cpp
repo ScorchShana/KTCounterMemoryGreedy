@@ -61,8 +61,8 @@ struct ConcurrentMemoryPoolTestAccess
         if (!pool.begin_first_segment(0, ref, data)) throw std::runtime_error("Filling fixture capacity");
     }
     static size_t pending(ConcurrentMemoryPool& memory) {
-        std::lock_guard lock(memory.arenas_[0].control_mutex);
-        return memory.arenas_[0].pending_bytes;
+        std::lock_guard lock(memory.arenas_[0].mutex);
+        return memory.arenas_[0].wait_head ? memory.arenas_[0].wait_head->bytes : 0;
     }
 };
 

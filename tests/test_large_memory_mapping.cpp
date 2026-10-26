@@ -51,6 +51,7 @@ int main()
         const size_t gap = pool.gap_bytes(0);
         std::vector<unsigned char> records(FIRST_SEGMENT_SIZE, 41);
         require(cache_full_first(pool, 0, records.data()), "mapped FIRST publication failed");
+        pool.set_spill_service(true);
         pool.request_first_drain();
         const auto status = pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
         require(status == ConcurrentMemoryPool::FirstClaimStatus::Data && pool.gap_bytes(0) == gap - FIRST_SEGMENT_SIZE, "mapped FIRST allocation failed");

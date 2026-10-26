@@ -430,6 +430,7 @@ public:
             } catch (...) { memory_pool_->complete_first(view); throw; }
             memory_pool_->complete_first(view);
             tree->submit_first_scan(batch);
+            tree->release_unused_first_scan_pages(batch);
             first_drain_singletons += segment_misses;
 #ifdef TEST_MODE
             repeat_query_count += segment_hits + segment_misses;

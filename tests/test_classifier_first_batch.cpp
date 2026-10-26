@@ -1843,6 +1843,7 @@ void check_sparse_input_keeps_filling(Shared& shared, bool reclaim_while_idle = 
     if (reclaim_while_idle) {
         // The owner is already waiting for input when reclamation starts.
         // It must observe the request without another input block or EOF.
+        pool.set_spill_service(true);
         pool.request_first_drain();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         ConcurrentMemoryPool::FirstSegmentView source;
@@ -1912,6 +1913,7 @@ void check_export_wait_reclaim(Shared& shared)
     resume.set_value();
     const bool blocked = worker.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
     const bool kept = pool.first_publications.load() == 0;
+    pool.set_spill_service(true);
     pool.request_first_drain();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     ConcurrentMemoryPool::FirstSegmentView source;
