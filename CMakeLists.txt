@@ -260,6 +260,7 @@ if(ENABLE_TSAN_TESTS)
 endif()
 add_test(NAME BloomRepeatTest COMMAND bloom_repeat_test)
 add_test(NAME ClassifierFirstBatchTest COMMAND classifier_first_batch_test)
+# The legacy target name now covers full first-pass Tree input without FIRST/refill.
 set_tests_properties(BloomRepeatTest ClassifierFirstBatchTest PROPERTIES TIMEOUT 60)
 add_executable(get_kmer_test tests/test_get_kmer.cpp)
 add_test(NAME GetKmerTest COMMAND get_kmer_test)
