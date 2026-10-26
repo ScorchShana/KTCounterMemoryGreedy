@@ -11,6 +11,13 @@
 struct ConcurrentMemoryPoolTestAccess
 {
     static Arena& arena(ConcurrentMemoryPool& pool, int i) { return pool.arenas_[i]; }
+    static void reclaim(ConcurrentMemoryPool& pool)
+    {
+        auto& arena = pool.arenas_[0];
+        std::lock_guard lock(arena.mutex);
+        arena.scan_reclaim_goal_pages.store(1, std::memory_order_release);
+        pool.update_pressure(arena);
+    }
     static void single(ConcurrentMemoryPool& pool)
     {
         pool.num_arenas_ = 1;
@@ -29,6 +36,32 @@ int main()
         ConcurrentMemoryPoolTestAccess::single(pool);
         pool.init_arenas();
         auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool, 0);
+        for (bool reclaim : {true, false}) {
+            if (reclaim) ConcurrentMemoryPoolTestAccess::reclaim(pool);
+            else { pool.clear_scan_reclaim_goals(); pool.poll_first_progress(0); }
+            std::unique_lock held(arena.mutex);
+            std::promise<bool> returned;
+            std::promise<void> started;
+            auto result = returned.get_future();
+            std::thread attempt([&] {
+                const unsigned char record[9]{0x6d};
+                started.set_value();
+                returned.set_value(pool.cache_first_record(0, record));
+            });
+            started.get_future().wait();
+            const bool immediate = result.wait_for(std::chrono::milliseconds(reclaim ? 200 : 20)) == std::future_status::ready;
+            held.unlock();
+            attempt.join();
+            require(reclaim ? immediate && !result.get() : !immediate && result.get(),
+                "FIRST admission ignored Reclaim filtering or mistook lock contention for exhaustion");
+        }
+        pool.set_spill_service(true);
+        pool.request_first_drain();
+        ConcurrentMemoryPool::FirstSegmentView source;
+        require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, source)
+            == ConcurrentMemoryPool::FirstClaimStatus::Data && pool.complete_first(source),
+            "blocking FIRST admission fixture did not publish and complete");
+        pool.set_spill_service(false);
         // A busy slow-path mutex must never make a try allocation wait.
         for (bool central : {false, true}) {
             std::unique_lock held(arena.mutex);

@@ -92,10 +92,15 @@ struct DecodedGroup {
     uint32_t records;
 };
 
-// Decode one complete in-memory group, allowing subsequent groups in input.
-// The destination holds complete keys, including repeated keys in the stream.
-inline DecodedGroup decode_group(std::span<const uint8_t> input, size_t width,
-    std::span<uint8_t> output)
+struct GroupHeader {
+    size_t prefix_bytes;
+    uint32_t records;
+    size_t encoded_bytes;
+};
+
+// Only the five-byte header must be present; streaming readers fetch the
+// prefix and payload separately from their already buffered input.
+inline GroupHeader parse_group_header(std::span<const uint8_t> input, size_t width)
 {
     if (!width || width > 32) throw std::runtime_error("invalid MSD key width");
     if (input.size() < GROUP_HEADER_BYTES) throw std::runtime_error("truncated MSD group header");
@@ -104,8 +109,19 @@ inline DecodedGroup decode_group(std::span<const uint8_t> input, size_t width,
     std::memcpy(&count, input.data() + 1, sizeof(count));
     if (prefix >= width) throw std::runtime_error("invalid MSD prefix length");
     if (!count || count > batch_records(width)) throw std::runtime_error("invalid MSD record count");
+    return {prefix, count, GROUP_HEADER_BYTES + prefix + size_t(count) * (width - prefix)};
+}
+
+// Decode one complete in-memory group, allowing subsequent groups in input.
+// The destination holds complete keys, including repeated keys in the stream.
+inline DecodedGroup decode_group(std::span<const uint8_t> input, size_t width,
+    std::span<uint8_t> output)
+{
+    const auto header = parse_group_header(input, width);
+    const size_t prefix = header.prefix_bytes;
+    const uint32_t count = header.records;
     const size_t suffix = width - prefix;
-    const size_t bytes = GROUP_HEADER_BYTES + prefix + size_t(count) * suffix;
+    const size_t bytes = header.encoded_bytes;
     if (input.size() < bytes) throw std::runtime_error("truncated MSD group payload");
     if (output.size() < size_t(count) * width) throw std::runtime_error("MSD decode buffer too small");
     const uint8_t* common = input.data() + GROUP_HEADER_BYTES;

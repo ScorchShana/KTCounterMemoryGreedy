@@ -518,10 +518,11 @@ public:
                     }
                     else
                     {
+                        memory_pool->seal_thread_first_if_reclaiming();
                         do
                         {
-                            memory_pool->seal_thread_first_if_reclaiming();
-                            classifier_enqueue_spin_backoff.backoff();
+                            if (classifier_enqueue_spin_backoff.backoff_should_check())
+                                memory_pool->seal_thread_first_if_reclaiming();
                         }
                         while (!queue_ptr->try_enqueue(task));
                         classifier_enqueue_spin_backoff.decay();
@@ -604,10 +605,11 @@ public:
                     }
                     else
                     {
+                        memory_pool->seal_thread_first_if_reclaiming();
                         do
                         {
-                            memory_pool->seal_thread_first_if_reclaiming();
-                            classifier_enqueue_spin_backoff.backoff();
+                            if (classifier_enqueue_spin_backoff.backoff_should_check())
+                                memory_pool->seal_thread_first_if_reclaiming();
                         }
                         while (!queue_ptr->try_enqueue(task));
                         classifier_enqueue_spin_backoff.decay();

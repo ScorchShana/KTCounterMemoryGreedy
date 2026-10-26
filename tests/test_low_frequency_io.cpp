@@ -14,6 +14,14 @@
 #include <sys/wait.h>
 #include <vector>
 
+struct LowFrequencyReaderTestAccess {
+    static void read_with(LowFrequencyReader& reader, ssize_t (*fn)(int, void*, size_t, off_t)) { reader.pread_ = fn; }
+};
+
+struct ExportWriterTestAccess {
+    static void limit(ExportWriter& writer, uint64_t bytes) { writer.shard_limit_bytes_ = bytes; }
+};
+
 namespace {
 void require(bool ok, const char* message)
 {
@@ -57,20 +65,19 @@ void check_io(const std::filesystem::path& directory, uint32_t k, size_t count,
     require(!std::filesystem::exists(input_path), "pending used the unnumbered filename");
     if (input.size() <= LOW_PENDING_SHARD_BYTES)
         require(pending.shard_count() == 1, "empty or complete input created an extra shard");
-    size_t offset = 0;
+    std::vector<std::vector<uint8_t>> all_pending;
     for (uint64_t i = 0; i < pending.shard_count(); ++i) {
-        std::ifstream shard(input_path.string() + "." + std::to_string(i), std::ios::binary);
-        require(shard.good(), "pending shard is missing");
-        std::vector<uint8_t> actual((std::istreambuf_iterator<char>(shard)), {});
-        require(actual.size() % width == 0, "pending shard split a packed record");
-        require(actual.size() < LOW_PENDING_SHARD_BYTES + exports.blockSize(), "pending shard exceeded block allowance");
-        if (i + 1 < pending.shard_count())
-            require(actual.size() >= LOW_PENDING_SHARD_BYTES, "pending shard rotated prematurely");
-        require(actual.size() <= input.size() - offset, "pending grew extra bytes");
-        require(std::equal(actual.begin(), actual.end(), input.begin() + offset), "pending bytes changed across shards");
-        offset += actual.size();
+        const auto path = input_path.string() + "." + std::to_string(i);
+        auto keys = low_msd_test::read(path, width, 37);
+        all_pending.insert(all_pending.end(), keys.begin(), keys.end());
+        require(std::filesystem::file_size(path) < LOW_PENDING_SHARD_BYTES + msd_prefix::BUFFER_BYTES,
+            "pending shard exceeded encoded batch allowance");
     }
-    require(offset == input.size(), "pending lost bytes");
+    std::vector<std::vector<uint8_t>> all_input;
+    for (size_t i = 0; i < count; ++i) all_input.emplace_back(input.begin() + i * width, input.begin() + (i + 1) * width);
+    std::sort(all_input.begin(), all_input.end());
+    std::sort(all_pending.begin(), all_pending.end());
+    require(all_input == all_pending, "pending encoded multiset differs");
     require(!std::filesystem::exists(input_path.string() + "." + std::to_string(pending.shard_count())),
         "pending created an empty trailing shard");
     exports.reset_producers(1);
@@ -180,6 +187,214 @@ void check_io(const std::filesystem::path& directory, uint32_t k, size_t count,
     check_returned(exports);
 }
 
+// Independent wire fixtures include raw groups larger than one input block.
+void check_encoded_reader(const std::filesystem::path& directory)
+{
+    for (const uint32_t k : {1U, 28U, 33U, 55U, 128U}) {
+        k_length = k;
+        const size_t width = kmer_bytes();
+        RunState state;
+        ActiveRunScope scope(state);
+        const auto base = (directory / ("encoded-" + std::to_string(k))).string();
+        std::vector<std::vector<uint8_t>> expected;
+        {
+            std::ofstream stream(base + ".0", std::ios::binary);
+            std::vector<size_t> prefixes{0};
+            if (width > 1) prefixes.push_back(1);
+            if (width > 2) prefixes.push_back(width - 1);
+            for (size_t prefix : prefixes) {
+                const uint32_t count = uint32_t(std::min<size_t>(90003, msd_prefix::batch_records(width)));
+                stream.put(char(prefix));
+                stream.write(reinterpret_cast<const char*>(&count), sizeof(count));
+                std::vector<uint8_t> common(prefix, 0x51);
+                stream.write(reinterpret_cast<const char*>(common.data()), common.size());
+                for (uint32_t i = 0; i < count; ++i) {
+                    std::vector<uint8_t> key(width);
+                    std::copy(common.begin(), common.end(), key.begin());
+                    for (size_t j = prefix; j < width; ++j) key[j] = uint8_t((i * 17 + j * 31) >> ((j % 3) * 3));
+                    stream.write(reinterpret_cast<const char*>(key.data() + prefix), width - prefix);
+                    expected.push_back(std::move(key));
+                }
+            }
+        }
+        const uint64_t encoded_bytes = std::filesystem::file_size(base + ".0");
+        // Empty shards are valid and must still be closed and removed.
+        std::ofstream(base + ".1", std::ios::binary);
+        SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(4096, 1);
+        RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> parsed(65536, 4);
+        std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> owners;
+        for (int i = 0; i < 4; ++i) owners.push_back(std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>());
+        for (size_t i = 0; i < prefix_owners.size(); ++i) prefix_owners[i] = i % owners.size();
+        MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+        ParserThreadPool parsers(owners, &global, nullptr, &parsed, 1);
+        LowFrequencyReader reader(reads);
+        parsers.start_low_pass(reads, 4);
+        reader.start(base, 2);
+        std::vector<std::vector<uint8_t>> actual;
+        while (!state.failed()) {
+            content_type content;
+            bool found = global.try_dequeue(content);
+            size_t queue = owners.size();
+            for (size_t i = 0; !found && i < owners.size(); ++i)
+                if ((found = owners[i]->try_dequeue(content))) queue = i;
+            if (!found) {
+                if (parsed.producer_finished()) {
+                    bool empty = global.size() == 0;
+                    for (const auto& owner : owners) empty = empty && owner->size() == 0;
+                    if (empty) break;
+                }
+                std::this_thread::yield();
+                continue;
+            }
+            for (size_t i = 0; i < content.length; ++i) {
+                const auto* key = reinterpret_cast<const uint8_t*>(content.data) + i * width;
+                if (queue < owners.size() && prefix_owners[key[0]] != queue)
+                    state.fail(std::make_exception_ptr(std::runtime_error("encoded group reached wrong owner")), "test");
+                actual.emplace_back(key, key + width);
+            }
+            parsed.consumer_enqueue(content.data);
+        }
+        reader.join(); parsers.join(); state.check();
+        std::sort(actual.begin(), actual.end()); std::sort(expected.begin(), expected.end());
+        require(actual == expected && reader.records_read() == expected.size(), "encoded reader/parser multiset differs");
+        require(reader.encoded_bytes_read() == encoded_bytes, "reader counted virtual headers as file bytes");
+        require(reader.read_calls() <= (encoded_bytes + LowFrequencyReader::READ_CACHE_BYTES - 1) / LowFrequencyReader::READ_CACHE_BYTES,
+            "reader issued per-group reads");
+        require(!std::filesystem::exists(base + ".0") && !std::filesystem::exists(base + ".1"), "encoded shards retained");
+        char* block; size_t returned = 0;
+        while (reads.producer_try_dequeue(block)) ++returned;
+        require(returned == reads.capacity(), "encoded reader leaked input blocks");
+    }
+}
+
+ssize_t fragmented_read(int fd, void* data, size_t bytes, off_t offset)
+{
+    static unsigned calls = 0; // Only the single Reader thread uses this hook.
+    if (++calls % 7 == 0) { errno = EINTR; return -1; }
+    return ::pread(fd, data, std::min<size_t>(bytes, 7), offset);
+}
+
+void check_reader_boundaries(const std::filesystem::path& directory, bool fragmented)
+{
+    k_length = 128;
+    RunState state; ActiveRunScope scope(state);
+    const auto base = (directory / (fragmented ? "short-cache" : "full-cache")).string();
+    const uint32_t count = uint32_t(msd_prefix::batch_records(32));
+    {
+        std::ofstream stream(base + ".0", std::ios::binary);
+        for (int g = 0; g < 4; ++g) {
+            stream.put(31); stream.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            std::array<char, 31> prefix; prefix.fill(char(0x40 + g));
+            stream.write(prefix.data(), prefix.size());
+            for (uint32_t i = 0; i < count; ++i) stream.put(char(i));
+        }
+    }
+    const auto encoded = std::filesystem::file_size(base + ".0");
+    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, 1);
+    LowFrequencyReader reader(reads);
+    if (fragmented) LowFrequencyReaderTestAccess::read_with(reader, fragmented_read);
+    reader.start(base, 1);
+    size_t records = 0, tasks = 0;
+    while (!state.failed()) {
+        content_type content;
+        bool available = reads.consumer_try_dequeue(content);
+        if (!available && reads.producer_finished()) {
+            available = reads.consumer_try_dequeue(content);
+            if (!available) break;
+        }
+        if (!available) { std::this_thread::yield(); continue; }
+        size_t pos = 0, decoded = 0;
+        while (pos < content.length) {
+            const auto input = std::span(reinterpret_cast<const uint8_t*>(content.data) + pos, content.length - pos);
+            const auto header = msd_prefix::parse_group_header(input, 32);
+            require(header.prefix_bytes == 31 && header.encoded_bytes <= input.size(), "cache split changed a header");
+            const auto* prefix = input.data() + 5;
+            const auto* suffix = prefix + 31;
+            for (size_t i = 0; i < header.records; ++i) {
+                const uint8_t expected = uint8_t(0x40 + records / count);
+                require(std::all_of(prefix, prefix + 31, [expected](uint8_t b) { return b == expected; })
+                    && suffix[i] == uint8_t(records % count), "cache boundary changed a key");
+                ++records;
+            }
+            decoded += header.records * 32;
+            pos += header.encoded_bytes;
+        }
+        require(decoded <= msd_prefix::BUFFER_BYTES && content.length <= reads.blockSize(), "reader exceeded task work bound");
+        ++tasks;
+        reads.consumer_enqueue(content.data);
+    }
+    reader.join(); state.check();
+    require(records == 4 * size_t(count) && reader.records_read() == records && tasks >= 4, "reader lost a fragmented group");
+    require(reader.encoded_bytes_read() == encoded, "reader counted synthesized headers");
+    require(fragmented || reader.read_calls() == (encoded + LowFrequencyReader::READ_CACHE_BYTES - 1) / LowFrequencyReader::READ_CACHE_BYTES,
+        "small groups triggered additional syscalls");
+}
+
+ssize_t cancel_interrupted_read(int, void*, size_t, off_t)
+{
+    static bool first = true;
+    if (first) {
+        first = false;
+        RunState::active->fail(std::make_exception_ptr(std::runtime_error("cancel read")), "cancel test");
+        errno = EINTR;
+        return -1;
+    }
+    return 0; // Old retry loops terminate so a failing regression can still join.
+}
+
+void check_reader_failures(const std::filesystem::path& directory)
+{
+    k_length = 33;
+    for (int mode = 0; mode < 6; ++mode) {
+        RunState state; ActiveRunScope scope(state);
+        const auto base = (directory / ("reader-bad-" + std::to_string(mode))).string();
+        std::vector<uint8_t> bytes(5, 0);
+        uint32_t count = mode == 0 ? 0 : mode == 1 ? uint32_t(msd_prefix::batch_records(9) + 1) : 1;
+        bytes[0] = mode == 2 ? 9 : mode == 3 ? 8 : 0;
+        std::memcpy(bytes.data() + 1, &count, 4);
+        if (mode == 4) bytes.resize(13); // One missing payload byte after acquiring an output block.
+        {
+            std::ofstream file(base + ".0", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(64, 1);
+        LowFrequencyReader reader(reads);
+        if (mode == 5) LowFrequencyReaderTestAccess::read_with(reader, cancel_interrupted_read);
+        reader.start(base, 1); reader.join();
+        require(state.failed() && !reads.producer_finished() && std::filesystem::exists(base + ".0"),
+            "bad/cancelled shard was reported consumed");
+        char* block; size_t returned = 0;
+        while (reads.producer_try_dequeue(block)) ++returned;
+        require(returned == reads.capacity(), "reader failure leaked its private block");
+        if (mode == 5) require(reader.read_calls() == 1, "EINTR retry ignored cancellation");
+    }
+}
+
+void check_parser_failure_cleanup()
+{
+    k_length = 33; prefix_owners.fill(0);
+    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(64, 1);
+    RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> parsed(64, 1);
+    std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> owners{
+        std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>()};
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    char* block; reads.producer_dequeue(block);
+    const uint32_t one = 1;
+    block[0] = 1; std::memcpy(block + 1, &one, 4); std::memset(block + 5, 0x51, 9);
+    block[14] = 9; std::memcpy(block + 15, &one, 4); // Invalid P, after an owner tail is acquired.
+    reads.producer_enqueue({block, 19}); reads.producer_set_finished();
+    LowFrequencyParser parser(owners, &global);
+    bool rejected = false;
+    try { parser.parse_and_push(reads, parsed); } catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "invalid parser group accepted");
+    size_t returned = 0;
+    while (reads.producer_try_dequeue(block)) ++returned;
+    require(returned == reads.capacity(), "parser exception leaked its input block");
+    returned = 0;
+    while (parsed.producer_try_dequeue(block)) ++returned;
+    require(returned == parsed.capacity(), "parser exception leaked owner tail blocks");
+}
+
 void check_queue_threshold(size_t queued)
 {
     constexpr uint32_t k = 33;
@@ -200,8 +415,11 @@ void check_queue_threshold(size_t queued)
     key[4] = 1;
     char* block;
     reads.producer_dequeue(block);
-    std::memcpy(block, key.data(), key.size());
-    reads.producer_enqueue({block, 1});
+    block[0] = 0;
+    const uint32_t one = 1;
+    std::memcpy(block + 1, &one, sizeof(one));
+    std::memcpy(block + 5, key.data(), key.size());
+    reads.producer_enqueue({block, 5 + key.size()});
     reads.producer_set_finished();
     LowFrequencyParser parser( owners, &global);
     parser.parse_and_push(reads, parsed);
@@ -231,8 +449,9 @@ void check_reader_lifecycle(const std::filesystem::path& directory, int failure)
     RunState state;
     ActiveRunScope active(state);
     const auto base = (directory / ("lifecycle-" + std::to_string(failure))).string();
-    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(kmer_bytes(), 1);
-    const size_t count = reads.capacity() + 4;
+    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(5 + kmer_bytes(), 1);
+    // Truncation must affect bytes not already buffered by the new Reader.
+    const size_t count = reads.capacity() + 4 + LowFrequencyReader::READ_CACHE_BYTES / (5 + kmer_bytes());
     for (int shard = 0; shard < 3; ++shard) {
         std::ofstream out(base + "." + std::to_string(shard), std::ios::binary);
         const size_t begin = shard == 0 ? 0 : 1;
@@ -240,7 +459,7 @@ void check_reader_lifecycle(const std::filesystem::path& directory, int failure)
         for (uint64_t i = begin; i < end; ++i) {
             std::array<char, 11> record{};
             std::memcpy(record.data(), &i, sizeof(i));
-            out.write(record.data(), record.size());
+            low_msd_test::write_raw(out, std::span(reinterpret_cast<const uint8_t*>(record.data()), record.size()), kmer_bytes());
         }
     }
     LowFrequencyReader reader(reads);
@@ -259,8 +478,8 @@ void check_reader_lifecycle(const std::filesystem::path& directory, int failure)
     uint64_t next = 0;
     for (auto& content : held) {
         uint64_t id;
-        std::memcpy(&id, content.data, sizeof(id));
-        require(content.length == 1 && id == next++, "reader changed cross-shard order");
+        std::memcpy(&id, content.data + 5, sizeof(id));
+        require(content.length == 5 + kmer_bytes() && id == next++, "reader changed cross-shard order");
         reads.consumer_enqueue(content.data);
     }
     while (!state.failed()) {
@@ -276,8 +495,8 @@ void check_reader_lifecycle(const std::filesystem::path& directory, int failure)
             continue;
         }
         uint64_t id;
-        std::memcpy(&id, content.data, sizeof(id));
-        require(content.length == 1 && id == next++, "reader changed cross-shard bytes");
+        std::memcpy(&id, content.data + 5, sizeof(id));
+        require(content.length == 5 + kmer_bytes() && id == next++, "reader changed cross-shard bytes");
         reads.consumer_enqueue(content.data);
     }
     reader.join();
@@ -301,7 +520,7 @@ void check_invalid_middle_shard(const std::filesystem::path& directory, bool mis
     std::ofstream(base + ".0", std::ios::binary);
     if (!missing) std::ofstream(base + ".1", std::ios::binary).put('x');
     std::ofstream(base + ".2", std::ios::binary).put('x');
-    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(kmer_bytes(), 1);
+    SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> reads(5 + kmer_bytes(), 1);
     LowFrequencyReader reader(reads);
     reader.start(base, 3);
     reader.join();
@@ -449,7 +668,8 @@ void check_rotation_error(const std::filesystem::path& directory, bool close_err
     if (close_error) ops.close = fail_close;
     ExportWriter writer(&exports, base, ExportWriter::OutputKind::Pending, nullptr, &ops);
     const size_t capacity = exports.blockSize() / kmer_bytes();
-    const size_t records = LOW_PENDING_SHARD_BYTES / kmer_bytes() + 2 * capacity;
+    const size_t records = 3 * msd_prefix::batch_records(kmer_bytes()) + 2 * capacity;
+    ExportWriterTestAccess::limit(writer, 1);
     for (size_t pos = 0; pos < records;) {
         char* block;
         exports.producer_dequeue(block);
@@ -502,13 +722,41 @@ void check_errors(const std::filesystem::path& directory)
 }
 }
 
-int main()
+int main(int argc, char** argv)
 {
     char name[] = "/tmp/tree-low-io-XXXXXX";
     const std::filesystem::path directory = ::mkdtemp(name);
     try {
+        if (argc > 1 && std::string(argv[1]) == "--reader-failures-only") {
+            check_reader_failures(directory);
+            std::filesystem::remove_all(directory);
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--parser-failure-only") {
+            check_parser_failure_cleanup();
+            std::filesystem::remove_all(directory);
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--encoded-only") {
+            check_reader_boundaries(directory, false);
+            check_reader_boundaries(directory, true);
+            check_encoded_reader(directory);
+            std::filesystem::remove_all(directory);
+            std::cout << "Encoded reader/parser tests passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--pending-only") {
+            check_io<2>(directory, 33, 61003);
+            std::filesystem::remove_all(directory);
+            return 0;
+        }
+        check_encoded_reader(directory);
+        check_reader_boundaries(directory, false);
+        check_reader_boundaries(directory, true);
+        check_parser_failure_cleanup();
+        check_reader_failures(directory);
         // Fork error cases before POSIX AIO starts helper threads in this process.
-        check_errors(directory);
+        if (!(argc > 1 && std::string(argv[1]) == "--no-death")) check_errors(directory);
         for (int failure = 0; failure <= 4; ++failure) check_final_aio(directory, failure);
         for (int failure = 0; failure < 3; ++failure) check_reader_lifecycle(directory, failure);
         check_invalid_middle_shard(directory, true);
@@ -519,9 +767,9 @@ int main()
         check_io<1>(directory, 32, 1); // A zero-kept block must be returned.
         check_io<2>(directory, 33, 61003);
         check_io<2>(directory, 41, 61003);
+        check_rotation_error(directory, false);
+        check_rotation_error(directory, true);
         if constexpr (LOW_PENDING_SHARD_BYTES <= (8ULL << 20)) {
-            check_rotation_error(directory, false);
-            check_rotation_error(directory, true);
             check_io<1>(directory, 32, (LOW_PENDING_SHARD_BYTES + 7) / 8);
             check_io<1>(directory, 32, (LOW_PENDING_SHARD_BYTES + 7) / 8 + 1);
         }

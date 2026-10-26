@@ -81,6 +81,7 @@ class FastqClassifier
     ConcurrentMemoryPool* memory_pool_;
     const bool first_cache_enabled_;
     const int first_arena_;
+    bool first_paused_ = false;
     size_t checkpoint_bytes_ = 0;
     ConcurrentFirstBlockRing* first_occurrence_ring_;
     uint8_t* first_block_;
@@ -180,6 +181,7 @@ public:
         {
             local_global_bloom_filter[i] = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[i]);
         }
+        if (first_cache_enabled_) refresh_first_state();
     }
 
     void classify_first_pass()
@@ -275,13 +277,13 @@ public:
                     }
                     else
                     {
+                        if (first_cache_enabled_) refresh_first_state();
                         do
                         {
 #ifdef TEST_MODE
                             consumer_enqueue_spin_time++;
 #endif
-                            memory_pool_->seal_thread_first_if_reclaiming();
-                            enqueue_backoff.backoff();
+                            if (enqueue_backoff.backoff_should_check() && first_cache_enabled_) refresh_first_state();
                         }
                         while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data));
 
@@ -296,8 +298,7 @@ public:
                         consumer_dequeue_spin_time++;
 #endif
 
-                    memory_pool_->seal_thread_first_if_reclaiming();
-                    dequeue_backoff.backoff();
+                    if (dequeue_backoff.backoff_should_check() && first_cache_enabled_) refresh_first_state();
                 }
             }
             else
@@ -495,13 +496,18 @@ private:
         hit_count = 0;
     }
 
+    void refresh_first_state() noexcept
+    {
+        first_paused_ = memory_pool_->first_reclaiming(first_arena_);
+        if (first_paused_) memory_pool_->seal_thread_first();
+    }
+
     void record_checkpoint()
     {
         checkpoint_bytes_ += kmer_bytes();
         if (checkpoint_bytes_ >= BLOCK_SIZE) {
             checkpoint_bytes_ = 0;
             memory_pool_->run_state().check();
-            if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
         }
     }
     bool try_dequeue_low_task(content_type& content)
@@ -570,7 +576,7 @@ private:
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_owned_local_block();
-        if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
+        if (first_cache_enabled_) refresh_first_state();
         total_deal_kmer_count += kmer_count;
     }
 
@@ -580,7 +586,7 @@ private:
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
         classify_other_local_block();
-        if (first_cache_enabled_) memory_pool_->seal_thread_first_if_reclaiming();
+        if (first_cache_enabled_) refresh_first_state();
         total_deal_kmer_count += kmer_count;
     }
 
@@ -657,7 +663,8 @@ private:
         first_occurrence_count++;
 #endif
         if (!first_occurrence_ring_) {
-            if (!first_cache_enabled_ || !memory_pool_->cache_first_record(first_arena_, val)) {
+            if (!first_cache_enabled_ || first_paused_ || !memory_pool_->cache_first_record(first_arena_, val)) {
+                if (first_cache_enabled_) first_paused_ = true;
                 export_one_kmer(val);
 #ifdef TEST_MODE
                 ++first_direct_pending;
@@ -1017,14 +1024,14 @@ private:
             return;
         }
 
+        if (first_cache_enabled_) refresh_first_state();
         do
         {
 
 #ifdef TEST_MODE
             producer_enqueue_spin_time++;
 #endif
-            memory_pool_->seal_thread_first_if_reclaiming();
-            enqueue_to_export_writer_backoff.backoff();
+            if (enqueue_to_export_writer_backoff.backoff_should_check() && first_cache_enabled_) refresh_first_state();
         }
         while (!export_pool->producer_try_enqueue(content));
 
@@ -1041,14 +1048,14 @@ private:
             return;
         }
 
+        if (first_cache_enabled_) refresh_first_state();
         do
         {
 
 #ifdef TEST_MODE
             producer_dequeue_spin_time++;
 #endif
-            memory_pool_->seal_thread_first_if_reclaiming();
-            dequeue_from_export_writer_backoff.backoff();
+            if (dequeue_from_export_writer_backoff.backoff_should_check() && first_cache_enabled_) refresh_first_state();
         }
         while (!export_pool->producer_try_dequeue(data));
 

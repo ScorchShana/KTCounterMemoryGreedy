@@ -1,5 +1,6 @@
 #include "../src/MemoryBudget.h"
 #include "../src/MsdPrefixCodec.h"
+#include "../src/LowFrequencyReader.h"
 #include "../src/ConcurrentMemoryPool.h"
 
 #include <iostream>
@@ -33,11 +34,12 @@ int main()
         require(rings.peak_bytes > rings.run_data, "RingPool object metadata missing");
         require(rings.peak_bytes == std::max({rings.run_bytes, rings.replay_bytes, rings.final_bytes}),
             "RingPool peak must use simultaneous lifetimes");
-        constexpr size_t pending_buffers = EXPORT_WRITER_BUFFER_BYTES * EXPORT_WRITER_BUFFER_COUNT;
+        constexpr size_t pending_buffers = msd_prefix::FINAL_LOW_BUFFER_BYTES;
         require(msd_prefix::FINAL_LOW_BUFFER_BYTES == 8 * mib, "FinalLow four-buffer budget");
         const size_t peak = std::max({rings.run_bytes + pending_buffers,
-            rings.replay_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES,
-            rings.final_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES});
+            rings.replay_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES + LowFrequencyReader::READ_CACHE_BYTES,
+            rings.final_bytes + 2 * msd_prefix::FINAL_LOW_BUFFER_BYTES});
+        require(main_pool_overhead_bytes() == peak, "exact phase overhead omits a live buffer");
         require(main_pool_budget(1) == ((1ULL << 30) - peak) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
             "main pool stage peak deduction/alignment");
         for (uint64_t gib : {1U, 2U, 350U}) {

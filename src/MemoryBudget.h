@@ -3,6 +3,7 @@
 
 #include "RingMemoryPool.h"
 #include "MsdPrefixCodec.h"
+#include "LowFrequencyReader.h"
 #include <algorithm>
 #include <atomic>
 #include <limits>
@@ -33,6 +34,16 @@ inline RingPoolBudget ring_pool_budget() noexcept
     return result;
 }
 
+inline size_t main_pool_overhead_bytes() noexcept
+{
+    const auto phases = ring_pool_budget();
+    constexpr size_t writer = msd_prefix::FINAL_LOW_BUFFER_BYTES;
+    return std::max({phases.run_bytes + writer,
+        phases.final_bytes + 2 * writer, // Pending reclamation overlaps FinalLow.
+        phases.replay_bytes + writer + LowFrequencyReader::READ_CACHE_BYTES,
+        phases.final_bytes + writer});
+}
+
 inline size_t main_pool_budget(uint64_t gib)
 {
     constexpr uint64_t gib_bytes = 1ULL << 30;
@@ -40,12 +51,7 @@ inline size_t main_pool_budget(uint64_t gib)
     if (gib > std::numeric_limits<size_t>::max() / gib_bytes)
         throw std::invalid_argument("memory limit GiB conversion overflow");
     const size_t total = static_cast<size_t>(gib) * gib_bytes;
-    // The pending transport is freed at normal-drain before final-low starts.
-    const auto phases = ring_pool_budget();
-    const size_t rings = std::max({
-        phases.run_bytes + EXPORT_WRITER_BUFFER_BYTES * EXPORT_WRITER_BUFFER_COUNT,
-        phases.replay_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES,
-        phases.final_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES});
+    const size_t rings = main_pool_overhead_bytes();
     if (total <= rings || total - rings < segment_bytes)
         throw std::invalid_argument("memory limit cannot hold RingPools and main pool");
     return (total - rings) & ~(segment_bytes - 1);

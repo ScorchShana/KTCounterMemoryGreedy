@@ -63,6 +63,9 @@ struct ConcurrentFirstBlockRingTestAccess
 
 struct FastqClassifierTestAccess
 {
+    static bool paused(const FastqClassifier<uint32_t>& classifier) { return classifier.first_paused_; }
+    static void refresh(FastqClassifier<uint32_t>& classifier) { classifier.refresh_first_state(); }
+    static void checkpoint(FastqClassifier<uint32_t>& classifier) { classifier.record_checkpoint(); }
     static void feed(FastqClassifier<uint32_t>& classifier, std::vector<Key>& keys, bool owned)
     {
         const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
@@ -110,6 +113,18 @@ struct FastqClassifierTestAccess
     {
         for (size_t i = 0; i < classifier.export_kmer_block_count; ++i)
             ++counts[read_key(classifier.export_block_ptr->k_mers.data() + i * kmer_bytes())];
+    }
+};
+
+struct ConcurrentMemoryPoolTestAccess
+{
+    static Arena& arena(ConcurrentMemoryPool& pool) { return pool.arenas_[0]; }
+    static void scan_demand(ConcurrentMemoryPool& pool, uint64_t pages)
+    {
+        auto& arena = pool.arenas_[0];
+        std::lock_guard lock(arena.mutex);
+        arena.scan_reclaim_goal_pages.store(pages, std::memory_order_release);
+        pool.update_pressure(arena);
     }
 };
 
@@ -820,7 +835,7 @@ void check_late_reconcile(Shared& shared, uint32_t k)
         std::array<uint8_t, 32> record{};
         for (const auto& key : pending) {
             std::memcpy(record.data(), key.data(), width);
-            out.write(reinterpret_cast<const char*>(record.data()), width);
+            low_msd_test::write_raw(out, std::span(record.data(), width), width);
         }
     }
     // Finish and drain the first-pass export queue before reusing it.
@@ -913,7 +928,8 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     shared.exports.producer_set_finished();
     pending_writer.join();
     require(classifier.repeat_query_count == runtime_queries, "first pass prematurely drained FIRST");
-    require(std::filesystem::file_size(pending_path.string() + ".0") == pending.size() * kmer_bytes(),
+    const auto decoded_pending = low_msd_test::read(pending_path.string() + ".0", kmer_bytes());
+    require(decoded_pending.size() == pending.size(),
         "terminal FIRST misses reached the pending file");
 
     const uint64_t direct_singletons = expected_low.size();
@@ -921,9 +937,7 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     if (has_pending) {
         char* block;
         shared.inputs.producer_dequeue(block);
-        std::ifstream input(pending_path.string() + ".0", std::ios::binary);
-        input.read(block, kmer_bytes());
-        require(input.good(), "failed to read pending test record");
+        std::memcpy(block, decoded_pending.front().data(), kmer_bytes());
         fixture.local->enqueue({block, 1});
         ++expected_low[pending[0]];
     }
@@ -1329,6 +1343,74 @@ void check_cross_classifier_finish(Shared& shared)
         a->total_kmers_send_to_tree + b->total_kmers_send_to_tree + a->total_kmers_exported + b->total_kmers_exported,
         "global input count differs from tree plus exports");
 }
+void check_first_pause_refresh(Shared& shared)
+{
+    using Access = FastqClassifierTestAccess;
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    const auto key = make_key(33, 8831);
+    Access::push(classifier, key);
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 1);
+    for (size_t i = 0; i < BLOCK_SIZE; i += kmer_bytes()) Access::checkpoint(classifier);
+    require(pool.thread_first_records() == 1, "4 KiB checkpoint prematurely sealed FIRST");
+    Access::refresh(classifier);
+    require(Access::paused(classifier) && pool.thread_first_records() == 0,
+        "Reclaim refresh did not pause and seal the exclusive segment");
+    {
+        std::unique_lock held(ConcurrentMemoryPoolTestAccess::arena(pool).mutex);
+        std::promise<void> returned;
+        auto result = returned.get_future();
+        std::thread attempt([&] { Access::push(classifier, key); returned.set_value(); });
+        const bool immediate = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+        held.unlock();
+        attempt.join();
+        require(immediate, "paused classifier consulted locked admission");
+    }
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 0);
+    Access::push(classifier, key);
+    require(classifier.first_direct_pending == 2 && Access::paused(classifier),
+        "recovered space bypassed the batch-local pause");
+    std::vector<Key> boundary{key};
+    Access::feed(classifier, boundary, true);
+    require(!Access::paused(classifier), "Grow refresh did not resume a classifier without a segment");
+    Access::push(classifier, key);
+    require(pool.thread_first_records() == 1, "resumed classifier did not acquire a new segment");
+    pool.seal_thread_first();
+    // A stale local Grow decision must still be rejected by the pool filter.
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 1);
+    Access::push(classifier, key);
+    require(Access::paused(classifier) && classifier.first_direct_pending == 4,
+        "stale Grow cache ignored the pool's Reclaim hint");
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 0);
+    Access::refresh(classifier);
+    // Capacity denial in Grow also pauses until the next batch boundary.
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool);
+    pool.allocate_large_from_numa(pool.gap_bytes(0) - arena.high, 0);
+    Access::push(classifier, key);
+    require(Access::paused(classifier) && !pool.first_reclaiming(0),
+        "Grow capacity denial did not pause locally");
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> actual;
+    collect_exports(shared, actual);
+    pool.freeze_first();
+    ConcurrentMemoryPool::FirstSegmentView view;
+    while (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, view)
+        == ConcurrentMemoryPool::FirstClaimStatus::Data) {
+        for (size_t i = 0; i < view.record_count; ++i) ++actual[read_key(view.records + i * kmer_bytes())];
+        require(pool.complete_first(view), "pause fixture completion failed");
+    }
+    require(actual == std::map<Key, uint64_t>{{key, 7}}, "pause and recovery changed record ownership");
+}
+
 void check_dynamic_safe_points(Shared& shared, bool enabled)
 {
     k_length = 33;
@@ -1376,7 +1458,7 @@ void check_dynamic_safe_points(Shared& shared, bool enabled)
     pool.freeze_first();
     classifier.process_memory_first<false>();
     require(pool.first_empty(), "memory phase retained a partial FIRST segment");
-    require(std::filesystem::file_size(directory.path / "pending.0") / kmer_bytes()
+    require(low_msd_test::read(directory.path / "pending.0", kmer_bytes()).size()
             + classifier.first_drain_singletons + classifier.first_memory_to_tree == 2,
         "FIRST=0/shrink/resume changed pending responsibility");
     std::map<Key, uint64_t> roots;
@@ -2243,6 +2325,11 @@ void check_low_queue_pause(Shared& shared)
 int main(int argc, char* argv[])
 {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--first-pause") == 0) {
+            Shared shared;
+            check_first_pause_refresh(shared);
+            return 0;
+        }
         if (argc == 2 && (std::strcmp(argv[1], "--first-soft") == 0 || std::strcmp(argv[1], "--first-idle") == 0
             || std::strcmp(argv[1], "--first-idle-reclaim") == 0 || std::strcmp(argv[1], "--first-export-wait") == 0)) {
             Shared shared;
@@ -2309,6 +2396,7 @@ int main(int argc, char* argv[])
         check_cross_classifier_finish(shared);
         check_low_owner_and_global_queues(shared);
         check_direct_first_segments(shared);
+        check_first_pause_refresh(shared);
         check_soft_pressure_keeps_filling(shared);
         check_sparse_input_keeps_filling(shared);
         check_sparse_input_keeps_filling(shared, true);

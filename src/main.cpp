@@ -659,6 +659,7 @@ int process_main()
     const auto export_join_end = std::chrono::steady_clock::now();
 #endif
     [[maybe_unused]] uint64_t low_records_read = 0;
+    uint64_t pending_encoded_read = 0;
     {
         SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> low_ring_pool(
             LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, low_reader_num);
@@ -671,6 +672,7 @@ int process_main()
         parser_thread_pool->join();
     runtime.check();
         low_records_read = low_reader.records_read();
+        pending_encoded_read = low_reader.encoded_bytes_read();
         } catch (...) {
             runtime.fail(std::current_exception(), "pending replay");
             low_reader.join();
@@ -760,6 +762,8 @@ int process_main()
     std::cout << "Final elapsed us: " << final_elapsed_us << std::endl;
 #endif
 
+    std::cout << "Pending encoded bytes written: " << export_writer->encoded_bytes_written() << '\n';
+    std::cout << "Pending encoded bytes read: " << pending_encoded_read << '\n';
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 #ifdef TEST_MODE
     std::cout << "RUN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - mid_start).count() << '\n';

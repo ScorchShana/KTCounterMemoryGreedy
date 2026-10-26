@@ -14,6 +14,12 @@ struct ConcurrentMemoryPoolTestAccess
         pool.total_cpus_ = pool.cpus_per_node_[0] = 1;
     }
     static Arena& arena(ConcurrentMemoryPool& pool) { return pool.arenas_[0]; }
+    static void reclaim(ConcurrentMemoryPool& pool) {
+        auto& arena = pool.arenas_[0];
+        std::lock_guard lock(arena.mutex);
+        arena.scan_reclaim_goal_pages.store(1, std::memory_order_release);
+        pool.update_pressure(arena);
+    }
 };
 struct alignas(64) Sample {
     double seconds = 0;
@@ -30,7 +36,8 @@ int main(int argc, char** argv)
     k_length = 33;
     const size_t threads = std::stoul(argv[1]);
     const std::string mode = argc == 3 ? argv[2] : "bump";
-    if (mode != "bump" && mode != "refill" && mode != "first" && mode != "mixed") return 1;
+    if (mode != "bump" && mode != "refill" && mode != "first" && mode != "mixed"
+        && mode != "reclaim_reject" && mode != "writer_idle" && mode != "writer_contention") return 1;
     cpu_set_t mask;
     CPU_ZERO(&mask);
     if (sched_getaffinity(0, sizeof(mask), &mask)) return 1;
@@ -42,6 +49,13 @@ int main(int argc, char** argv)
     ConcurrentMemoryPoolTestAccess::single(pool);
     pool.init_arenas();
     pool.set_spill_service(true);
+    if (mode == "reclaim_reject") ConcurrentMemoryPoolTestAccess::reclaim(pool);
+    if (mode == "writer_idle" || mode == "writer_contention") {
+        const unsigned char record[9]{0x6d};
+        if (!pool.cache_first_record(0, record)) return 2;
+        if (mode == "writer_idle") { pool.seal_thread_first(); pool.freeze_first(); }
+        else pool.request_first_drain(); // Hold Filling while Tree refills compete.
+    }
     std::barrier start(static_cast<std::ptrdiff_t>(threads));
     std::vector<Sample> samples(threads);
     std::atomic<bool> finished{false};
@@ -95,13 +109,23 @@ int main(int argc, char** argv)
                 operation_begin = std::chrono::steady_clock::now();
             }
 #endif
-            if (mode == "first" || (mode == "mixed" && n % 256 == 0)) {
+            if (mode == "reclaim_reject") {
+                if (pool.cache_first_record(0, record)) std::terminate();
+            } else if (mode == "writer_idle" || (mode == "writer_contention" && i == 0)) {
+                ConcurrentMemoryPool::FirstSegmentView view;
+#ifdef FIRST_POLL_OPT
+                if (pool.writer_work_pending()) pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+#else
+                pool.poll_first_progress(0);
+                pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+#endif
+            } else if (mode == "first" || (mode == "mixed" && n % 256 == 0)) {
                 while (!pool.cache_first_record(0, record)) std::this_thread::yield();
                 pool.seal_thread_first();
             }
             if (mode == "bump") {
                 checksum ^= reinterpret_cast<uintptr_t>(pool.allocate_large_from_numa(BLOCK_SIZE, 0));
-            } else if (mode != "first") {
+            } else if (mode == "refill" || mode == "mixed" || (mode == "writer_contention" && i != 0)) {
                 pages[n % burst] = pool.allocate();
                 checksum ^= reinterpret_cast<uintptr_t>(pages[n % burst]);
                 if (n % burst == burst - 1 || n + 1 == per_thread)
@@ -118,6 +142,14 @@ int main(int argc, char** argv)
     for (auto& worker : workers) worker.join();
     finished.store(true, std::memory_order_release);
     if (consumer.joinable()) consumer.join();
+    if (mode == "writer_idle" || mode == "writer_contention") {
+        pool.seal_thread_first();
+        pool.freeze_first();
+        ConcurrentMemoryPool::FirstSegmentView view;
+        while (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, view)
+            == ConcurrentMemoryPool::FirstClaimStatus::Data)
+            if (!pool.complete_first(view)) return 2;
+    }
     const size_t expected_spills = mode == "first" ? threads * per_thread
         : mode == "mixed" ? threads * ((per_thread + 255) / 256) : 0;
     if (spilled != expected_spills) return 2;

@@ -1,8 +1,10 @@
 #include "first_pool_fixture.h"
 #include "../src/ConcurrentMemoryPool.h"
 #include "../src/ExportWriter.h"
+#include "low_msd_test_helpers.h"
 #include <filesystem>
 #include <future>
+#include <barrier>
 #include <iostream>
 #include <stdexcept>
 
@@ -23,6 +25,12 @@ struct ConcurrentMemoryPoolTestAccess
         return pool.arenas_[0].wait_head ? pool.arenas_[0].wait_head->bytes : 0;
     }
     static Arena& arena(ConcurrentMemoryPool& pool) { return pool.arenas_[0]; }
+    static void scan_goal(ConcurrentMemoryPool& pool, uint64_t pages)
+    {
+        auto& arena = pool.arenas_[0];
+        if (arena.scan_reclaim_goal_pages.exchange(pages, std::memory_order_release) != pages)
+            arena.writer_poll_hint.exchange(true, std::memory_order_release);
+    }
     static void pressure(ConcurrentMemoryPool& pool, size_t gap, bool pending) {
         auto& arena = pool.arenas_[0];
         std::lock_guard lock(arena.mutex);
@@ -33,6 +41,88 @@ struct ConcurrentMemoryPoolTestAccess
     }
 };
 static void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+
+static std::barrier<>* hint_check_barrier;
+static void pause_writer_check(ConcurrentMemoryPool&)
+{
+    hint_check_barrier->arrive_and_wait();
+    hint_check_barrier->arrive_and_wait();
+}
+
+static void check_writer_poll_hint()
+{
+    ConcurrentMemoryPool pool(32ULL << 20);
+    ConcurrentMemoryPoolTestAccess::single(pool);
+    pool.init_arenas();
+    pool.set_spill_service(true);
+    require(!pool.writer_work_pending(), "quiet Grow published Writer work");
+    auto* segment = ConcurrentMemoryPoolTestAccess::filling(pool);
+    pool.request_first_drain();
+    require(pool.writer_work_pending(), "Drain did not publish Writer work");
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool);
+    ConcurrentMemoryPool::FirstSegmentView view;
+    {
+        std::unique_lock held(arena.mutex);
+        auto busy = std::async(std::launch::async, [&] {
+            return pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+        });
+        const bool immediate = busy.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+        held.unlock();
+        require(busy.get() == ConcurrentMemoryPool::FirstClaimStatus::Busy && immediate,
+            "Writer hint changed the nonblocking claim contract");
+    }
+    require(pool.writer_work_pending(), "mutex contention consumed Writer work");
+    require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view)
+        == ConcurrentMemoryPool::FirstClaimStatus::Busy && pool.writer_work_pending(),
+        "Filling consumed the only Writer notification");
+    ConcurrentMemoryPoolTestAccess::publish(pool, segment);
+    require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view)
+        == ConcurrentMemoryPool::FirstClaimStatus::Data && !pool.writer_work_pending(),
+        "claim did not retire fulfilled demand");
+#ifdef ARENA_BENCH_DIAGNOSTICS
+    ConcurrentMemoryPool::FirstSegmentView none;
+    pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, none);
+    require(pool.writer_busy_streak.load() != 0, "diagnostic did not record an actual Busy");
+    require(!pool.writer_work_pending() && pool.writer_busy_streak.load() == 0,
+        "quiet demand episode retained the diagnostic Busy streak");
+    pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, none);
+#endif
+    require(pool.complete_first(view), "hint fixture completion failed");
+#ifdef ARENA_BENCH_DIAGNOSTICS
+    require(pool.writer_busy_streak.load() == 0, "FIRST completion retained the diagnostic Busy streak");
+#endif
+    // An external event published after consumption must survive; a false
+    // snapshot at the end of the lock would overwrite it.
+    arena.writer_poll_hint.exchange(false, std::memory_order_acq_rel);
+    std::thread publisher([&] { ConcurrentMemoryPoolTestAccess::scan_goal(pool, 1); });
+    publisher.join();
+    require(pool.writer_work_pending(), "Scan publication was lost after consume");
+    pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+    require(pool.first_reclaiming(0) && !pool.writer_work_pending(),
+        "empty Scan demand did not update mode and quiesce polling");
+    pool.clear_scan_reclaim_goals();
+    require(pool.writer_work_pending(), "Scan cancellation did not publish a check");
+    pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+    require(!pool.first_reclaiming(0) && !pool.writer_work_pending(), "Scan cancellation stranded Reclaim");
+    pool.clear_scan_reclaim_goals();
+    require(!pool.writer_work_pending(), "unchanged Scan cancellation republished work");
+    // Pause the actual claim after its last locked decision, then publish a
+    // new goal without that mutex. A trailing false store would lose it.
+    ConcurrentMemoryPoolTestAccess::scan_goal(pool, 1);
+    std::barrier checked(2);
+    hint_check_barrier = &checked;
+    pool.writer_checked_hook = pause_writer_check;
+    std::thread checking([&] { pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view); });
+    checked.arrive_and_wait();
+    ConcurrentMemoryPoolTestAccess::scan_goal(pool, 2);
+    checked.arrive_and_wait();
+    checking.join();
+    pool.writer_checked_hook = nullptr;
+    require(pool.writer_work_pending(), "late Scan event was overwritten after the locked check");
+    pool.clear_scan_reclaim_goals();
+    pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, view);
+    require(!pool.writer_work_pending(), "cancelled late event kept Writer spinning");
+}
 
 static void check_publication_without_progress_lock()
 {
@@ -124,7 +214,7 @@ static void check_writer_observes_publication()
     require(allocation.get() && pool.first_empty(), "polling Writer did not satisfy the RAM reservation");
     queue.producer_set_finished();
     writer.join();
-    require(std::filesystem::file_size(path.string() + ".0") == ConcurrentMemoryPool::first_segment_record_capacity() * kmer_bytes(), "polling spill lost its records");
+    require(low_msd_test::read(path.string() + ".0", kmer_bytes()).size() == ConcurrentMemoryPool::first_segment_record_capacity(), "polling spill lost its records");
     std::filesystem::remove(path.string() + ".0");
 }
 
@@ -132,6 +222,7 @@ int main()
 {
     try {
         k_length = 33;
+        check_writer_poll_hint();
         check_pressure_transitions();
         check_publication_without_progress_lock();
         check_writer_observes_publication();

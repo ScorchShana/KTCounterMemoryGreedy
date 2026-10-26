@@ -50,7 +50,7 @@ static void histogram_boundaries()
 {
     // Known single-group layouts catch missing lanes, a dropped tail, and
     // counts merged into the wrong bucket without relying on the decoder.
-    for (size_t width : {2U, 7U, 10U, 14U, 32U}) {
+    for (size_t width : {2U, 7U, 9U, 10U, 14U, 32U}) {
         std::vector<size_t> counts;
         for (size_t n = 0; n <= 17; ++n) counts.push_back(n);
         for (size_t boundary : {32U, 64U, 256U, 1024U, 4096U})
@@ -92,12 +92,49 @@ static void histogram_boundaries()
         }
     }
 }
+static void sparse_bucket_layout()
+{
+    // Gaps and unequal bucket sizes expose incorrect cumulative offsets;
+    // distinct suffixes check that scatter preserves each bucket's order.
+    constexpr size_t width = 9;
+    const std::array<uint8_t, 4> buckets{0x00, 0x11, 0x80, 0xff};
+    const std::array<uint32_t, 4> counts{12, 9, 8, 9};
+    Bytes input;
+    for (uint8_t i = 0; i < 12; ++i) {
+        for (size_t b = 0; b < buckets.size(); ++b) {
+            if (i >= counts[b]) continue;
+            input.push_back(buckets[b]);
+            input.push_back(i);
+            input.insert(input.end(), width - 2, 0x5a);
+        }
+    }
+    // Four P=1 groups in bucket order, each with an ascending second byte
+    // and seven fixed suffix bytes per record: 4*6 + 38*8 = 328 bytes.
+    Bytes expected;
+    for (size_t b = 0; b < buckets.size(); ++b) {
+        expected.push_back(1);
+        const auto* native = reinterpret_cast<const uint8_t*>(&counts[b]);
+        expected.insert(expected.end(), native, native + sizeof(counts[b]));
+        expected.push_back(buckets[b]);
+        for (uint8_t i = 0; i < counts[b]; ++i) {
+            expected.push_back(i);
+            expected.insert(expected.end(), width - 2, 0x5a);
+        }
+    }
+    require(expected.size() == 328 && roundtrip(input, width) == expected,
+        "sparse unequal buckets changed stable wire layout");
+}
 int main()
 {
     try {
         static_assert(msd_prefix::BUFFER_BYTES == 2ULL << 20);
         static_assert(msd_prefix::FINAL_LOW_BUFFER_BYTES == 8ULL << 20);
+        const std::array<uint8_t, 5> header{1, 3, 0, 0, 0};
+        const auto parsed = msd_prefix::parse_group_header(header, 9);
+        require(parsed.prefix_bytes == 1 && parsed.records == 3 && parsed.encoded_bytes == 30,
+            "shared header parser changed packed layout");
         histogram_boundaries();
+        sparse_bucket_layout();
         std::mt19937 rng(4381);
         for (unsigned k = 1; k <= 128; ++k) {
             const size_t w = (k + 3) / 4;

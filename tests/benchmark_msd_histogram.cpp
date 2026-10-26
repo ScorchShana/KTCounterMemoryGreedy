@@ -62,7 +62,7 @@ int main(int argc, char** argv)
             else if (option == "--dump-dir") dump_dir = value;
             else throw std::runtime_error("unknown option: " + option);
         }
-        const std::array<size_t, 4> widths{7, 10, 14, 32};
+        const std::array<size_t, 5> widths{7, 9, 10, 14, 32};
         if ((selected_width && std::find(widths.begin(), widths.end(), selected_width) == widths.end())
             || !(min_ms > 0) || !std::isfinite(min_ms)
             || (!selected_distribution.empty() && std::find(DISTRIBUTIONS.begin(), DISTRIBUTIONS.end(),
