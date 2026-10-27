@@ -1,9 +1,18 @@
 #ifndef PARTITION_HEADER
 #define PARTITION_HEADER
 
+// Splits high.bin / low.bin into 2^P bucket directories so that every bucket
+// fits the memory budget of dump_tool.
+//
+// Input files use the group layout described in MsdGroupReader.h. Buckets are
+// routed by the top P bits of the packed key; the rewritten files use the same
+// group layout, with the bucket's whole byte prefix stored once per group.
+
 #include "../src/definition.h"
 #include "../tool/LegacyKmer.h"
+#include "MsdGroupReader.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -19,6 +28,7 @@ namespace partition
 {
 
     constexpr uint64_t PARTITION_WRITER_BUFFER_SIZE = 128ULL * 1024;
+    constexpr uint64_t PARTITION_GROUP_PAYLOAD_BYTES = 64ULL * 1024;
 
     struct PartitionWriter
     {
@@ -128,220 +138,185 @@ namespace partition
         }
     };
 
-    // Extract the high P-base prefix from a packed k-mer byte sequence.
-    // Returns a value in [0, 2^P - 1].
-    // The packed format stores data[0] in little-endian in the first few bytes,
-    // with bases left-aligned (first base = highest 2 bits of data[0]).
-    inline uint64_t extract_prefix_from_packed(const char* packed_kmer,
-                                               uint32_t P,
-                                               uint32_t k_len)
+    // Top `bits` bits of a packed key (first base in the MSB of byte 0).
+    // Bits past the meaningful key bytes must be zero padded by the caller.
+    inline uint64_t extract_prefix_bits(const uint8_t* packed_key, uint32_t bits) noexcept
     {
-        const uint32_t full_words = k_len / BASES_PER_U64T;
-        const uint32_t tail_bits = 2 * (k_len % BASES_PER_U64T);
-        const uint32_t tail_bytes = (tail_bits + 7) / 8;
-
-        uint64_t data0;
-        if (full_words >= 1)
-        {
-            // data[0] is fully stored as the first 8 bytes (little-endian)
-            std::memcpy(&data0, packed_kmer, sizeof(uint64_t));
-        }
-        else
-        {
-            // k_len < 32: data stored MSB-aligned in tail_bytes
-            data0 = 0;
-            std::memcpy(reinterpret_cast<char*>(&data0) + (8 - tail_bytes),
-                        packed_kmer, tail_bytes);
-        }
-
-        return data0 >> (64 - P);
+        uint64_t value = 0;
+        for (uint32_t i = 0; i < bits; ++i)
+            value = (value << 1) | ((packed_key[i >> 3] >> (7 - (i & 7))) & 1u);
+        return value;
     }
 
-    // Partition high.bin into 2^P sub-files based on k-mer prefix.
-    // Returns a vector of record counts per partition.
-    template <uint32_t N>
-    std::vector<uint64_t> partition_high_file(const std::string& tmp_dir,
-                                              uint32_t P,
-                                              uint32_t k_len)
+    // Accumulates whole groups of one bucket. Every record in a bucket shares
+    // the bucket prefix, so the prefix is stored once per group.
+    struct GroupWriter
     {
-        const uint64_t num_partitions = 1ULL << P;
-        const uint32_t full_words = k_len / BASES_PER_U64T;
-        const uint32_t tail_bits = 2 * (k_len % BASES_PER_U64T);
-        const uint32_t tail_bytes = (tail_bits + 7) / 8;
-        const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
-        const uint64_t compact_rec_size = kmer_bytes + sizeof(uint32_t);
+        PartitionWriter out;
+        std::vector<uint8_t> payload;
+        std::vector<uint8_t> prefix;
+        uint32_t records = 0;
+        uint32_t count_bytes = 0;
+        uint8_t prefix_bytes = 0;
 
-        const std::string high_path = tmp_dir + "high.bin";
-
-        int fd = ::open(high_path.c_str(), O_RDONLY);
-        if (fd < 0)
+        bool open(const std::string& path, uint32_t in_count_bytes, uint8_t in_prefix_bytes)
         {
-            std::cerr << "partition_high_file: failed to open " << high_path
-                      << ": " << std::strerror(errno) << std::endl;
-            std::exit(-1);
+            count_bytes = in_count_bytes;
+            prefix_bytes = in_prefix_bytes;
+            return out.open(path);
         }
 
-        struct stat st {};
-        if (::fstat(fd, &st) != 0)
+        void add(const uint8_t* key, uint32_t key_bytes, uint32_t count)
         {
-            std::cerr << "partition_high_file: failed to stat " << high_path << std::endl;
-            ::close(fd);
-            std::exit(-1);
+            const size_t record_bytes = size_t(key_bytes - prefix_bytes) + count_bytes;
+            if (records != 0 && payload.size() + record_bytes > PARTITION_GROUP_PAYLOAD_BYTES)
+                flush();
+            if (records == 0)
+            {
+                prefix.assign(key, key + prefix_bytes);
+                payload.reserve(PARTITION_GROUP_PAYLOAD_BYTES);
+            }
+            else if (prefix_bytes != 0 &&
+                     std::memcmp(prefix.data(), key, prefix_bytes) != 0)
+            {
+                std::cerr << "partition: bucket prefix mismatch" << std::endl;
+                std::exit(-1);
+            }
+            payload.insert(payload.end(), key + prefix_bytes, key + key_bytes);
+            for (uint32_t i = 0; i < count_bytes; ++i)
+                payload.push_back(static_cast<uint8_t>(count >> (8 * i)));
+            ++records;
         }
-        const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        const uint64_t record_count = file_size / compact_rec_size;
 
-        // mmap the input file
-        const char* mapped = static_cast<const char*>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-        if (mapped == MAP_FAILED)
+        void flush()
         {
-            std::cerr << "partition_high_file: mmap failed" << std::endl;
-            std::exit(-1);
+            if (records == 0)
+                return;
+            uint8_t header[msd_group::GROUP_HEADER_BYTES];
+            header[0] = prefix_bytes;
+            std::memcpy(header + 1, &records, sizeof(records));
+            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            if (!prefix.empty())
+                out.write(reinterpret_cast<const char*>(prefix.data()), prefix.size());
+            out.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+            payload.clear();
+            prefix.clear();
+            records = 0;
         }
+    };
 
-        // Create partition directories and writers
-        std::vector<PartitionWriter> writers(num_partitions);
-        std::vector<uint64_t> record_counts(num_partitions, 0);
-
+    inline void create_partition_dirs(const std::string& tmp_dir, uint64_t num_partitions)
+    {
         for (uint64_t i = 0; i < num_partitions; ++i)
         {
             const std::string part_dir = tmp_dir + "partition_" + std::to_string(i);
             // Create directory (ignore error if it already exists)
             ::mkdir(part_dir.c_str(), 0755);
-            const std::string part_high = part_dir + "/high.bin";
-            if (!writers[i].open(part_high))
-            {
-                ::munmap(const_cast<char*>(mapped), file_size);
+        }
+    }
+
+    // Partition high.bin into 2^P sub-files based on the k-mer prefix bits.
+    // Returns a vector of record counts per partition.
+    template <uint32_t N>
+    std::vector<uint64_t> partition_high_file(const std::string& tmp_dir,
+                                              uint32_t P,
+                                              uint32_t k_len,
+                                              uint32_t count_bytes = sizeof(uint32_t))
+    {
+        static_assert(N == 1 || N == 2 || N == 4, "unsupported k-mer width");
+        const uint64_t num_partitions = 1ULL << P;
+        msd_group::File source = msd_group::open_file(tmp_dir + "high.bin", k_len, count_bytes);
+        const uint32_t key_bytes = source.key_bytes;
+        const uint8_t group_prefix =
+            static_cast<uint8_t>(std::min<uint64_t>(P / 8, key_bytes - 1));
+
+        create_partition_dirs(tmp_dir, num_partitions);
+        std::vector<GroupWriter> writers(num_partitions);
+        std::vector<uint64_t> record_counts(num_partitions, 0);
+        for (uint64_t i = 0; i < num_partitions; ++i)
+        {
+            const std::string part_high =
+                tmp_dir + "partition_" + std::to_string(i) + "/high.bin";
+            if (!writers[i].open(part_high, count_bytes, group_prefix))
                 std::exit(-1);
-            }
         }
 
         std::cout << "partitioning high.bin into " << num_partitions
-                  << " buckets (P=" << P << "), " << record_count << " records..."
+                  << " buckets (P=" << P << "), " << source.records << " records..."
                   << std::endl;
 
-        for (uint64_t i = 0; i < record_count; ++i)
+        std::vector<char> group;
+        uint8_t key[msd_group::MAX_KEY_BYTES];
+        for (size_t index = 0; index < source.groups.size(); ++index)
         {
-            const char* record = mapped + i * compact_rec_size;
-            const uint64_t prefix = extract_prefix_from_packed(record, P, k_len);
-            writers[prefix].write(record, compact_rec_size);
-            record_counts[prefix]++;
-
-            if ((i & 0xFFFFF) == 0xFFFFF)
+            msd_group::read_group(source, index, group);
+            const char* data = group.data();
+            const uint32_t records = msd_group::group_records(data);
+            for (uint32_t i = 0; i < records; ++i)
             {
-                std::cout << "\rpartitioning high.bin: "
-                          << (i * 100 / record_count) << "%" << std::flush;
+                std::memset(key, 0, sizeof(key));
+                msd_group::expand_key(source, data, i, key);
+                const uint64_t bucket = extract_prefix_bits(key, P);
+                writers[bucket].add(key, key_bytes, msd_group::group_count_value(source, data, i));
+                ++record_counts[bucket];
             }
         }
-        std::cout << "\rpartitioning high.bin: 100%" << std::endl;
+        for (auto& writer : writers)
+            writer.flush();
 
-        // Flush and close all writers
-        for (auto& w : writers)
-        {
-            w.flush();
-            if (w.fd >= 0)
-            {
-                ::close(w.fd);
-                w.fd = -1;
-            }
-        }
-
-        ::munmap(const_cast<char*>(mapped), file_size);
+        std::cout << "partitioned high.bin: " << source.records << " records" << std::endl;
         return record_counts;
     }
 
-    // Partition low.bin into 2^P sub-files based on k-mer prefix.
+    // Partition low.bin into 2^P sub-files based on the k-mer prefix bits.
     // Returns a vector of k-mer counts per partition.
     template <uint32_t N>
     std::vector<uint64_t> partition_low_file(const std::string& tmp_dir,
                                              uint32_t P,
                                              uint32_t k_len)
     {
+        static_assert(N == 1 || N == 2 || N == 4, "unsupported k-mer width");
         const uint64_t num_partitions = 1ULL << P;
-        const uint32_t full_words = k_len / BASES_PER_U64T;
-        const uint32_t tail_bits = 2 * (k_len % BASES_PER_U64T);
-        const uint32_t tail_bytes = (tail_bits + 7) / 8;
-        const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
+        msd_group::File source = msd_group::open_file(tmp_dir + "low.bin", k_len, 0);
+        const uint32_t key_bytes = source.key_bytes;
+        const uint8_t group_prefix =
+            static_cast<uint8_t>(std::min<uint64_t>(P / 8, key_bytes - 1));
 
-        const std::string low_path = tmp_dir + "low.bin";
-
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "partition_low_file: failed to open " << low_path
-                      << ": " << std::strerror(errno) << std::endl;
-            std::exit(-1);
-        }
-
-        struct stat st {};
-        if (::fstat(fd, &st) != 0)
-        {
-            std::cerr << "partition_low_file: failed to stat " << low_path << std::endl;
-            ::close(fd);
-            std::exit(-1);
-        }
-        const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        const uint64_t kmer_count = file_size / kmer_bytes;
-
-        // mmap the input file
-        const char* mapped = static_cast<const char*>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-        if (mapped == MAP_FAILED)
-        {
-            std::cerr << "partition_low_file: mmap failed" << std::endl;
-            std::exit(-1);
-        }
-
-        // Create partition directories and writers
-        std::vector<PartitionWriter> writers(num_partitions);
+        create_partition_dirs(tmp_dir, num_partitions);
+        std::vector<GroupWriter> writers(num_partitions);
         std::vector<uint64_t> kmer_counts(num_partitions, 0);
-
         for (uint64_t i = 0; i < num_partitions; ++i)
         {
-            const std::string part_dir = tmp_dir + "partition_" + std::to_string(i);
-            ::mkdir(part_dir.c_str(), 0755);
-            const std::string part_low = part_dir + "/low.bin";
-            if (!writers[i].open(part_low))
-            {
-                ::munmap(const_cast<char*>(mapped), file_size);
+            const std::string part_low =
+                tmp_dir + "partition_" + std::to_string(i) + "/low.bin";
+            if (!writers[i].open(part_low, 0, group_prefix))
                 std::exit(-1);
-            }
         }
 
         std::cout << "partitioning low.bin into " << num_partitions
-                  << " buckets (P=" << P << "), " << kmer_count << " k-mers..."
+                  << " buckets (P=" << P << "), " << source.records << " k-mers..."
                   << std::endl;
 
-        for (uint64_t i = 0; i < kmer_count; ++i)
+        std::vector<char> group;
+        uint8_t key[msd_group::MAX_KEY_BYTES];
+        for (size_t index = 0; index < source.groups.size(); ++index)
         {
-            const char* kmer = mapped + i * kmer_bytes;
-            const uint64_t prefix = extract_prefix_from_packed(kmer, P, k_len);
-            writers[prefix].write(kmer, kmer_bytes);
-            kmer_counts[prefix]++;
-
-            if ((i & 0xFFFFF) == 0xFFFFF)
+            msd_group::read_group(source, index, group);
+            const char* data = group.data();
+            const uint32_t records = msd_group::group_records(data);
+            for (uint32_t i = 0; i < records; ++i)
             {
-                std::cout << "\rpartitioning low.bin: "
-                          << (i * 100 / kmer_count) << "%" << std::flush;
+                std::memset(key, 0, sizeof(key));
+                msd_group::expand_key(source, data, i, key);
+                const uint64_t bucket = extract_prefix_bits(key, P);
+                writers[bucket].add(key, key_bytes, 1);
+                ++kmer_counts[bucket];
             }
         }
-        std::cout << "\rpartitioning low.bin: 100%" << std::endl;
+        for (auto& writer : writers)
+            writer.flush();
 
-        // Flush and close all writers
-        for (auto& w : writers)
-        {
-            w.flush();
-            if (w.fd >= 0)
-            {
-                ::close(w.fd);
-                w.fd = -1;
-            }
-        }
-
-        ::munmap(const_cast<char*>(mapped), file_size);
+        std::cout << "partitioned low.bin: " << source.records << " k-mers" << std::endl;
         return kmer_counts;
     }
 
