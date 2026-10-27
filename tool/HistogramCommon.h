@@ -45,22 +45,6 @@ struct RecordLayout
     }
 };
 
-template <uint32_t N>
-inline void unpack_key(const char* record, const RecordLayout& layout, legacy_kmer<N>& key) noexcept
-{
-    const size_t full_bytes = layout.full_words * sizeof(uint64_t);
-    std::memcpy(key.data.data(), record, full_bytes);
-    if (layout.tail_bytes)
-    {
-        uint64_t tail = 0;
-        std::memcpy(reinterpret_cast<char*>(&tail) + 8 - layout.tail_bytes,
-                    record + full_bytes, layout.tail_bytes);
-        key.data[layout.full_words] = tail;
-    }
-    // The caller zero-initializes each local key once; every payload word is
-    // overwritten on each use, while words beyond the layout stay zero.
-}
-
 inline uint32_t unpack_count(const char* record, const RecordLayout& layout) noexcept
 {
     uint32_t count = 0;

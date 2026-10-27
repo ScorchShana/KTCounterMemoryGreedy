@@ -1,10 +1,11 @@
 #include "HistogramRunner.h"
-#include "CompactRecordReader.h"
 #include "HighFrequencyThreadPool.h"
+#include "MsdGroupReader.h"
 #include "LowFrequencyThreadPool.h"
 
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <pthread.h>
 #include <sys/stat.h>
 
@@ -87,27 +88,40 @@ namespace
         int error = pthread_attr_getstacksize(&attr, &stack_bytes);
         pthread_attr_destroy(&attr);
         if (error) throw std::runtime_error("failed to query thread stack size");
-        uint64_t bytes = RING_CAPACITY * BLOCK_BYTES + CompactRecordReader::BUFFER_BYTES;
+        uint64_t bytes = RING_CAPACITY * BLOCK_BYTES;
         bytes = checked_add(bytes, checked_multiply(buckets, sizeof(std::atomic<int64_t>)));
         bytes = checked_add(bytes, checked_multiply(checked_multiply(buckets, sizeof(int64_t)), workers));
         bytes = checked_add(bytes, checked_multiply(workers, checked_add(stack_bytes, 4096)));
         return checked_add(bytes, 2ULL * 1024 * 1024);
     }
 
-    void enqueue_records(const std::string& path, uint32_t k, uint32_t count_bytes,
+    // Decode records straight out of the group stream into flat worker blocks.
+    void enqueue_records(const msd_group::File& source,
                          SPMCRingMemoryPool<RING_CAPACITY>& pool, ProgressPrinter& progress,
                          uint64_t first = 0, uint64_t count = std::numeric_limits<uint64_t>::max())
     {
-        RecordLayout layout(k, count_bytes);
-        CompactRecordReader reader(k, count_bytes);
-        reader.open(path, first, count);
-        while (!reader.finished())
+        if (first >= source.records)
+        {
+            pool.producer_set_finished();
+            return;
+        }
+        uint64_t remaining = std::min(count, source.records - first);
+        const uint64_t record_bytes = uint64_t(source.key_bytes) + source.count_bytes;
+        const uint64_t capacity = BLOCK_BYTES / record_bytes;
+        std::vector<char> scratch;
+        while (remaining > 0)
         {
             char* block = nullptr;
             pool.producer_dequeue(block);
-            uint64_t records = reader.read_compact_records(block, BLOCK_BYTES / layout.record_bytes);
+            const uint64_t batch = std::min(remaining, capacity);
+            uint64_t bytes = 0;
+            const uint64_t records = source.read_flat_records(first, batch, block, scratch, &bytes);
+            if (records == 0)
+                throw std::runtime_error("short read from " + source.path);
             pool.producer_enqueue(content_type{block, records});
-            progress.add(records * layout.record_bytes);
+            progress.add(bytes);
+            first += records;
+            remaining -= records;
         }
         pool.producer_set_finished();
     }
@@ -124,7 +138,8 @@ namespace
     }
 
     template <uint32_t N>
-    void process_exact_segment(const Options& options, uint64_t first, uint64_t records,
+    void process_exact_segment(const Options& options, const msd_group::File& high,
+                               const msd_group::File& low, uint64_t first, uint64_t records,
                                AtomicHistogram& histogram, ProgressPrinter& progress,
                                SPMCRingMemoryPool<RING_CAPACITY>& pool,
                                std::atomic<uint64_t>* matched)
@@ -137,8 +152,7 @@ namespace
                 &pool, &hash_map, &histogram, options.max_threads, options.k_len,
                 options.count_bytes, options.min_freq, options.max_freq, histogram.size());
             threads.start();
-            enqueue_records(options.tmp_dir + "high.bin", options.k_len, options.count_bytes,
-                            pool, progress, first, records);
+            enqueue_records(high, pool, progress, first, records);
             threads.join();
             if (threads.insert_failed()) throw std::runtime_error("failed to insert high-frequency records");
         }
@@ -149,15 +163,18 @@ namespace
                 &pool, &hash_map, &histogram, options.max_threads, options.k_len,
                 options.min_freq, options.max_freq, histogram.size(), options.count_max, matched);
             threads.start();
-            enqueue_records(options.tmp_dir + "low.bin", options.k_len, 0, pool, progress);
+            enqueue_records(low, pool, progress);
             threads.join();
         }
     }
 
     template <uint32_t N>
-    int run_precise(const Options& options, uint64_t records, uint64_t high_bytes,
-                    uint64_t low_bytes, size_t buckets, uint64_t fixed)
+    int run_precise(const Options& options, const msd_group::File& high,
+                    const msd_group::File& low, size_t buckets, uint64_t fixed)
     {
+        const uint64_t records = high.records;
+        const uint64_t high_bytes = high.size;
+        const uint64_t low_bytes = low.size;
         uint64_t available = options.max_memory_bytes - fixed;
         const uint32_t table_k_len = options.k_len;
         if (FlatConcurrentHashMap<N>::required_mmap_bytes(records ? 1 : 0, table_k_len) > available)
@@ -190,12 +207,13 @@ namespace
         for (uint64_t segment = 0; segment < segments; ++segment)
         {
             uint64_t count = std::min(per_segment, records - first);
-            process_exact_segment<N>(options, first, count, histogram, progress, pool, segmented ? &matched : nullptr);
+            process_exact_segment<N>(options, high, low, first, count, histogram, progress, pool,
+                                     segmented ? &matched : nullptr);
             first += count;
         }
         if (segmented)
         {
-            uint64_t low_count = low_bytes / RecordLayout(options.k_len, 0).key_bytes;
+            uint64_t low_count = low.records;
             uint64_t matched_count = matched.load(std::memory_order_relaxed);
             if (matched_count > low_count) throw std::runtime_error("invalid duplicate high-frequency keys across segments");
             if (in_range(1, options.min_freq, options.max_freq))
@@ -210,18 +228,22 @@ namespace
     template <uint32_t N>
     int run(const Options& options)
     {
-        RecordLayout layout(options.k_len, options.count_bytes);
-        uint64_t high_bytes = file_size(options.tmp_dir + "high.bin", layout.record_bytes);
+        msd_group::File high = msd_group::open_file(options.tmp_dir + "high.bin",
+                                                    options.k_len, options.count_bytes);
         const bool include_singletons = in_range(1, options.min_freq, options.max_freq);
-        uint64_t low_bytes = options.is_precise || include_singletons
-            ? file_size(options.tmp_dir + "low.bin", layout.key_bytes) : 0;
-        uint64_t records = high_bytes / layout.record_bytes;
+        const bool need_low = options.is_precise || include_singletons;
+        std::unique_ptr<msd_group::File> low;
+        if (need_low)
+            low = std::make_unique<msd_group::File>(
+                msd_group::open_file(options.tmp_dir + "low.bin", options.k_len, 0));
+        const uint64_t high_bytes = high.size;
+        const uint64_t low_bytes = low ? low->size : 0;
         size_t buckets = static_cast<size_t>(static_cast<uint64_t>(options.max_freq) - options.min_freq + 1);
         uint64_t fixed = fixed_memory_bytes(options.max_threads, buckets);
         if (fixed > options.max_memory_bytes)
             throw std::runtime_error("insufficient memory budget for histogram buffers and workers");
         if (options.is_precise)
-            return run_precise<N>(options, records, high_bytes, low_bytes, buckets, fixed);
+            return run_precise<N>(options, high, *low, buckets, fixed);
 
         ProgressPrinter progress(high_bytes);
         AtomicHistogram histogram(buckets);
@@ -232,14 +254,14 @@ namespace
                 &pool, &histogram, options.max_threads, options.k_len, options.count_bytes,
                 options.min_freq, options.max_freq, buckets);
             threads.start();
-            enqueue_records(options.tmp_dir + "high.bin", options.k_len, options.count_bytes, pool, progress);
+            enqueue_records(high, pool, progress);
             threads.join();
         }
         // Tree reconciles pending occurrences before publishing low.bin, so
         // each final low record contributes one distinct frequency-one key.
         if (include_singletons)
             histogram[histogram_index(1, options.min_freq)].fetch_add(
-                static_cast<int64_t>(low_bytes / layout.key_bytes), std::memory_order_relaxed);
+                static_cast<int64_t>(low->records), std::memory_order_relaxed);
         write_histogram(options, histogram);
         progress.finish();
         return 0;

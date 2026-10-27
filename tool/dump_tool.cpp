@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "FlatConcurrentHashMap.h"
+#include "MsdGroupReader.h"
 #include "Partition.h"
 
 namespace
@@ -57,6 +58,7 @@ namespace
         std::string filename;
         uint64_t record_count = 0;
         uint64_t file_size = 0;
+        std::shared_ptr<msd_group::File> reader;
     };
 
     class ProgressPrinter
@@ -270,36 +272,59 @@ namespace
 
     using uint128_t = unsigned __int128;
 
-    struct Key128
+    // 256-bit sort key: k <= 128 bases = 256 bits. Bases are fed with
+    // `key = (key << 2) | base`, so the first base ends up at the top.
+    struct Key256
     {
-        uint64_t hi, lo;
-        Key128() : hi(0), lo(0) {}
-        Key128(uint64_t v) : hi(0), lo(v) {}
-        Key128(uint64_t h, uint64_t l) : hi(h), lo(l) {}
-        Key128 operator<<(int shift) const
+        std::array<uint64_t, 4> w{};
+        Key256() = default;
+        Key256(uint64_t v) { w[0] = v; }
+        Key256 operator<<(unsigned shift) const
         {
-            if (shift == 0)
-                return *this;
-            if (shift < 64)
-                return {(hi << shift) | (lo >> (64 - shift)), lo << shift};
-            return {lo << (shift - 64), 0};
+            Key256 out;
+            if (shift >= 256)
+                return out;
+            const unsigned words = shift / 64;
+            const unsigned bits = shift % 64;
+            for (unsigned i = 0; i < 4; ++i)
+            {
+                const unsigned target = i + words;
+                if (target >= 4)
+                    break;
+                out.w[target] |= w[i] << bits;
+                if (bits != 0 && target + 1 < 4)
+                    out.w[target + 1] |= w[i] >> (64 - bits);
+            }
+            return out;
         }
-        Key128 operator>>(int shift) const
+        Key256 operator>>(unsigned shift) const
         {
-            if (shift == 0)
-                return *this;
-            if (shift < 64)
-                return {hi >> shift, (lo >> shift) | (hi << (64 - shift))};
-            return {0, hi >> (shift - 64)};
+            Key256 out;
+            if (shift >= 256)
+                return out;
+            const unsigned words = shift / 64;
+            const unsigned bits = shift % 64;
+            for (unsigned i = words; i < 4; ++i)
+            {
+                const unsigned target = i - words;
+                out.w[target] |= w[i] >> bits;
+                if (bits != 0 && i + 1 < 4)
+                    out.w[target] |= w[i + 1] << (64 - bits);
+            }
+            return out;
         }
-        Key128 operator|(uint64_t v) const { return {hi, lo | v}; }
-        uint64_t operator&(uint64_t m) const { return lo & m; }
-        Key128 &operator>>=(int shift)
+        Key256 operator|(uint64_t v) const
+        {
+            Key256 out = *this;
+            out.w[0] |= v;
+            return out;
+        }
+        uint64_t operator&(uint64_t m) const { return w[0] & m; }
+        Key256 &operator>>=(unsigned shift)
         {
             *this = *this >> shift;
             return *this;
         }
-        auto operator<=>(const Key128 &) const = default;
     };
 
     template <uint32_t N>
@@ -319,7 +344,7 @@ namespace
     template <>
     struct SortKeyType<4>
     {
-        using type = Key128;
+        using type = Key256;
         static constexpr uint32_t bits = 256;
     };
 
@@ -367,7 +392,7 @@ namespace
 
     static inline uint32_t radix_digit(uint64_t key, uint32_t shift) { return static_cast<uint32_t>((key >> shift) & RADIX_MASK); }
     static inline uint32_t radix_digit(uint128_t key, uint32_t shift) { return static_cast<uint32_t>((key >> shift) & RADIX_MASK); }
-    static inline uint32_t radix_digit(Key128 key, uint32_t shift) { return static_cast<uint32_t>(((key >> shift) & RADIX_MASK)); }
+    static inline uint32_t radix_digit(Key256 key, uint32_t shift) { return static_cast<uint32_t>((key >> shift) & RADIX_MASK); }
 
     template <typename KeyT>
     static void parallel_radix_sort(std::vector<SortEntry<KeyT>> &entries,
@@ -578,102 +603,23 @@ namespace
         return dir + "high" + ".bin";
     }
 
-    template <uint32_t N>
-    static uint64_t packed_kmer_bytes(uint32_t k_len)
-    {
-        uint64_t full_words = k_len / BASES_PER_U64T;
-        uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
-        uint64_t tail_bytes = (tail_bits + 7) / 8;
-        uint64_t bytes_per_kmer = full_words * sizeof(uint64_t) + tail_bytes;
-        if (bytes_per_kmer == 0 || k_len > N * BASES_PER_U64T)
-        {
-            std::cerr << "invalid k_len for packed bytes: " << k_len << '\n';
-            exit(-1);
-        }
-        return bytes_per_kmer;
-    }
-
-    // Read compact k-mer records from file and expand to full ExportRecord<N>
-    template <uint32_t N>
-    static uint64_t read_compact_high_records(
-        int fd, uint64_t file_offset, uint64_t count,
-        ExportRecord<N>* out, uint32_t k_len, uint32_t count_bytes)
-    {
-        const uint64_t full_words = k_len / BASES_PER_U64T;
-        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
-        const uint64_t tail_bytes = (tail_bits + 7) / 8;
-        const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
-        const uint64_t compact_rec = kmer_bytes + count_bytes;
-
-        const size_t total_bytes = static_cast<size_t>(count * compact_rec);
-        std::vector<char> buf(total_bytes);
-        ssize_t n = ::pread(fd, buf.data(), total_bytes,
-                            static_cast<off_t>(file_offset * compact_rec));
-        if (n != static_cast<ssize_t>(total_bytes))
-        {
-            std::cerr << "short read reading compact high records\n";
-            exit(-1);
-        }
-
-        for (uint64_t i = 0; i < count; ++i)
-        {
-            const char* src = buf.data() + i * compact_rec;
-            ExportRecord<N>& dst = out[i];
-            dst.key.reset();
-            std::memcpy(dst.key.data.data(), src, full_words * sizeof(uint64_t));
-            if (tail_bytes > 0)
-            {
-                uint64_t tail = 0;
-                std::memcpy(reinterpret_cast<char*>(&tail) + (8 - tail_bytes),
-                            src + full_words * sizeof(uint64_t), tail_bytes);
-                dst.key.data[full_words] = tail;
-            }
-            dst.count = 0;
-            std::memcpy(&dst.count, src + kmer_bytes, count_bytes);
-        }
-        return total_bytes;
-    }
-
-    // collect high file data
+    // collect high file data (record index is built from the group headers)
     template <uint32_t N>
     static std::vector<RootFileInfo> collect_high_files(const std::string &tmp_dir,
                                                           uint64_t &total_records,
                                                           uint32_t k_len,
                                                           uint32_t count_bytes)
     {
-        const uint64_t compact_rec = packed_kmer_bytes<N>(k_len) + count_bytes;
+        static_assert(N == 1 || N == 2 || N == 4, "unsupported k-mer width");
         std::vector<RootFileInfo> files;
-
-        std::string path = high_filename(tmp_dir);
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "failed to open " << path << ": " << std::strerror(errno) << '\n';
-            exit(-1);
-        }
-        struct stat st{};
-        if (::fstat(fd, &st) != 0)
-        {
-            std::cerr << "failed to stat " << path << ": " << std::strerror(errno) << '\n';
-            ::close(fd);
-            exit(-1);
-        }
-        ::close(fd);
-        uint64_t size = static_cast<uint64_t>(st.st_size);
-        if (size == 0)
-        {
-            std::cerr << "empty high.bin file\n";
-            exit(-1);
-        }
-        if (size % compact_rec != 0)
-        {
-            std::cerr << "bad high file size: " << path << '\n';
-            exit(-1);
-        }
-        uint64_t records = size / compact_rec;
-        total_records += records;
-        files.push_back({std::move(path), records, size});
-
+        RootFileInfo info;
+        info.filename = high_filename(tmp_dir);
+        info.reader = std::make_shared<msd_group::File>(
+            msd_group::open_file(info.filename, k_len, count_bytes));
+        info.record_count = info.reader->records;
+        info.file_size = info.reader->size;
+        total_records += info.record_count;
+        files.push_back(std::move(info));
         return files;
     }
 
@@ -684,8 +630,6 @@ namespace
                                uint32_t worker_count,
                                uint32_t min_freq,
                                uint32_t max_freq,
-                               uint32_t k_len,
-                               uint32_t count_bytes,
                                ProgressPrinter *progress)
     {
         std::atomic<uint64_t> next_file{0};
@@ -693,34 +637,33 @@ namespace
         auto worker = [&]()
         {
             std::vector<ExportRecord<N>> buffer(65536);
+            std::vector<char> scratch;
             for (;;)
             {
                 uint64_t index = next_file.fetch_add(1, std::memory_order_relaxed);
                 if (index >= files.size())
                     break;
                 const RootFileInfo &info = files[index];
-                int fd = ::open(info.filename.c_str(), O_RDONLY);
-                if (fd < 0)
-                {
-                    std::cerr << "open: " << info.filename << '\n';
-                    exit(-1);
-                }
-
                 uint64_t remaining = info.record_count;
-                uint64_t offset = 0;
+                uint64_t first = 0;
                 while (remaining > 0)
                 {
-                    uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                    uint64_t bytes = read_compact_high_records<N>(fd, offset, batch,
-                                                                  buffer.data(), k_len, count_bytes);
+                    const uint64_t batch = std::min<uint64_t>(remaining, buffer.size());
+                    uint64_t bytes = 0;
+                    const uint64_t decoded = info.reader->read_records(first, batch, buffer.data(),
+                                                                      scratch, &bytes);
+                    if (decoded != batch)
+                    {
+                        std::cerr << "short read reading high records\n";
+                        exit(-1);
+                    }
                     for (uint64_t i = 0; i < batch; ++i)
                         if (in_range(buffer[i].count, min_freq, max_freq))
                             hash_map.insert_unique(buffer[i].key, buffer[i].count);
                     remaining -= batch;
-                    offset += batch;
+                    first += batch;
                     progress->add(bytes);
                 }
-                ::close(fd);
             }
         };
 
@@ -734,41 +677,17 @@ namespace
 
     // process low.bin
     template <uint32_t N>
-    static void process_low_freq(const std::string &low_path,
+    static void process_low_freq(msd_group::File &low,
                                  FlatConcurrentHashMap<N> &hash_map,
                                  uint32_t k_len,
                                  uint32_t min_freq,
                                  uint32_t max_freq,
                                  uint32_t worker_count,
-                                 uint64_t packed_bytes,
                                  uint32_t count_max,
                                  ProgressPrinter *progress,
                                  AsyncWriter *writer)
     {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        if (fd < 0)
-        {
-            std::cerr << "open low.bin failed\n";
-            exit(-1);
-        }
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-        if (mapped == MAP_FAILED)
-        {
-            std::cerr << "mmap low.bin failed\n";
-            exit(-1);
-        }
-
-        const uint64_t full_data_words = k_len / BASES_PER_U64T;
-        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
-        const uint64_t tail_bytes = (tail_bits + 7) / 8;
-        uint64_t kmers_per_worker = (total_kmers + worker_count - 1) / worker_count;
+        const uint64_t per_worker = (low.records + worker_count - 1) / worker_count;
 
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
@@ -776,79 +695,61 @@ namespace
         {
             workers.emplace_back([&, tid]()
                                  {
-            uint64_t start = tid * kmers_per_worker;
-            uint64_t end   = std::min(start + kmers_per_worker, total_kmers);
-            if (start >= end) return;
+            uint64_t first = uint64_t(tid) * per_worker;
+            uint64_t end   = std::min(first + per_worker, low.records);
+            if (first >= end) return;
 
             LineWriter<N> line_writer(writer, k_len);
-            legacy_kmer<N> key{};
-
-            for (uint64_t i = start; i < end; ++i) {
-                const char* record = mapped + i * packed_bytes;
-                uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
-                    std::memcpy(key.data.data(), record, full_bytes);
-                if (tail_bytes > 0) {
-                    uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
-                    key.data[full_data_words] = tail;
-                    for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
-                } else {
-                    for (uint64_t j = full_data_words; j < N; ++j) key.data[j] = 0;
+            std::vector<ExportRecord<N>> buffer(65536);
+            std::vector<char> scratch;
+            while (first < end) {
+                const uint64_t batch = std::min<uint64_t>(end - first, buffer.size());
+                uint64_t bytes = 0;
+                const uint64_t decoded = low.read_records(first, batch, buffer.data(), scratch, &bytes);
+                if (!decoded) {
+                    std::cerr << "short read reading low records\n";
+                    exit(-1);
                 }
-
-                auto lookup = hash_map.prepare_lookup(key);
-                hash_map.prefetch(lookup);
-                uint32_t count = 0;
-                uint64_t slot  = UINT64_MAX;
-                if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
-                    uint64_t merged = static_cast<uint64_t>(count) + 1;
-                    if (merged > count_max) merged = count_max;
-                    if (in_range(merged, min_freq, max_freq))
-                        line_writer.write_line(key, static_cast<uint32_t>(merged));
-                    *hash_map.mutable_count_at(slot) = 0;
-                } else if (in_range(1, min_freq, max_freq)) {
-                    line_writer.write_line(key, 1);
+                for (uint64_t i = 0; i < decoded; ++i) {
+                    const legacy_kmer<N>& key = buffer[i].key;
+                    auto lookup = hash_map.prepare_lookup(key);
+                    hash_map.prefetch(lookup);
+                    uint32_t count = 0;
+                    uint64_t slot  = UINT64_MAX;
+                    if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
+                        uint64_t merged = static_cast<uint64_t>(count) + 1;
+                        if (merged > count_max) merged = count_max;
+                        if (in_range(merged, min_freq, max_freq))
+                            line_writer.write_line(key, static_cast<uint32_t>(merged));
+                        *hash_map.mutable_count_at(slot) = 0;
+                    } else if (in_range(1, min_freq, max_freq)) {
+                        line_writer.write_line(key, 1);
+                    }
                 }
-            }
-            progress->add((end - start) * packed_bytes); });
+                progress->add(bytes);
+                first += decoded;
+            } });
         }
         for (auto &w : workers)
             w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
     }
 
     // process low.bin
     template <uint32_t N>
-    static void process_low_freq_collect(const std::string &low_path,
+    static void process_low_freq_collect(msd_group::File &low,
                                          FlatConcurrentHashMap<N> &hash_map,
                                          std::vector<ExportRecord<N>> &results,
-                                         uint32_t k_len,
                                          uint32_t min_freq,
                                          uint32_t max_freq,
                                          uint32_t worker_count,
-                                         uint64_t packed_bytes,
                                          uint32_t count_max,
                                          ProgressPrinter *progress)
     {
-        int fd = ::open(low_path.c_str(), O_RDONLY);
-        struct stat st{};
-        ::fstat(fd, &st);
-        uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        uint64_t total_kmers = file_size / packed_bytes;
-
-        const char *mapped = static_cast<const char *>(
-            ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
-        ::close(fd);
-
-        const uint64_t full_data_words = k_len / BASES_PER_U64T;
-        const uint64_t tail_bytes = (2ULL * (k_len % BASES_PER_U64T) + 7) / 8;
-        uint64_t kmers_per_worker = (total_kmers + worker_count - 1) / worker_count;
+        const uint64_t per_worker = (low.records + worker_count - 1) / worker_count;
 
         std::vector<std::vector<ExportRecord<N>>> high_results(worker_count);
         for (auto &v : high_results)
-            v.reserve(total_kmers / worker_count + 1024);
+            v.reserve(low.records / worker_count + 1024);
 
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
@@ -856,46 +757,43 @@ namespace
         {
             workers.emplace_back([&, tid]()
                                  {
-            uint64_t start = tid * kmers_per_worker;
-            uint64_t end   = std::min(start + kmers_per_worker, total_kmers);
-            if (start >= end) return;
+            uint64_t first = uint64_t(tid) * per_worker;
+            uint64_t end   = std::min(first + per_worker, low.records);
+            if (first >= end) return;
             auto& local = high_results[tid];
-            legacy_kmer<N> key{};
 
-            for (uint64_t i = start; i < end; ++i) {
-                const char* record = mapped + i * packed_bytes;
-                uint64_t full_bytes = full_data_words * sizeof(uint64_t);
-                if (full_bytes > 0)
-                    std::memcpy(key.data.data(), record, full_bytes);
-                if (tail_bytes > 0) {
-                    uint64_t tail = 0;
-                    std::memcpy(reinterpret_cast<char*>(&tail) + (sizeof(uint64_t) - tail_bytes),
-                                record + full_bytes, tail_bytes);
-                    key.data[full_data_words] = tail;
-                    for (uint64_t j = full_data_words + 1; j < N; ++j) key.data[j] = 0;
-                } else {
-                    for (uint64_t j = full_data_words; j < N; ++j) key.data[j] = 0;
+            std::vector<ExportRecord<N>> buffer(65536);
+            std::vector<char> scratch;
+            while (first < end) {
+                const uint64_t batch = std::min<uint64_t>(end - first, buffer.size());
+                uint64_t bytes = 0;
+                const uint64_t decoded = low.read_records(first, batch, buffer.data(), scratch, &bytes);
+                if (!decoded) {
+                    std::cerr << "short read reading low records\n";
+                    exit(-1);
                 }
-
-                auto lookup = hash_map.prepare_lookup(key);
-                hash_map.prefetch(lookup);
-                uint32_t count = 0;
-                uint64_t slot  = UINT64_MAX;
-                if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
-                    uint64_t merged = static_cast<uint64_t>(count) + 1;
-                    if (merged > count_max) merged = count_max;
-                    if (in_range(merged, min_freq, max_freq))
-                        local.push_back({key, static_cast<uint32_t>(merged)});
-                    *hash_map.mutable_count_at(slot) = 0;
-                } else if (in_range(1, min_freq, max_freq)) {
-                    local.push_back({key, 1});
+                for (uint64_t i = 0; i < decoded; ++i) {
+                    const legacy_kmer<N>& key = buffer[i].key;
+                    auto lookup = hash_map.prepare_lookup(key);
+                    hash_map.prefetch(lookup);
+                    uint32_t count = 0;
+                    uint64_t slot  = UINT64_MAX;
+                    if (hash_map.find_prepared_slot(key, lookup, count, slot)) {
+                        uint64_t merged = static_cast<uint64_t>(count) + 1;
+                        if (merged > count_max) merged = count_max;
+                        if (in_range(merged, min_freq, max_freq))
+                            local.push_back({key, static_cast<uint32_t>(merged)});
+                        *hash_map.mutable_count_at(slot) = 0;
+                    } else if (in_range(1, min_freq, max_freq)) {
+                        local.push_back({key, 1});
+                    }
                 }
-            }
-            progress->add((end - start) * packed_bytes); });
+                progress->add(bytes);
+                first += decoded;
+            } });
         }
         for (auto &w : workers)
             w.join();
-        ::munmap(const_cast<char *>(mapped), file_size);
 
         uint64_t total = 0;
         for (auto &v : high_results)
@@ -1062,7 +960,7 @@ namespace
 
         // Phase 1: Partition high.bin and low.bin
         const auto high_counts = partition::partition_high_file<N>(
-            opts.tmp_dir, P, opts.k_len);
+            opts.tmp_dir, P, opts.k_len, opts.count_bytes);
         const auto low_counts = partition::partition_low_file<N>(
             opts.tmp_dir, P, opts.k_len);
 
@@ -1146,8 +1044,6 @@ namespace
 
         // Build sort entries
         std::vector<SortEntry<KeyT>> entries(count);
-        const uint32_t full_words = k_len / BASES_PER_U64T;
-        const uint32_t tail_bases = k_len % BASES_PER_U64T;
         for (uint64_t i = 0; i < count; ++i)
         {
             entries[i].key = make_sort_key<KeyT, N>(results[i].key, k_len);
@@ -1191,8 +1087,9 @@ namespace
                 cursor += digit_len;
                 *cursor++ = '\n';
             }
-            if (cursor > block)
-                writer.release_buffer(block, static_cast<size_t>(cursor - block));
+            // Release even an empty block: AsyncWriter only frees blocks that
+            // came back through release_buffer().
+            writer.release_buffer(block, static_cast<size_t>(cursor - block));
         }
         writer.finish();
     }
@@ -1203,7 +1100,6 @@ namespace
     {
         temp_dir = opts.tmp_dir;
         uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
-        uint64_t pkb = packed_kmer_bytes<N>(opts.k_len);
 
         // Collect high file metadata
         uint64_t total_high_records = 0;
@@ -1212,26 +1108,9 @@ namespace
         for (auto &rf : high_files)
             high_bytes += rf.file_size;
 
-        // Check low.bin
-        uint64_t low_bytes = 0;
-        {
-            std::string low_path = opts.tmp_dir + "low.bin";
-            int fd = ::open(low_path.c_str(), O_RDONLY);
-            if (fd < 0)
-            {
-                std::cerr << "open low.bin failed\n";
-                exit(-1);
-            }
-            struct stat st{};
-            ::fstat(fd, &st);
-            ::close(fd);
-            low_bytes = static_cast<uint64_t>(st.st_size);
-            if (low_bytes % pkb != 0)
-            {
-                std::cerr << "low.bin size error\n";
-                exit(-1);
-            }
-        }
+        // low.bin stores only frequency-one keys and carries no counts.
+        msd_group::File low = msd_group::open_file(opts.tmp_dir + "low.bin", opts.k_len, 0);
+        const uint64_t low_bytes = low.size;
 
         ProgressPrinter progress(high_bytes + low_bytes);
         progress.start();
@@ -1239,16 +1118,16 @@ namespace
         // build hash map
         FlatConcurrentHashMap<N> hash_map(total_high_records, wc);
         build_hash_map<N>(high_files, hash_map, wc,
-                          opts.min_freq, opts.max_freq, opts.k_len, opts.count_bytes, &progress);
+                          opts.min_freq, opts.max_freq, &progress);
         hash_map.seal();
 
         if (opts.sort_output)
         {
             // Sort path
             std::vector<ExportRecord<N>> results;
-            process_low_freq_collect<N>(opts.tmp_dir + "low.bin", hash_map, results,
-                                        opts.k_len, opts.min_freq, opts.max_freq,
-                                        wc, pkb, opts.count_max, &progress);
+            process_low_freq_collect<N>(low, hash_map, results,
+                                        opts.min_freq, opts.max_freq,
+                                        wc, opts.count_max, &progress);
             collect_remaining_into_vector<N>(hash_map, results,
                                              opts.min_freq, opts.max_freq);
             progress.finish();
@@ -1258,9 +1137,9 @@ namespace
         {
             AsyncWriter writer;
             writer.open(opts.output_file);
-            process_low_freq<N>(opts.tmp_dir + "low.bin", hash_map,
+            process_low_freq<N>(low, hash_map,
                                 opts.k_len, opts.min_freq, opts.max_freq,
-                                wc, pkb, opts.count_max, &progress, &writer);
+                                wc, opts.count_max, &progress, &writer);
             collect_remaining_stream<N>(hash_map, opts.min_freq, opts.max_freq,
                                         &writer, opts.k_len);
             writer.finish();
@@ -1310,7 +1189,6 @@ namespace
         if (opts.sort_output)
         {
             // Collect all matching records, compute sort keys, global sort, write
-            using KeyT = typename SortKeyType<N>::type;
             std::vector<std::vector<ExportRecord<N>>> high_results(wc);
             for (auto &v : high_results)
                 v.reserve(total_records / wc + 1024);
@@ -1319,6 +1197,7 @@ namespace
             auto worker = [&](uint32_t tid)
             {
                 std::vector<ExportRecord<N>> buffer(65536);
+                std::vector<char> scratch;
                 auto &local = high_results[tid];
                 for (;;)
                 {
@@ -1326,27 +1205,26 @@ namespace
                     if (index >= high_files.size())
                         break;
                     const RootFileInfo &info = high_files[index];
-                    int fd = ::open(info.filename.c_str(), O_RDONLY);
-                    if (fd < 0)
-                    {
-                        std::cerr << "open: " << info.filename << '\n';
-                        exit(-1);
-                    }
                     uint64_t remaining = info.record_count;
-                    uint64_t offset = 0;
+                    uint64_t first = 0;
                     while (remaining > 0)
                     {
-                        uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        uint64_t bytes = read_compact_high_records<N>(
-                            fd, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
+                        const uint64_t batch = std::min<uint64_t>(remaining, buffer.size());
+                        uint64_t bytes = 0;
+                        const uint64_t decoded = info.reader->read_records(first, batch, buffer.data(),
+                                                                          scratch, &bytes);
+                        if (decoded != batch)
+                        {
+                            std::cerr << "short read reading high records\n";
+                            exit(-1);
+                        }
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 local.push_back(buffer[i]);
                         remaining -= batch;
-                        offset += batch;
+                        first += batch;
                         progress.add(bytes);
                     }
-                    ::close(fd);
                 }
             };
             std::vector<std::thread> workers;
@@ -1381,33 +1259,33 @@ namespace
             {
                 LineWriter<N> line_writer(&writer, opts.k_len);
                 std::vector<ExportRecord<N>> buffer(65536);
+                std::vector<char> scratch;
                 for (;;)
                 {
                     uint64_t index = next_file.fetch_add(1, std::memory_order_relaxed);
                     if (index >= high_files.size())
                         break;
                     const RootFileInfo &info = high_files[index];
-                    int fd = ::open(info.filename.c_str(), O_RDONLY);
-                    if (fd < 0)
-                    {
-                        std::cerr << "open: " << info.filename << '\n';
-                        exit(-1);
-                    }
                     uint64_t remaining = info.record_count;
-                    uint64_t offset = 0;
+                    uint64_t first = 0;
                     while (remaining > 0)
                     {
-                        uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        uint64_t bytes = read_compact_high_records<N>(
-                            fd, offset, batch, buffer.data(), opts.k_len, opts.count_bytes);
+                        const uint64_t batch = std::min<uint64_t>(remaining, buffer.size());
+                        uint64_t bytes = 0;
+                        const uint64_t decoded = info.reader->read_records(first, batch, buffer.data(),
+                                                                          scratch, &bytes);
+                        if (decoded != batch)
+                        {
+                            std::cerr << "short read reading high records\n";
+                            exit(-1);
+                        }
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 line_writer.write_line(buffer[i].key, buffer[i].count);
                         remaining -= batch;
-                        offset += batch;
+                        first += batch;
                         progress.add(bytes);
                     }
-                    ::close(fd);
                 }
             };
             std::vector<std::thread> workers;
