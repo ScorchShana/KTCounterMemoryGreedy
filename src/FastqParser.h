@@ -101,13 +101,6 @@ public:
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
 
-        for (int i = 0; i < classifier_num; i++)
-        {
-            dequeue_data_from_classifier(owner_contents[i].data);
-            owner_contents[i].length = 0;
-        }
-
-
         while (true)
         {
             if (!reader_parser_ring_pool->producer_finished()) [[likely]]
@@ -222,15 +215,7 @@ public:
 
         flush_kmer_buffer();
 
-        for (uint32_t owner = 0; owner < owner_contents.size(); owner++)
-        {
-            if (owner_contents[owner].length == 0)
-            {
-                parser_classifier_ring_pool->consumer_enqueue(owner_contents[owner].data);
-                continue;
-            }
-            enqueue_content_to_classifier(owner);
-        }
+        flush_owner_blocks();
     }
 
     uint64_t get_total_read_kmer() const noexcept
@@ -513,41 +498,39 @@ private:
         {
             uint32_t owner = (i + owner_start) % owner_contents.size();
             uint32_t remaining_count = local_block_owner_counts[owner];
+            if (remaining_count == 0) continue;
             uint64_t read_offset = local_block_owner_sums[owner] - local_block_owner_counts[owner];
-
-            if (owner_contents[owner].length + remaining_count > max_kmers_per_block)
+            auto& content = owner_contents[owner];
+            while (remaining_count > 0)
             {
-                const uint32_t copy_count = (max_kmers_per_block - owner_contents[owner].length);
-                std::memcpy(owner_contents[owner].data + owner_contents[owner].length * kmer_bytes(), local_block_for_copy.data() + read_offset * kmer_bytes(), copy_count * kmer_bytes());
-                owner_contents[owner].length += copy_count;
-
+                if (content.data == nullptr)
+                {
 #ifdef TEST_MODE
-                uint64_t queue_wait_start = __rdtsc();
+                    const uint64_t queue_wait_start = __rdtsc();
 #endif
-                enqueue_content_to_classifier(owner);
+                    dequeue_data_from_classifier(content.data);
 #ifdef TEST_MODE
-                uint64_t queue_wait_end = __rdtsc();
-                queue_wait_cycles += queue_wait_end - queue_wait_start;
+                    queue_wait_cycles += __rdtsc() - queue_wait_start;
 #endif
+                }
+                const uint32_t copy_count = std::min<uint64_t>(
+                    max_kmers_per_block - content.length, remaining_count);
+                std::memcpy(content.data + content.length * kmer_bytes(),
+                    local_block_for_copy.data() + read_offset * kmer_bytes(), copy_count * kmer_bytes());
+                content.length += copy_count;
                 read_offset += copy_count;
-
-                owner_contents[owner].length = 0;
-
-#ifdef TEST_MODE
-                queue_wait_start = __rdtsc();
-#endif
-                dequeue_data_from_classifier(owner_contents[owner].data);
-#ifdef TEST_MODE
-                queue_wait_end = __rdtsc();
-                queue_wait_cycles += queue_wait_end - queue_wait_start;
-#endif
-
                 remaining_count -= copy_count;
+                if (content.length == max_kmers_per_block)
+                {
+#ifdef TEST_MODE
+                    const uint64_t queue_wait_start = __rdtsc();
+#endif
+                    enqueue_content_to_classifier(owner);
+#ifdef TEST_MODE
+                    queue_wait_cycles += __rdtsc() - queue_wait_start;
+#endif
+                }
             }
-
-            std::memcpy(owner_contents[owner].data + owner_contents[owner].length * kmer_bytes(), local_block_for_copy.data() + read_offset * kmer_bytes(), remaining_count * kmer_bytes());
-            owner_contents[owner].length += remaining_count;
-            read_offset += remaining_count;
         }
 
     }
@@ -589,6 +572,7 @@ private:
 
     void flush_kmer_buffer()
     {
+        if (kmer_buffer_count == 0) return;
         // divide_kmer_buffer_into_owner_contents(kmer_buffer.data(), kmer_buffer_count);
         calculate_block_owner_counts(kmer_buffer.data(), kmer_buffer_count);
         push_kmers_into_local_block_for_copy(kmer_buffer.data(), kmer_buffer_count);
@@ -599,78 +583,32 @@ private:
 
     void enqueue_content_to_classifier(const uint32_t owner_id)
     {
-
-        bool reverse_enqueue = classifier_task_queues[owner_id]->size() >= CLASSIFIER_TASK_QUEUE_HALF_WATERMARK;
-        if (reverse_enqueue)
-        {
-            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-            {
-                enqueue_to_classifier_backoff.double_decay();
-                return;
-            }
-            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-            {
-                enqueue_to_classifier_backoff.double_decay();
-                return;
-            }
-        }
-        else
-        {
-            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-            {
-                enqueue_to_classifier_backoff.double_decay();
-                return;
-            }
-
-            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-            {
-                enqueue_to_classifier_backoff.double_decay();
-                return;
-            }
-        }
-
-        enqueue_to_classifier_backoff.backoff();
-
+        auto& content = owner_contents[owner_id];
+        const bool reverse_enqueue = classifier_task_queues[owner_id]->size() >= CLASSIFIER_TASK_QUEUE_HALF_WATERMARK;
+        bool submitted = reverse_enqueue
+            ? global_classifier_task_queue->try_enqueue(content) || classifier_task_queues[owner_id]->try_enqueue(content)
+            : classifier_task_queues[owner_id]->try_enqueue(content) || global_classifier_task_queue->try_enqueue(content);
+        if (submitted) {
+            enqueue_to_classifier_backoff.double_decay();
+        } else {
+            do {
+                enqueue_to_classifier_backoff.backoff();
 #ifdef TEST_MODE
-        producer_enqueue_spin_time++;
+                producer_enqueue_spin_time++;
 #endif
-
-        while (true)
-        {
-
-            if (reverse_enqueue)
-            {
-                if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-                if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-
-            }
-            else
-            {
-                if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-                if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-            }
-
-            enqueue_to_classifier_backoff.backoff();
-
-#ifdef TEST_MODE
-            producer_enqueue_spin_time++;
-#endif
-
+                submitted = reverse_enqueue
+                    ? global_classifier_task_queue->try_enqueue(content) || classifier_task_queues[owner_id]->try_enqueue(content)
+                    : classifier_task_queues[owner_id]->try_enqueue(content) || global_classifier_task_queue->try_enqueue(content);
+            } while (!submitted);
+            enqueue_to_classifier_backoff.decay();
         }
+        content = {nullptr, 0};
+    }
 
-        enqueue_to_classifier_backoff.decay();
+    void flush_owner_blocks()
+    {
+        for (uint32_t owner = 0; owner < owner_contents.size(); ++owner)
+            if (owner_contents[owner].data != nullptr) enqueue_content_to_classifier(owner);
     }
 
     void dequeue_data_from_classifier(char*& data)
@@ -682,6 +620,8 @@ private:
             return;
         }
 
+        // Publish partial blocks before waiting so Classifiers can return memory.
+        flush_owner_blocks();
         dequeue_from_classifier_backoff.backoff();
 
         while (!parser_classifier_ring_pool->producer_try_dequeue(data))

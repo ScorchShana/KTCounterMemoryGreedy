@@ -12,6 +12,7 @@
 #include <memory>
 #include <atomic>
 
+template<typename CountType = uint32_t>
 class LayerQueues
 {
     struct alignas(CACHE_LINE_SIZE) PaddedAtomicSize
@@ -20,8 +21,8 @@ class LayerQueues
     };
 
     std::array<PaddedAtomicSize, MAX_DEPTH> depth_sizes_{ 0 };
-    std::array<std::shared_ptr<MPMCRingQueue<Task, TASK_QUEUE_CAPACITY>>, MAX_DEPTH> queues_;
-    std::shared_ptr<MPMCRingQueue<Task, 1ULL << (2 * ROOT_BASES)>> final_drain_queue_;
+    std::array<std::shared_ptr<MPMCRingQueue<Task<CountType>, TASK_QUEUE_CAPACITY>>, MAX_DEPTH> queues_;
+    std::shared_ptr<MPMCRingQueue<Task<CountType>, 1ULL << (2 * ROOT_BASES)>> final_drain_queue_;
 
 public:
     explicit LayerQueues()
@@ -29,12 +30,12 @@ public:
         for (uint32_t i = 0; i < MAX_DEPTH; ++i)
         {
             depth_sizes_[i].size.store(0, std::memory_order_relaxed);
-            queues_[i] = std::make_shared<MPMCRingQueue<Task, TASK_QUEUE_CAPACITY>>();
+            queues_[i] = std::make_shared<MPMCRingQueue<Task<CountType>, TASK_QUEUE_CAPACITY>>();
         }
-        final_drain_queue_ = std::make_shared<MPMCRingQueue<Task, 1ULL << (2 * ROOT_BASES)>>();
+        final_drain_queue_ = std::make_shared<MPMCRingQueue<Task<CountType>, 1ULL << (2 * ROOT_BASES)>>();
     }
 
-    void initialize_final_drain_queue(std::vector<std::atomic<uint32_t>>& prefix_counts, node* root_nodes)
+    void initialize_final_drain_queue(std::vector<std::atomic<uint32_t>>& prefix_counts, node<CountType>* root_nodes)
     {
         struct PrefixInfo
         {
@@ -53,18 +54,18 @@ public:
 
         for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); ++i)
         {
-            Task task;
+            Task<CountType> task;
             task.current_node = &root_nodes[prefix_info_array[i].prefix];
             final_drain_queue_->enqueue(task);
         }
     }
 
-    MPMCRingQueue<Task, TASK_QUEUE_CAPACITY>* get_queue(uint32_t depth) const
+    MPMCRingQueue<Task<CountType>, TASK_QUEUE_CAPACITY>* get_queue(uint32_t depth) const
     {
         return queues_[depth].get();
     }
 
-    MPMCRingQueue<Task, 1ULL << (2 * ROOT_BASES)>* get_final_drain_queue() const
+    MPMCRingQueue<Task<CountType>, 1ULL << (2 * ROOT_BASES)>* get_final_drain_queue() const
     {
         return final_drain_queue_.get();
     }

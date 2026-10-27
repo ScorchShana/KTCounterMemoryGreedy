@@ -2,6 +2,7 @@
 #define LOW_FREQUENCY_PARSER_HEADER
 
 #include "kmer.h"
+#include "MsdPrefixCodec.h"
 #include "RingMemoryPool.h"
 #include "SpinBackoff.h"
 #include "SplitMix.h"
@@ -46,29 +47,54 @@ public:
         const size_t capacity = parsed.blockSize() / kmer_bytes();
         const size_t width = kmer_bytes();
         SpinBackoff<> backoff;
-        content_type content;
-        while (true)
-        {
-            bool available = reads.consumer_try_dequeue(content);
-            if (!available && reads.producer_finished()) {
-                available = reads.consumer_try_dequeue(content);
-                if (!available) break;
-            }
-            if (!available) {
-                backoff.backoff();
-                continue;
-            }
-            backoff.decay();
-            size_t pos = 0;
-            while (pos < content.length)
+        content_type content{};
+        try {
+            while (true)
             {
-                const size_t count = std::min<size_t>(capacity, content.length - pos);
-                group_and_push(reinterpret_cast<const unsigned char*>(content.data) + pos * width, count, parsed);
-                pos += count;
+                bool available = reads.consumer_try_dequeue(content);
+                if (!available && reads.producer_finished()) {
+                    available = reads.consumer_try_dequeue(content);
+                    if (!available) break;
+                }
+                if (!available) {
+                    backoff.backoff();
+                    continue;
+                }
+                backoff.decay();
+                size_t pos = 0;
+                while (pos < content.length)
+                {
+                    const auto input = std::span(reinterpret_cast<const uint8_t*>(content.data) + pos, content.length - pos);
+                    const auto group = msd_prefix::parse_group_header(input, width);
+                    if (input.size() < group.encoded_bytes) throw std::runtime_error("truncated pending parser group");
+                    const auto* common = input.data() + msd_prefix::GROUP_HEADER_BYTES;
+                    const auto* suffix = common + group.prefix_bytes;
+                    if (group.prefix_bytes) {
+                        restore_to_owner(common, suffix, group.prefix_bytes, group.records, parsed);
+                    } else {
+                        for (size_t done = 0; done < group.records;) {
+                            const size_t count = std::min(capacity, size_t(group.records) - done);
+                            group_and_push(suffix + done * width, count, parsed);
+                            done += count;
+                        }
+                    }
+                    pos += group.encoded_bytes;
+                }
+                reads.consumer_enqueue(content.data);
+                content = {};
             }
-            reads.consumer_enqueue(content.data);
+            flush_owner_blocks();
+        } catch (...) {
+            // These blocks are privately held, so each return queue has room.
+            // Avoid failure-aware blocking operations while already unwinding.
+            if (content.data)
+                while (!reads.consumer_try_enqueue(content.data)) std::this_thread::yield();
+            for (auto& tail : owner_contents) if (tail.data) {
+                while (!parsed.consumer_try_enqueue(tail.data)) std::this_thread::yield();
+                tail = {};
+            }
+            throw;
         }
-        flush_owner_blocks();
     }
 
 private:
@@ -105,6 +131,46 @@ private:
     {
         for (size_t owner = 0; owner < owner_contents.size(); ++owner)
             if (owner_contents[owner].data != nullptr) enqueue_content_to_classifier(owner);
+    }
+
+    void restore_to_owner(const uint8_t* prefix, const uint8_t* suffix, size_t prefix_bytes,
+        size_t count, RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>& parsed)
+    {
+        const size_t width = kmer_bytes();
+        const size_t suffix_bytes = width - prefix_bytes;
+        const size_t owner = get_classifier_owner(prefix);
+        auto& content = owner_contents[owner];
+        while (count) {
+            if (!content.data) {
+                char* block;
+                if (!parsed.producer_try_dequeue(block)) {
+                    flush_owner_blocks();
+                    parsed.producer_dequeue(block);
+                }
+                content = {block, 0};
+            }
+            const size_t take = std::min(count, parsed.blockSize() / width - content.length);
+            auto* target = reinterpret_cast<uint8_t*>(content.data) + content.length * width;
+            if (prefix_bytes == 1) {
+                const uint8_t common = prefix[0];
+                for (size_t i = 0; i < take; ++i) {
+                    target[0] = common;
+                    std::memcpy(target + 1, suffix, suffix_bytes);
+                    target += width;
+                    suffix += suffix_bytes;
+                }
+            } else {
+                for (size_t i = 0; i < take; ++i) {
+                    std::memcpy(target, prefix, prefix_bytes);
+                    std::memcpy(target + prefix_bytes, suffix, suffix_bytes);
+                    target += width;
+                    suffix += suffix_bytes;
+                }
+            }
+            content.length += take;
+            count -= take;
+            if (content.length == parsed.blockSize() / width) enqueue_content_to_classifier(owner);
+        }
     }
 
     void group_and_push(const unsigned char* decoded, size_t count,

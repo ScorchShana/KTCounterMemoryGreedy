@@ -1,9 +1,12 @@
+#include "low_msd_test_helpers.h"
+#include "high_prefix_test_helpers.h"
 #include "../src/FastqClassifier.h"
 #include "../src/ConcurrentFirstBlockRing.h"
 #include "../src/FastqParser.h"
 #include "../src/LowFrequencyReader.h"
 #include "../src/ParserThreadPool.h"
 #include "../src/ExportWriter.h"
+#include "../src/ClassifierThreadPool.h"
 
 #include <chrono>
 #include <future>
@@ -20,6 +23,31 @@ using Key = std::vector<unsigned char>;
 static Key read_key(const unsigned char* bytes)
 { return Key(bytes, bytes + kmer_bytes()); }
 
+static size_t tree_record_bytes(uint32_t depth = 0)
+{ return std::max(size_t{1}, kmer_bytes() - std::min(kmer_bytes(), size_t{1} + depth / 2)); }
+
+static Key read_tree_key(const unsigned char* bytes, const node<uint32_t>* owner, uint32_t depth = 0)
+{
+    Key full(kmer_bytes());
+    const size_t cut = std::min(full.size(), size_t{1} + depth / 2);
+    for (size_t i = 0; i < cut; ++i)
+        full[i] = owner->prefix_code >> (8 + 4 * depth - 8 * (i + 1));
+    if (cut < full.size()) std::memcpy(full.data() + cut, bytes, full.size() - cut);
+    return full;
+}
+
+static void store_tree_key(unsigned char* dest, const Key& full, uint32_t depth)
+{
+    const size_t cut = std::min(full.size(), size_t{1} + depth / 2);
+    if (cut == full.size()) dest[0] = 0;
+    else std::memcpy(dest, full.data() + cut, full.size() - cut);
+}
+
+static void initialize_children(node<uint32_t>* parent, node<uint32_t>* children)
+{
+    for (uint32_t i = 0; i < 16; ++i) children[i].prefix_code = (parent->prefix_code << 4) | i;
+}
+
 static std::vector<unsigned char> flatten(const std::vector<Key>& keys)
 {
     std::vector<unsigned char> bytes(keys.size() * kmer_bytes());
@@ -35,7 +63,10 @@ struct ConcurrentFirstBlockRingTestAccess
 
 struct FastqClassifierTestAccess
 {
-    static void feed(FastqClassifier& classifier, std::vector<Key>& keys, bool owned)
+    static bool paused(const FastqClassifier<uint32_t>& classifier) { return classifier.first_paused_; }
+    static void refresh(FastqClassifier<uint32_t>& classifier) { classifier.refresh_first_state(); }
+    static void checkpoint(FastqClassifier<uint32_t>& classifier) { classifier.record_checkpoint(); }
+    static void feed(FastqClassifier<uint32_t>& classifier, std::vector<Key>& keys, bool owned)
     {
         const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
         const auto bytes = flatten(keys);
@@ -46,35 +77,64 @@ struct FastqClassifierTestAccess
         }
     }
     template<bool WRITE_MISSES = true>
-    static uint64_t flush(FastqClassifier& classifier) { return classifier.flush_evicted_batch<WRITE_MISSES>(); }
-    static void group_and_decode(FastqClassifier& classifier) { classifier.group_evicted(); }
-    static const auto* grouped(FastqClassifier& classifier) { return classifier.evicted_grouped_; }
+    static uint64_t flush(FastqClassifier<uint32_t>& classifier) { return classifier.flush_evicted_batch<WRITE_MISSES>(); }
+    static void group_and_decode(FastqClassifier<uint32_t>& classifier) { classifier.group_evicted(); }
+    static const auto* grouped(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_grouped_; }
     template<bool WRITE_MISSES = true>
-    static uint64_t finish(FastqClassifier& classifier) { return classifier.drain_first_occurrences<WRITE_MISSES>(); }
-    static size_t block_capacity(FastqClassifier& classifier) { return classifier.first_block_capacity_; }
-    static size_t ring_capacity(FastqClassifier& classifier)
+    static uint64_t finish(FastqClassifier<uint32_t>& classifier) { return classifier.drain_first_occurrences<WRITE_MISSES>(); }
+    static size_t block_capacity(FastqClassifier<uint32_t>& classifier) { return classifier.first_block_capacity_; }
+    static size_t ring_capacity(FastqClassifier<uint32_t>& classifier)
     { return ConcurrentFirstBlockRingTestAccess::capacity(*classifier.first_occurrence_ring_) * block_capacity(classifier); }
-    static void push(FastqClassifier& classifier, const Key& key) { classifier.push_first_occurrence(key.data()); }
-    static size_t batch_capacity(FastqClassifier& classifier) { return classifier.evicted_capacity_; }
-    static size_t pending(FastqClassifier& classifier) { return classifier.evicted_count_; }
-    static const auto& prefix_counts(FastqClassifier& classifier, bool evicted)
+    static void push(FastqClassifier<uint32_t>& classifier, const Key& key) { classifier.push_first_occurrence(key.data()); }
+    static size_t batch_capacity(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_capacity_; }
+    static size_t pending(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_count_; }
+    static const auto& prefix_counts(FastqClassifier<uint32_t>& classifier, bool evicted)
     { return evicted ? classifier.evicted_prefix_counts_ : classifier.local_block_prefix_counts; }
-    static auto& packed(FastqClassifier& classifier) { return classifier.evicted_buffer_; }
-    static void stage(FastqClassifier& classifier, const std::vector<Key>& keys)
+    static auto& packed(FastqClassifier<uint32_t>& classifier) { return classifier.evicted_buffer_; }
+    static void stage(FastqClassifier<uint32_t>& classifier, const std::vector<Key>& keys)
     {
         for (size_t i = 0; i < keys.size(); ++i)
             std::memcpy(classifier.evicted_buffer_.data() + i * kmer_bytes(), keys[i].data(), kmer_bytes());
         classifier.evicted_count_ = keys.size();
     }
-    static auto* roots(FastqClassifier& classifier) { return classifier.local_root_nodes.data(); }
-    static void collect_partial_export(FastqClassifier& classifier, std::map<Key, uint64_t>& counts)
+    static auto* roots(FastqClassifier<uint32_t>& classifier) { return classifier.local_root_nodes.data(); }
+    template<bool WRITE_LOW = false>
+    static void low_block(FastqClassifier<uint32_t>& classifier, const content_type& content, size_t& hit_count)
+    { classifier.reconcile_low_block<WRITE_LOW>(content, hit_count); }
+    static void flush_low(FastqClassifier<uint32_t>& classifier, size_t& hit_count)
+    { classifier.flush_recovered_tree_batch(hit_count); }
+    static void export_batch(FastqClassifier<uint32_t>& classifier, const unsigned char* records, size_t count)
+    { classifier.export_kmer_batch(records, count); }
+    static void acquire_export_block(FastqClassifier<uint32_t>& classifier, char*& block)
+    { classifier.dequeue_data_to_export_writer(block); }
+    static size_t export_count(const FastqClassifier<uint32_t>& classifier) { return classifier.export_kmer_block_count; }
+    static const auto* export_block(const FastqClassifier<uint32_t>& classifier) { return classifier.export_block_ptr; }
+    static void collect_partial_export(FastqClassifier<uint32_t>& classifier, std::map<Key, uint64_t>& counts)
     {
         for (size_t i = 0; i < classifier.export_kmer_block_count; ++i)
             ++counts[read_key(classifier.export_block_ptr->k_mers.data() + i * kmer_bytes())];
     }
 };
 
+struct ConcurrentMemoryPoolTestAccess
+{
+    static Arena& arena(ConcurrentMemoryPool& pool) { return pool.arenas_[0]; }
+    static void scan_demand(ConcurrentMemoryPool& pool, uint64_t pages)
+    {
+        auto& arena = pool.arenas_[0];
+        std::lock_guard lock(arena.mutex);
+        arena.scan_reclaim_goal_pages.store(pages, std::memory_order_release);
+        pool.update_pressure(arena);
+    }
+};
+
 namespace {
+struct ScopedCountMax
+{
+    uint32_t previous = count_max;
+    ~ScopedCountMax() { count_max = previous; }
+};
+
 void require(bool ok, const char* message)
 {
     if (!ok) throw std::runtime_error(message);
@@ -85,8 +145,10 @@ struct TemporaryDirectory
     std::filesystem::path path;
     TemporaryDirectory()
     {
-        char name[] = "/tmp/tree-first-drain-test-XXXXXX";
-        const char* created = ::mkdtemp(name);
+        auto name_string = (std::filesystem::temp_directory_path() / "tree-first-drain-test-XXXXXX").string();
+        std::vector<char> name(name_string.begin(), name_string.end());
+        name.push_back(0);
+        const char* created = ::mkdtemp(name.data());
         if (created == nullptr) throw std::runtime_error("failed to create test directory");
         path = created;
     }
@@ -141,6 +203,180 @@ void check_parser_returns_empty_blocks()
     }
 }
 
+struct ParserTransferCase
+{
+    uint32_t parsers = 1;
+    uint32_t owners = 110;
+    size_t free_blocks = PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY;
+    bool before_eof = false;
+    bool defer_consumer = false;
+};
+
+void check_parser_transfer(uint32_t k, const std::vector<std::string>& sequences,
+    const ParserTransferCase& scenario = {})
+{
+    k_length = k;
+    for (size_t prefix = 0; prefix < prefix_owners.size(); ++prefix)
+        prefix_owners[prefix] = prefix % scenario.owners;
+
+    size_t input_block_bytes = 64;
+    std::map<Key, uint64_t> expected;
+    constexpr char bases[] = "ACGT";
+    for (const auto& sequence : sequences) {
+        input_block_bytes = std::max(input_block_bytes, sequence.size() + 1);
+        for (size_t pos = 0; pos + k <= sequence.size(); ++pos) {
+            const auto window = sequence.substr(pos, k);
+            const std::string reversed(window.rbegin(), window.rend());
+            std::string complement = window;
+            for (auto& base : complement) base = bases[3 - (std::strchr(bases, base) - bases)];
+            const auto& canonical = std::min(reversed, complement);
+            Key key(kmer_bytes(), 0);
+            for (size_t i = 0; i < canonical.size(); ++i)
+                key[i / 4] |= (std::strchr(bases, canonical[i]) - bases) << (6 - 2 * (i % 4));
+            ++expected[key];
+        }
+    }
+
+    RunState state;
+    ActiveRunScope active(state);
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> reads(input_block_bytes, 1);
+    RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> parsed(
+        PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, scenario.parsers);
+    std::vector<char*> held;
+    for (size_t i = scenario.free_blocks; i < parsed.capacity(); ++i) {
+        char* block;
+        parsed.producer_dequeue(block);
+        held.push_back(block);
+    }
+    for (const auto& sequence : sequences) {
+        char* block;
+        reads.producer_dequeue(block);
+        std::memcpy(block, sequence.data(), sequence.size());
+        block[sequence.size()] = '\n';
+        reads.producer_enqueue({block, sequence.size() + 1});
+    }
+    if (!scenario.before_eof) reads.producer_set_finished();
+
+    std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> owners;
+    for (uint32_t i = 0; i < scenario.owners; ++i)
+        owners.push_back(std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>());
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    const size_t capacity = parsed.blockSize() / kmer_bytes();
+    std::atomic<bool> full_seen{false};
+    std::atomic<bool> consume{!scenario.defer_consumer};
+    std::atomic<uint64_t> generated{0};
+    std::map<Key, uint64_t> actual;
+    size_t global_blocks = 0;
+    std::future<void> consumer;
+    std::vector<std::future<void>> parsers;
+    try {
+        consumer = std::async(std::launch::async, [&] {
+            run_worker("parser transfer consumer", [&] {
+                while (!consume.load(std::memory_order_acquire)) {
+                    state.check();
+                    std::this_thread::yield();
+                }
+                for (;;) {
+                    state.check();
+                    // Observe completion before the final queue drain.
+                    const bool finished = parsed.producer_finished();
+                    bool worked = false;
+                    for (size_t owner = 0; owner <= owners.size(); ++owner) {
+                        content_type content;
+                        const bool found = owner == owners.size() ? global.try_dequeue(content)
+                            : owners[owner]->try_dequeue(content);
+                        if (!found) continue;
+                        require(content.data && content.length && content.length <= capacity,
+                            "parser published an empty or oversized block");
+                        const auto* keys = reinterpret_cast<const unsigned char*>(content.data);
+                        const auto destination = prefix_owners[keys[0]];
+                        require(owner == owners.size() || owner == destination, "parser used the wrong owner queue");
+                        for (size_t i = 0; i < content.length; ++i) {
+                            require(prefix_owners[keys[i * kmer_bytes()]] == destination,
+                                "parser mixed owners within an output block");
+                            ++actual[read_key(keys + i * kmer_bytes())];
+                        }
+                        if (content.length == capacity) full_seen.store(true, std::memory_order_release);
+                        if (owner == owners.size()) ++global_blocks;
+                        parsed.consumer_enqueue(content.data);
+                        worked = true;
+                        std::this_thread::yield();
+                    }
+                    if (!worked && finished) break;
+                    if (!worked) std::this_thread::yield();
+                }
+            });
+        });
+        for (uint32_t i = 0; i < scenario.parsers; ++i) {
+            parsers.push_back(std::async(std::launch::async, [&] {
+                run_worker("parser transfer producer", [&] {
+                    FastqParser parser(owners, &global, &reads, &parsed);
+                    parser.parse_and_push();
+                    generated.fetch_add(parser.get_total_read_kmer(), std::memory_order_relaxed);
+                    parsed.producer_set_finished();
+                });
+            }));
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        if (scenario.before_eof) {
+            while (!full_seen.load(std::memory_order_acquire) && !state.failed()
+                && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+            require(full_seen.load(std::memory_order_acquire), "parser retained a full block until EOF");
+            reads.producer_set_finished();
+        }
+        for (auto& parser : parsers)
+            require(parser.wait_until(deadline) == std::future_status::ready, "parser waited for output blocks");
+        consume.store(true, std::memory_order_release);
+        require(consumer.wait_until(deadline) == std::future_status::ready, "parser consumer did not finish");
+    } catch (...) {
+        state.fail(std::current_exception(), "parser transfer test");
+    }
+    for (auto& parser : parsers) parser.get();
+    if (consumer.valid()) consumer.get();
+    state.check();
+
+    require(actual == expected, "parser handoff lost, duplicated, or corrupted records");
+    uint64_t expected_records = 0;
+    for (const auto& [key, count] : expected) expected_records += count;
+    require(generated.load() == expected_records, "parser handoff changed the input count");
+    if (scenario.defer_consumer) require(global_blocks > 0, "parser did not use the global fallback queue");
+    for (char* block : held) parsed.consumer_enqueue(block);
+    std::set<char*> returned;
+    char* block;
+    while (parsed.producer_try_dequeue(block)) {
+        require(block && returned.insert(block).second, "parser returned a null or duplicate block");
+    }
+    require(returned.size() == parsed.capacity(), "parser handoff leaked an output block");
+}
+
+void check_parser_transfers()
+{
+    check_parser_transfer(33, {}, {.free_blocks = 0});
+    check_parser_transfer(33, {std::string(33, 'A')}, {.free_blocks = 1});
+    check_parser_transfer(33, {std::string(33, 'A'), std::string(33, 'C')}, {.free_blocks = 1});
+    for (uint32_t k : {1u, 33u, 128u}) {
+        const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / ((k + 3) / 4);
+        for (size_t records : {capacity - 1, capacity, capacity + 1})
+            check_parser_transfer(k, {std::string(records + k - 1, 'A')});
+    }
+    check_parser_transfer(1, {std::string(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE + 1, 'A')},
+        {.before_eof = true});
+    std::vector<std::string> sequences;
+    constexpr char bases[] = "ACGT";
+    for (size_t repeat = 0; repeat < 19; ++repeat) {
+        for (uint32_t owner = 0; owner < 110; ++owner) {
+            // The chosen key starts below T and ends in A, so reversal wins.
+            std::string key(33, 'A');
+            for (uint32_t i = 0; i < 4; ++i) key[i] = bases[(owner >> (6 - 2 * i)) & 3];
+            sequences.emplace_back(key.rbegin(), key.rend());
+        }
+    }
+    check_parser_transfer(33, sequences, {.parsers = 19, .free_blocks = 8});
+    sequences.assign(CLASSIFIER_TASK_QUEUES_CAPACITY + 1,
+        std::string(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE + 1, 'A'));
+    check_parser_transfer(1, sequences, {.defer_consumer = true});
+}
+
 Key make_key(uint32_t k, uint64_t seed)
 {
     Key key(kmer_bytes());
@@ -166,21 +402,21 @@ struct Fixture
 {
     Shared& shared;
     ConcurrentMemoryPool pool{64ULL << 20};
-    std::unique_ptr<LayerQueues> layers = std::make_unique<LayerQueues>();
-    std::unique_ptr<KmerTree> tree;
+    std::unique_ptr<LayerQueues<uint32_t>> layers = std::make_unique<LayerQueues<uint32_t>>();
+    std::unique_ptr<KmerTree<uint32_t>> tree;
     std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>> local =
         std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>();
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    std::barrier<> start{1};
-    std::unique_ptr<FastqClassifier> classifier;
+    PhaseBarrier start{1};
+    std::unique_ptr<FastqClassifier<uint32_t>> classifier;
     Fixture(Shared& state, uint32_t k) : shared(state)
     {
         k_length = k;
         pool.init_arenas();
         prefix_owners.fill(0);
         bloom_filter_capacity.fill(4096);
-        tree = std::make_unique<KmerTree>( &pool, layers.get(), &shared.exports);
-        classifier = std::make_unique<FastqClassifier>(0, &shared.inputs, local.get(), &global,
+        tree = std::make_unique<KmerTree<uint32_t>>( &pool, layers.get(), &shared.exports);
+        classifier = std::make_unique<FastqClassifier<uint32_t>>(0, &shared.inputs, local.get(), &global,
             tree.get(), &pool, start,
             ConcurrentFirstBlockRing::create(&pool, 0, 1,
                 align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
@@ -188,13 +424,13 @@ struct Fixture
     }
 };
 
-void collect_roots(node* roots, std::map<Key, uint64_t>& counts)
+void collect_roots(node<uint32_t>* roots, std::map<Key, uint64_t>& counts)
 {
     for (uint32_t prefix = 0; prefix < 256; ++prefix) {
         for (size_t b = 0; b < roots[prefix].count; ++b) {
             auto* block = roots[prefix].kmer_blocks[b];
             for (size_t i = 0; i < block->count; ++i) {
-                const auto key = read_key(block->k_mers.data() + i * kmer_bytes());
+                const auto key = read_tree_key(block->k_mers.data() + i * tree_record_bytes(), roots + prefix);
                 require(key[0] == prefix, "recovered key was submitted to the wrong root");
                 ++counts[key];
             }
@@ -210,6 +446,52 @@ void collect_exports(Shared& shared, std::map<Key, uint64_t>& counts)
         for (size_t i = 0; i < content.length; ++i) ++counts[read_key(block->k_mers.data() + i * kmer_bytes())];
         shared.exports.consumer_enqueue(content.data);
     }
+}
+
+void check_export_batches(Shared& shared, uint32_t k)
+{
+    using Access = FastqClassifierTestAccess;
+    Fixture fixture(shared, k);
+    auto& classifier = *fixture.classifier;
+    const size_t width = kmer_bytes();
+    const size_t capacity = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / width;
+    std::vector<Key> keys;
+    for (size_t i = 0; i < 3 * capacity + 17; ++i) keys.push_back(make_key(k, i + 1));
+    const auto records = flatten(keys);
+    std::vector<unsigned char> actual;
+    size_t appended = 0;
+    for (size_t count : {size_t{0}, capacity - 3, size_t{16}, capacity + 4, capacity - 17, size_t{0}, size_t{17}}) {
+        Access::export_batch(classifier, records.data() + appended * width, count);
+        appended += count;
+        require(classifier.total_kmers_exported == appended, "batch export statistics differ");
+        require(Access::export_count(classifier) == appended % capacity, "batch export tail count differs");
+        const auto* tail = Access::export_block(classifier);
+        require(tail != nullptr, "batch export did not acquire the next empty block");
+        content_type content;
+        while (shared.exports.consumer_try_dequeue(content)) {
+            require(content.length == capacity, "batch export submitted a partial block early");
+            const auto* block = reinterpret_cast<const ExportBlock*>(content.data);
+            require(block != tail, "batch export retained a submitted full block");
+            actual.insert(actual.end(), block->k_mers.data(), block->k_mers.data() + content.length * width);
+            shared.exports.consumer_enqueue(content.data);
+        }
+        require(actual.size() == (appended / capacity) * capacity * width, "batch export lost a full block");
+        require(std::equal(actual.begin(), actual.end(), records.begin()), "batch export changed full-block byte order");
+        require(std::equal(tail->k_mers.begin(), tail->k_mers.begin() + Access::export_count(classifier) * width,
+            records.begin() + actual.size()), "batch export changed tail byte order");
+    }
+    classifier.classify_first_pass();
+    content_type content;
+    require(shared.exports.consumer_try_dequeue(content) && content.length == 17,
+        "batch export did not submit the final partial block");
+    const auto* block = reinterpret_cast<const ExportBlock*>(content.data);
+    actual.insert(actual.end(), block->k_mers.data(), block->k_mers.data() + content.length * width);
+    shared.exports.consumer_enqueue(content.data);
+    require(actual == records, "batch export lost, duplicated, or reordered bytes");
+    require(!shared.exports.consumer_try_dequeue(content), "batch export submitted an extra block");
+    require(Access::export_count(classifier) == 0 && Access::export_block(classifier) == nullptr,
+        "batch export retained the submitted tail");
+    require(classifier.total_kmers_exported == keys.size(), "batch export final statistics differ");
 }
 
 void check_group_and_decode(Shared& shared, uint32_t k)
@@ -257,14 +539,14 @@ void check_root_block_rollover(Shared& shared)
     constexpr uint32_t prefix = 57;
     auto key = make_key(33, 999);
     key[0] = ((uint64_t{prefix} << 56)) >> 56;
-    const size_t block_capacity = 4092 / kmer_bytes();
+    const size_t block_capacity = 4092 / tree_record_bytes();
     const size_t count = (MAX_KMER_BLOCK_NUM + 1) * block_capacity + 3;
     std::vector<Key> keys(count, key);
     fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), 0, prefix, roots);
     require(roots[prefix].count == 0, "empty root append allocated a tree block");
     fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), keys.size(), prefix, roots);
     require(fixture.layers->size(0) == 1, "root rollover did not account for its queued task");
-    Task task;
+    Task<uint32_t> task;
     require(fixture.layers->get_queue(0)->try_dequeue(task), "full local root was not queued");
     require(task.current_node == fixture.tree->root_nodes + prefix && task.depth == 0,
         "rollover task points at the wrong global root");
@@ -274,7 +556,7 @@ void check_root_block_rollover(Shared& shared)
     {
         require(task.kmer_blocks[b]->count == block_capacity, "rollover published a partial block");
         for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)
-            ++actual[read_key(task.kmer_blocks[b]->k_mers.data() + i * kmer_bytes())];
+            ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
     }
     // The ordinary multi-root interface must share the same append behavior.
     auto other = key;
@@ -549,11 +831,11 @@ void check_late_reconcile(Shared& shared, uint32_t k)
     const auto output_path = directory.path / "low.bin";
     const size_t width = kmer_bytes();
     {
-        std::ofstream out(input_path, std::ios::binary);
+        std::ofstream out(input_path.string() + ".0", std::ios::binary);
         std::array<uint8_t, 32> record{};
         for (const auto& key : pending) {
             std::memcpy(record.data(), key.data(), width);
-            out.write(reinterpret_cast<const char*>(record.data()), width);
+            low_msd_test::write_raw(out, std::span(record.data(), width), width);
         }
     }
     // Finish and drain the first-pass export queue before reusing it.
@@ -569,11 +851,11 @@ void check_late_reconcile(Shared& shared, uint32_t k)
     std::unique_ptr<ExportWriter> writer;
     if constexpr (WRITE_LOW) {
         shared.exports.reset_producers(1);
-        writer = std::make_unique<ExportWriter>( &shared.exports, output_path.string());
+        writer = std::make_unique<ExportWriter>(&shared.exports, output_path.string(), ExportWriter::OutputKind::FinalLow);
         writer->start();
     }
     parsers.start_low_pass(reads, 1);
-    reader.start(input_path.string());
+    reader.start(input_path.string(), 1);
     classifier.template reconcile_low<WRITE_LOW>();
     reader.join();
     parsers.join();
@@ -590,13 +872,8 @@ void check_late_reconcile(Shared& shared, uint32_t k)
     require(classifier.low_records_scanned == 3 && classifier.low_records_recovered == 2,
         "pending query conservation failed");
     if constexpr (WRITE_LOW) {
-        require(std::filesystem::file_size(output_path) == width, "low output lost its singleton");
-        std::ifstream out(output_path, std::ios::binary);
-        std::array<uint8_t, 32> record{};
-        out.read(reinterpret_cast<char*>(record.data()), width);
-        Key key(kmer_bytes());
-        std::memcpy(key.data(), record.data(), width);
-        require(key == pending[1], "low output contains the wrong key");
+        const auto actual = low_msd_test::read(output_path, width);
+        require(actual.size() == 1 && actual[0] == pending[1], "low output contains the wrong singleton");
     } else {
         exported.clear();
         collect_exports(shared, exported);
@@ -645,13 +922,14 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     Access::stage(classifier, batch);
     for (size_t i = staged; i < keys.size(); ++i) Access::push(classifier, keys[i]);
     shared.exports.reset_producers(1);
-    ExportWriter pending_writer(&shared.exports, pending_path.string());
+    ExportWriter pending_writer(&shared.exports, pending_path.string(), ExportWriter::OutputKind::Pending);
     pending_writer.start();
     classifier.classify_first_pass();
     shared.exports.producer_set_finished();
     pending_writer.join();
     require(classifier.repeat_query_count == runtime_queries, "first pass prematurely drained FIRST");
-    require(std::filesystem::file_size(pending_path) == pending.size() * kmer_bytes(),
+    const auto decoded_pending = low_msd_test::read(pending_path.string() + ".0", kmer_bytes());
+    require(decoded_pending.size() == pending.size(),
         "terminal FIRST misses reached the pending file");
 
     const uint64_t direct_singletons = expected_low.size();
@@ -659,9 +937,7 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     if (has_pending) {
         char* block;
         shared.inputs.producer_dequeue(block);
-        std::ifstream input(pending_path, std::ios::binary);
-        input.read(block, kmer_bytes());
-        require(input.good(), "failed to read pending test record");
+        std::memcpy(block, decoded_pending.front().data(), kmer_bytes());
         fixture.local->enqueue({block, 1});
         ++expected_low[pending[0]];
     }
@@ -669,7 +945,7 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     std::unique_ptr<ExportWriter> final_writer;
     if constexpr (WRITE_LOW) {
         shared.exports.reset_producers(1);
-        final_writer = std::make_unique<ExportWriter>(&shared.exports, final_path.string());
+        final_writer = std::make_unique<ExportWriter>(&shared.exports, final_path.string(), ExportWriter::OutputKind::FinalLow);
         final_writer->start();
     } else {
         char* block;
@@ -690,9 +966,7 @@ void check_first_drain_after_writer_switch(Shared& shared, bool has_pending)
     require(Access::pending(classifier) == 0, "second-stage FIRST drain left staged records");
     require(classifier.repeat_query_count == runtime_queries + total, "FIRST records were lost or queried twice");
     if constexpr (WRITE_LOW) {
-        std::ifstream input(final_path, std::ios::binary);
-        Key key(kmer_bytes());
-        while (input.read(reinterpret_cast<char*>(key.data()), key.size())) ++actual_low[key];
+        for (const auto& key : low_msd_test::read(final_path, kmer_bytes())) ++actual_low[key];
         require(actual_low == expected_low, "final low lost or duplicated terminal singleton records");
     } else {
         collect_exports(shared, actual_low);
@@ -711,42 +985,47 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
     constexpr uint32_t k = 33;
     k_length = k;
     constexpr uint32_t prefix = 57;
-    Fixture fixture(shared, k);
-    const uint32_t saved_min = filter_min, saved_max = filter_max, saved_cap = count_max;
+    ScopedCountMax restore_cap;
+    const uint32_t saved_min = filter_min, saved_max = filter_max;
     filter_min = minimum;
     filter_max = maximum;
     count_max = 4;
+    Fixture fixture(shared, k);
     const auto below_before = filtered_below_min_count.load();
     const auto above_before = filtered_above_max_count.load();
     std::array<Key, 4> keys;
     const std::array<uint32_t, 4> counts{1, 2, 4, 5};
     std::map<Key, uint32_t> expected;
     uint64_t below = 0, above = 0;
-    std::vector<std::unique_ptr<node[]>> slabs;
-    std::unique_ptr<ConcurrentOpenAddressHashMap> map;
+    std::vector<std::unique_ptr<node<uint32_t>[]>> slabs;
+    std::unique_ptr<ConcurrentOpenAddressHashMap<uint32_t>> map;
     if (hashed) {
         auto* current = fixture.tree->root_nodes + prefix;
         for (uint32_t depth = 0; depth + 1 < MAX_DEPTH; ++depth) {
             auto* children = current->children_ptr.load();
             if (!children) {
-                slabs.push_back(std::make_unique<node[]>(1ULL << (2 * NODE_BASES)));
+                slabs.push_back(std::make_unique<node<uint32_t>[]>(1ULL << (2 * NODE_BASES)));
                 children = slabs.back().get();
+                initialize_children(current, children);
                 current->children_ptr.store(children);
             }
             current = children;
         }
-        ConcurrentOpenAddressHashMap::set_memory_pool(&fixture.pool);
-        map = std::make_unique<ConcurrentOpenAddressHashMap>(64);
+        ConcurrentOpenAddressHashMap<uint32_t>::set_memory_pool(&fixture.pool);
+        map = std::make_unique<ConcurrentOpenAddressHashMap<uint32_t>>(64, count_max, tree_record_bytes(MAX_DEPTH - 1));
         current->hash_map.store(map.get());
     }
     for (size_t i = 0; i < keys.size(); ++i) {
         keys[i] = make_key(k, i + 1);
         keys[i][0] = ((uint64_t{prefix} << 56)) >> 56;
         if (hashed) {
-            const auto hash = ConcurrentOpenAddressHashMap::hash_key(keys[i].data());
+            keys[i][1] = 0; keys[i][2] &= 0x0f;
+            Key suffix(tree_record_bytes(MAX_DEPTH - 1));
+            store_tree_key(suffix.data(), keys[i], MAX_DEPTH - 1);
+            const auto hash = ConcurrentOpenAddressHashMap<uint32_t>::hash_key(suffix.data(), suffix.size());
             uint64_t inserted = 0;
-            require(map->try_increment(hash, keys[i].data(), ConcurrentOpenAddressHashMap::fingerprint(hash),
-                counts[i], inserted) == ConcurrentOpenAddressHashMap::InsertResult::INSERTED,
+            require(map->try_increment(hash, suffix.data(), ConcurrentOpenAddressHashMap<uint32_t>::fingerprint(hash),
+                counts[i], inserted) == ConcurrentOpenAddressHashMap<uint32_t>::InsertResult::INSERTED,
                 "failed to seed final drain hash map");
         } else {
             std::vector<Key> copies(counts[i], keys[i]);
@@ -770,18 +1049,13 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
         "incorrect above-maximum unique count or repeated close counted twice");
     filter_min = saved_min;
     filter_max = saved_max;
-    count_max = saved_cap;
 
-    const size_t record_bytes = kmer_bytes() + count_max_bytes;
     std::map<Key, uint32_t> actual;
     content_type content;
     while (output.consumer_try_dequeue(content)) {
-        require(content.length % record_bytes == 0, "final drain wrote a partial record");
-        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-            uint32_t count = 0;
-            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-            require(actual.emplace(key, count).second, "final drain duplicated a key");
+        for (const auto& record : high_prefix_test::decode(
+                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+            require(actual.emplace(record.key, record.count).second, "final drain duplicated a key");
         }
         output.consumer_enqueue(content.data);
     }
@@ -790,26 +1064,30 @@ void check_final_drain_filter(Shared& shared, bool hashed, uint32_t minimum, uin
 
 void check_final_drain_runs(Shared& shared, uint32_t k)
 {
-    Fixture fixture(shared, k);
-    const auto saved_min = filter_min, saved_max = filter_max, saved_cap = count_max;
+    k_length = k;
+    ScopedCountMax restore_cap;
+    const auto saved_min = filter_min, saved_max = filter_max;
     const auto saved_count_bytes = count_max_bytes;
     RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY> output(FINAL_DRAIN_RING_POOL_BLOCK_SIZE, 1);
-    auto* root = fixture.tree->root_nodes + 57;
-    std::array<node*, MAX_DEPTH> path{root, root->children_ptr.load()};
-    std::vector<std::unique_ptr<node[]>> slabs;
-    for (uint32_t depth = 2; depth < MAX_DEPTH; ++depth) {
-        slabs.push_back(std::make_unique<node[]>(16));
-        path[depth] = slabs.back().get();
-        path[depth - 1]->children_ptr.store(path[depth]);
-    }
-    const size_t capacity = 4092 / kmer_bytes();
+    const size_t capacity = 4092 / tree_record_bytes();
     const uint32_t padding = (4 - k % 4) % 4 * 2;
-    for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth) {
-        auto* leaf = path[depth];
-        auto* children = leaf->children_ptr.exchange(nullptr);
-        for (uint32_t count_bytes : {1u, 2u, 4u}) {
-            count_max_bytes = count_bytes;
-            count_max = count_bytes == 1 ? 255 : count_bytes == 2 ? 65535 : UINT32_MAX;
+    for (uint32_t count_bytes : {1u, 2u, 4u}) {
+        count_max_bytes = count_bytes;
+        count_max = count_bytes == 1 ? 255 : count_bytes == 2 ? 65535 : UINT32_MAX;
+        Fixture fixture(shared, k);
+        auto* root = fixture.tree->root_nodes + 57;
+        std::array<node<uint32_t>*, MAX_DEPTH> path{root, root->children_ptr.load()};
+        std::vector<std::unique_ptr<node<uint32_t>[]>> slabs;
+        for (uint32_t depth = 2; depth < MAX_DEPTH; ++depth) {
+            slabs.push_back(std::make_unique<node<uint32_t>[]>(16));
+            path[depth] = slabs.back().get();
+            initialize_children(path[depth - 1], path[depth]);
+            path[depth - 1]->children_ptr.store(path[depth]);
+        }
+        for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth) {
+            const size_t capacity = 4092 / tree_record_bytes(depth);
+            auto* leaf = path[depth];
+            auto* children = leaf->children_ptr.exchange(nullptr);
             for (uint32_t blocks : {0u, 1u, 2u, 3u, 8u, 16u}) {
                 for (uint32_t pattern = 0; pattern < 5; ++pattern) {
                     filter_min = pattern == 3 ? 2 : 1;
@@ -834,7 +1112,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                             id <<= padding;
                             for (uint32_t byte = 0; byte < 4; ++byte)
                                 key[key.size() - 1 - byte] = id >> (byte * 8);
-                            std::memcpy(block->k_mers.data() + i * kmer_bytes(), key.data(), key.size());
+                            store_tree_key(block->k_mers.data() + i * tree_record_bytes(depth), key, depth);
                             ++truth[key];
                         }
                         leaf->kmer_blocks[leaf->count++] = block;
@@ -846,7 +1124,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                         auto* block = static_cast<kmer_block*>(fixture.pool.allocate());
                         block->count = 1;
                         const auto& key = truth.begin()->first;
-                        std::memcpy(block->k_mers.data(), key.data(), key.size());
+                        store_tree_key(block->k_mers.data(), key, 0);
                         root->kmer_blocks[0] = block;
                         root->count = 1;
                         root->active_block = block;
@@ -874,27 +1152,26 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                         "final drain emitted the wrong unique count");
                     std::map<Key, uint32_t> actual;
                     content_type content;
-                    const size_t record_bytes = kmer_bytes() + count_max_bytes;
                     while (output.consumer_try_dequeue(content)) {
-                        require(content.length % record_bytes == 0, "final drain emitted a partial record");
-                        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-                            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-                            uint32_t count = 0;
-                            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-                            require(actual.emplace(key, count).second, "final drain emitted a duplicate key");
+                        for (const auto& record : high_prefix_test::decode(
+                                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+                            require(record.prefix_bytes == std::min(size_t{1} + depth / 2, kmer_bytes() - 1),
+                                "drain did not select the node prefix length");
+                            require(actual.emplace(record.key, record.count).second, "final drain emitted a duplicate key");
                         }
                         output.consumer_enqueue(content.data);
                     }
                     require(actual == expected, "final drain changed the complete key/frequency mapping");
                 }
             }
+            leaf->children_ptr.store(children);
         }
-        leaf->children_ptr.store(children);
     }
     // Two large leaves share one writer, crossing its 128 KiB block boundary.
     filter_min = 1;
     filter_max = count_max = UINT32_MAX;
     count_max_bytes = 4;
+    Fixture fixture(shared, k);
     std::map<Key, uint32_t> expected, actual;
     {
         FinalDrainWriter writer(&output);
@@ -910,7 +1187,7 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
                     const uint32_t id = (b * capacity + i) << padding;
                     for (uint32_t byte = 0; byte < 4; ++byte)
                         key[key.size() - 1 - byte] = id >> (byte * 8);
-                    std::memcpy(block->k_mers.data() + i * kmer_bytes(), key.data(), key.size());
+                    store_tree_key(block->k_mers.data() + i * tree_record_bytes(), key, 0);
                     expected.emplace(key, 1);
                 }
                 leaf->kmer_blocks[leaf->count++] = block;
@@ -923,22 +1200,17 @@ void check_final_drain_runs(Shared& shared, uint32_t k)
     }
     content_type content;
     size_t output_blocks = 0;
-    const size_t record_bytes = kmer_bytes() + count_max_bytes;
     while (output.consumer_try_dequeue(content)) {
         ++output_blocks;
-        require(content.length % record_bytes == 0, "large drain emitted a partial record");
-        for (size_t pos = 0; pos < content.length; pos += record_bytes) {
-            const auto key = read_key(reinterpret_cast<const unsigned char*>(content.data + pos));
-            uint32_t count = 0;
-            std::memcpy(&count, content.data + pos + kmer_bytes(), count_max_bytes);
-            require(actual.emplace(key, count).second, "large drain emitted a duplicate key");
+        for (const auto& record : high_prefix_test::decode(
+                {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+            require(actual.emplace(record.key, record.count).second, "large drain emitted a duplicate key");
         }
         output.consumer_enqueue(content.data);
     }
     require(output_blocks >= 2 && actual == expected, "large drain lost records across output blocks");
     filter_min = saved_min;
     filter_max = saved_max;
-    count_max = saved_cap;
     count_max_bytes = saved_count_bytes;
 }
 
@@ -950,16 +1222,16 @@ void check_low_owner_and_global_queues(Shared& shared)
     for (size_t i = 0; i < prefix_owners.size(); ++i) prefix_owners[i] = i % 2;
     bloom_filter_capacity.fill(4096);
     shared.inputs.reset_producers(0);
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree( &shared.pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree( &shared.pool, layers.get(), &shared.exports);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    std::barrier<> start(2);
+    PhaseBarrier start(2);
     auto* ring = ConcurrentFirstBlockRing::create(&shared.pool, 0, 2,
         align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
             + 3 * ConcurrentFirstBlockRing::BLOCK_BYTES);
     auto create = [&](uint32_t index, auto* local) {
-        return std::make_unique<FastqClassifier>(index, &shared.inputs, local, &global,
+        return std::make_unique<FastqClassifier<uint32_t>>(index, &shared.inputs, local, &global,
             &tree, &shared.pool, start, ring, index);
     };
     auto constructing_a = std::async(std::launch::async, [&] { return create(0, &local_a); });
@@ -1019,16 +1291,16 @@ void check_cross_classifier_finish(Shared& shared)
     using Access = FastqClassifierTestAccess;
     prefix_owners.fill(0);
     bloom_filter_capacity.fill(4096);
-    auto layers = std::make_unique<LayerQueues>();
-    KmerTree tree( &shared.pool, layers.get(), &shared.exports);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree( &shared.pool, layers.get(), &shared.exports);
     MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
-    std::barrier<> start(2);
+    PhaseBarrier start(2);
     auto* ring = ConcurrentFirstBlockRing::create(&shared.pool, 0, 2,
         align_up(sizeof(ConcurrentFirstBlockRing) + sizeof(std::atomic<uint8_t*>), PAGE_SIZE)
             + 3 * ConcurrentFirstBlockRing::BLOCK_BYTES);
     auto create = [&](uint32_t index, auto* local) {
-        return std::make_unique<FastqClassifier>(index, &shared.inputs, local, &global,
+        return std::make_unique<FastqClassifier<uint32_t>>(index, &shared.inputs, local, &global,
             &tree, &shared.pool, start, ring, index);
     };
     auto constructing_a = std::async(std::launch::async, [&] { return create(0, &local_a); });
@@ -1042,8 +1314,7 @@ void check_cross_classifier_finish(Shared& shared)
     }
     Access::feed(*a, input, true);
     auto finishing_a = std::async(std::launch::async, [&] { a->classify_first_pass(); });
-    require(finishing_a.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
-        "Classifier finished before the other input producer reached the barrier");
+    const bool returned_early = finishing_a.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
     Access::feed(*b, input, false);
     std::vector<Key> other;
     for (size_t i = 0; i < Access::block_capacity(*b); ++i) {
@@ -1056,6 +1327,7 @@ void check_cross_classifier_finish(Shared& shared)
     auto finishing_b = std::async(std::launch::async, [&] { b->classify_first_pass(); });
     finishing_a.get();
     finishing_b.get();
+    require(returned_early, "first pass still waits at an inter-Classifier barrier");
     a->reconcile_low<true>();
     b->reconcile_low<true>();
     a->finish_tree_input();
@@ -1071,13 +1343,1028 @@ void check_cross_classifier_finish(Shared& shared)
         a->total_kmers_send_to_tree + b->total_kmers_send_to_tree + a->total_kmers_exported + b->total_kmers_exported,
         "global input count differs from tree plus exports");
 }
+void check_first_pause_refresh(Shared& shared)
+{
+    using Access = FastqClassifierTestAccess;
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    const auto key = make_key(33, 8831);
+    Access::push(classifier, key);
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 1);
+    for (size_t i = 0; i < BLOCK_SIZE; i += kmer_bytes()) Access::checkpoint(classifier);
+    require(pool.thread_first_records() == 1, "4 KiB checkpoint prematurely sealed FIRST");
+    Access::refresh(classifier);
+    require(Access::paused(classifier) && pool.thread_first_records() == 0,
+        "Reclaim refresh did not pause and seal the exclusive segment");
+    {
+        std::unique_lock held(ConcurrentMemoryPoolTestAccess::arena(pool).mutex);
+        std::promise<void> returned;
+        auto result = returned.get_future();
+        std::thread attempt([&] { Access::push(classifier, key); returned.set_value(); });
+        const bool immediate = result.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+        held.unlock();
+        attempt.join();
+        require(immediate, "paused classifier consulted locked admission");
+    }
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 0);
+    Access::push(classifier, key);
+    require(classifier.first_direct_pending == 2 && Access::paused(classifier),
+        "recovered space bypassed the batch-local pause");
+    std::vector<Key> boundary{key};
+    Access::feed(classifier, boundary, true);
+    require(!Access::paused(classifier), "Grow refresh did not resume a classifier without a segment");
+    Access::push(classifier, key);
+    require(pool.thread_first_records() == 1, "resumed classifier did not acquire a new segment");
+    pool.seal_thread_first();
+    // A stale local Grow decision must still be rejected by the pool filter.
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 1);
+    Access::push(classifier, key);
+    require(Access::paused(classifier) && classifier.first_direct_pending == 4,
+        "stale Grow cache ignored the pool's Reclaim hint");
+    ConcurrentMemoryPoolTestAccess::scan_demand(pool, 0);
+    Access::refresh(classifier);
+    // Capacity denial in Grow also pauses until the next batch boundary.
+    auto& arena = ConcurrentMemoryPoolTestAccess::arena(pool);
+    pool.allocate_large_from_numa(pool.gap_bytes(0) - arena.high, 0);
+    Access::push(classifier, key);
+    require(Access::paused(classifier) && !pool.first_reclaiming(0),
+        "Grow capacity denial did not pause locally");
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> actual;
+    collect_exports(shared, actual);
+    pool.freeze_first();
+    ConcurrentMemoryPool::FirstSegmentView view;
+    while (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, view)
+        == ConcurrentMemoryPool::FirstClaimStatus::Data) {
+        for (size_t i = 0; i < view.record_count; ++i) ++actual[read_key(view.records + i * kmer_bytes())];
+        require(pool.complete_first(view), "pause fixture completion failed");
+    }
+    require(actual == std::map<Key, uint64_t>{{key, 7}}, "pause and recovery changed record ownership");
 }
 
-int main()
+void check_dynamic_safe_points(Shared& shared, bool enabled)
+{
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier,
+        nullptr, 0, enabled);
+    auto first = make_key(33, 8831), next = make_key(33, 12931);
+    std::vector<Key> input{first};
+    FastqClassifierTestAccess::feed(classifier, input, true);
+    if (enabled) {
+        require(!pool.first_empty(), "FIRST record did not go directly into an owned shared segment");
+    }
+    input.assign(1000, first);
+    FastqClassifierTestAccess::feed(classifier, input, false);
+    if (enabled) {
+        require(!pool.first_empty(), "normal Tree calls lost the active FIRST segment");
+    }
+    TemporaryDirectory directory;
+    shared.exports.reset_producers(1);
+    ExportWriter writer(&shared.exports, (directory.path / "pending").string(), ExportWriter::OutputKind::Pending, &pool);
+    writer.start();
+    pool.seal_thread_first(); // The fixture is about to wait while owning TLS activity.
+    pool.request_first_drain();
+    SpinBackoff<> backoff;
+    while (!pool.first_empty()) {
+        pool.run_state().check();
+        backoff.backoff();
+    }
+    // Resume after Writer has invalidated the old generation and returned pages.
+    input.assign(1000, first);
+    FastqClassifierTestAccess::feed(classifier, input, true);
+    input.assign(1, next);
+    FastqClassifierTestAccess::feed(classifier, input, false);
+    classifier.classify_first_pass();
+    tree.mark_finish_export();
+    writer.join();
+    pool.freeze_first();
+    classifier.process_memory_first<false>();
+    require(pool.first_empty(), "memory phase retained a partial FIRST segment");
+    require(low_msd_test::read(directory.path / "pending.0", kmer_bytes()).size()
+            + classifier.first_drain_singletons + classifier.first_memory_to_tree == 2,
+        "FIRST=0/shrink/resume changed pending responsibility");
+    std::map<Key, uint64_t> roots;
+    collect_roots(FastqClassifierTestAccess::roots(classifier), roots);
+    // The first FIRST was spilled before Bloom froze; this fixture stops before
+    // pending replay. Both batches of REPEATs must still be owned by Tree.
+    require(roots == std::map<Key, uint64_t>{{first, 2000}}, "REPEAT ownership changed around reclaim");
+    shared.exports.reset_producers(1);
+}
+
+void check_memory_first_batches(Shared& shared, bool keep_singletons)
+{
+    using Access = FastqClassifierTestAccess;
+    k_length = 33;
+    const auto saved_min = filter_min;
+    filter_min = keep_singletons ? 1 : 2;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    std::vector<Key> first, repeated;
+    std::set<std::pair<uint32_t, uint64_t>> occupied;
+    for (size_t seed = 0; first.size() < 5000; ++seed) {
+        const auto key = make_key(33, seed);
+        auto& bloom = *static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+        if (!occupied.emplace(key[0], bloom.prepare_insert(key.data()).block_idx).second) continue;
+        if (first.size() % 3 == 0) repeated.push_back(key);
+        first.push_back(key);
+    }
+    // No Writer is competing during admission; all FIRST records are resident.
+    Access::feed(classifier, first, true);
+    Access::feed(classifier, repeated, true);
+    require(classifier.first_direct_pending == 0 && !pool.first_empty(), "memory FIRST fixture bypassed RAM");
+    TemporaryDirectory directory;
+    shared.exports.reset_producers(1);
+    ExportWriter writer(&shared.exports, (directory.path / "pending").string(), ExportWriter::OutputKind::Pending, &pool);
+    writer.start();
+    classifier.classify_first_pass();
+    require(!pool.first_empty() && classifier.repeat_query_count == 0,
+        "first pass prematurely scanned or emptied memory FIRST");
+    tree.mark_finish_export();
+    writer.join();
+    require(std::filesystem::file_size(directory.path / "pending.0") == 0,
+        "resident FIRST leaked into pending before the Writer switch");
+    pool.freeze_first();
+    std::unique_ptr<ExportWriter> final_writer;
+    std::vector<char*> held;
+    if (keep_singletons) {
+        shared.exports.reset_producers(1);
+        final_writer = std::make_unique<ExportWriter>(&shared.exports, (directory.path / "low").string(), ExportWriter::OutputKind::FinalLow);
+        final_writer->start();
+        classifier.process_memory_first<true>();
+    } else {
+        char* block;
+        while (shared.exports.producer_try_dequeue(block)) held.push_back(block);
+        classifier.process_memory_first<false>();
+        for (char* data : held) shared.exports.consumer_enqueue(data);
+    }
+    if (final_writer) {
+        tree.mark_finish_export();
+        final_writer->join();
+    }
+    const auto misses = first.size() - repeated.size();
+    require(classifier.first_memory_to_tree == repeated.size(), "memory FIRST batches or final tail lost hits");
+    require(classifier.first_memory_kept == (keep_singletons ? misses : 0), "memory FIRST kept count differs");
+    require(classifier.first_memory_discarded == (keep_singletons ? 0 : misses), "memory FIRST misses took the wrong branch");
+    require(classifier.first_drain_singletons == misses
+        && classifier.low_records_scanned == 0, "memory FIRST changed file replay statistics");
+    if (keep_singletons) {
+        std::map<Key, uint64_t> actual_low, expected_low;
+        for (const auto& key : first) expected_low[key] = 1;
+        for (const auto& key : repeated) expected_low.erase(key);
+        for (const auto& key : low_msd_test::read(directory.path / "low", kmer_bytes())) ++actual_low[key];
+        require(actual_low == expected_low, "memory FIRST final low multiset changed");
+    }
+    std::map<Key, uint64_t> actual, expected;
+    collect_roots(Access::roots(classifier), actual);
+    for (const auto& key : repeated) expected[key] = 2;
+    require(actual == expected && pool.first_empty(), "memory FIRST changed Tree counts or retained a segment");
+    require(classifier.total_deal_kmer_count == first.size() + repeated.size(), "memory FIRST recounted input records");
+    filter_min = saved_min;
+    shared.exports.reset_producers(1);
+}
+
+enum class FirstScanPattern { Miss, Hit, SingleRoot, Alternating, SplitRuns, LongMissRun, AllRoots };
+
+void check_memory_first_scan(Shared& shared, uint32_t k, size_t count,
+    FirstScanPattern pattern, bool keep_singletons, bool replay_pending = false)
+{
+    using Access = FastqClassifierTestAccess;
+    k_length = k;
+    const size_t width = kmer_bytes();
+    const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / width;
+    const size_t segment_capacity = ConcurrentMemoryPool::first_segment_record_capacity();
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    std::vector<Key> keys;
+    std::vector<std::vector<uint64_t>> bloom_before;
+    const size_t roots = pattern == FirstScanPattern::AllRoots ? 256 : 4;
+    for (size_t r = 0; r < roots; ++r) {
+        auto key = make_key(k, 8831 + r);
+        key[0] = roots == 256 ? r : r * 64;
+        keys.push_back(key);
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+        auto& snapshot = bloom_before.emplace_back(2 * bloom_filter_capacity[key[0]]);
+        for (size_t b = 0; b < snapshot.size(); ++b) {
+            snapshot[b] = b % 2 ? (0x5a5a5a5a5a5a5a5aULL ^ b)
+                : (roots == 256 || r % 2 == 0 ? UINT64_MAX : 0);
+            bloom->get_bins()[b].store(snapshot[b]);
+        }
+    }
+    std::map<Key, uint64_t> expected_tree, expected_low;
+    size_t hits = 0;
+    std::set<size_t> hit_segments;
+    for (size_t i = 0; i < count; ++i) {
+        const bool hit = pattern == FirstScanPattern::Hit || pattern == FirstScanPattern::SingleRoot
+            || pattern == FirstScanPattern::AllRoots
+            || (pattern == FirstScanPattern::Alternating && i % 2 == 0)
+            || (pattern == FirstScanPattern::LongMissRun && i == EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / width + 3)
+            || (pattern == FirstScanPattern::SplitRuns
+                && (i < capacity - 1 || i >= capacity - 1 + 3 * Access::batch_capacity(classifier)));
+        const auto& key = keys[pattern == FirstScanPattern::SingleRoot ? 0
+            : roots == 256 ? i % roots : (i % 3 == 1 ? 2 : 0) + !hit];
+        Access::push(classifier, key);
+        ++(hit ? expected_tree : expected_low)[key];
+        hits += hit;
+        if (hit) hit_segments.insert(i / segment_capacity);
+    }
+    require(classifier.first_tail_records() == count % segment_capacity,
+        "memory scan fixture changed active segment ownership");
+    require(classifier.first_direct_pending == 0, "memory scan fixture unexpectedly used pending");
+    Access::packed(classifier).fill(0xa5);
+    const auto packed_before = Access::packed(classifier);
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> actual_low;
+    collect_exports(shared, actual_low);
+    require(actual_low.empty(), "memory scan fixture exported resident FIRSTs");
+    pool.freeze_first();
+    std::vector<char*> held;
+    if (keep_singletons) {
+        classifier.process_memory_first<true>();
+    } else {
+        char* block;
+        while (shared.exports.producer_try_dequeue(block)) held.push_back(block);
+        classifier.process_memory_first<false>();
+        for (auto* data : held) shared.exports.consumer_enqueue(data);
+    }
+    require(Access::packed(classifier) == packed_before,
+        "memory FIRST scan copied input through the old 32KB ring buffer");
+    // Whole-segment extraction copies valid records only, including k=33 padding.
+    require(pool.first_empty() && classifier.first_tail_records() == 0, "memory scan retained FIRST input");
+    require(classifier.repeat_query_count == count && classifier.first_memory_to_tree == hits
+        && classifier.recovered_first_count == hits && classifier.total_kmers_send_to_tree == hits,
+        "memory scan lost queries or counted Tree hits more than once");
+    require(classifier.first_memory_tree_batches == hit_segments.size(),
+        "memory scan source-batch statistic differs");
+    require(classifier.first_drain_singletons == count - hits
+        && classifier.first_memory_kept == (keep_singletons ? count - hits : 0)
+        && classifier.first_memory_discarded == (keep_singletons ? 0 : count - hits),
+        "memory scan singleton statistics differ");
+    collect_exports(shared, actual_low);
+    require(actual_low == (keep_singletons ? expected_low : std::map<Key, uint64_t>{}),
+        "memory scan changed the singleton multiset");
+    if (replay_pending) {
+        // The pending pass must reuse the buffers after an incomplete hit tail.
+        char* block;
+        shared.inputs.producer_dequeue(block);
+        for (size_t i = 0; i < 17; ++i) {
+            const auto& key = keys[i % 4];
+            std::memcpy(block + i * width, key.data(), width);
+            if (i % 2 == 0) ++expected_tree[key];
+            else if (keep_singletons) ++expected_low[key];
+        }
+        require(local.try_enqueue({block, 17}), "pending fixture queue is full");
+        const std::vector<char> pending_before(block, block + 17 * width);
+        if (keep_singletons) classifier.reconcile_low<true>();
+        else classifier.reconcile_low<false>();
+        require(std::equal(pending_before.begin(), pending_before.end(), block), "pending pass changed input after memory FIRST");
+        require(classifier.low_records_scanned == 17 && classifier.low_records_recovered == 9,
+            "memory scan changed pending pass statistics");
+        require(classifier.low_tree_batches == 1 && classifier.first_memory_to_tree == hits
+            && classifier.recovered_first_count == hits && classifier.total_kmers_send_to_tree == hits + 9
+            && classifier.first_memory_tree_batches == hit_segments.size(),
+            "pending recovery changed memory FIRST statistics");
+        collect_exports(shared, actual_low);
+        require(actual_low == (keep_singletons ? expected_low : std::map<Key, uint64_t>{}),
+            "pending pass mixed memory FIRSTs into singleton output");
+    }
+    require(classifier.total_kmers_exported == (keep_singletons ? count - hits + (replay_pending ? 8 : 0) : 0),
+        "memory FIRST or following pending pass export statistics differ");
+    std::map<Key, uint64_t> actual_tree;
+    collect_roots(Access::roots(classifier), actual_tree);
+    Task<uint32_t> task;
+    while (layers->get_queue(0)->try_dequeue(task)) {
+        for (size_t b = 0; b < task.count; ++b)
+            for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
+                require(task.current_node == tree.root_nodes + key[0], "queued memory hit has the wrong root");
+                ++actual_tree[key];
+            }
+    }
+    require(actual_tree == expected_tree, "memory scan lost or corrupted Tree records during rollover");
+    for (size_t r = 0; r < roots; ++r) {
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[keys[r][0]]);
+        for (size_t b = 0; b < bloom_before[r].size(); ++b)
+            require(bloom->get_bins()[b].load() == bloom_before[r][b], "memory query modified a Bloom layer");
+    }
+}
+
+void check_memory_first_scan_boundaries(Shared& shared)
+{
+    for (uint32_t k : {1u, 31u, 33u, 65u, 128u}) {
+        const size_t width = (k + 3) / 4;
+        const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / width;
+        const size_t slice_capacity = 32768 / width;
+        const size_t export_capacity = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / width;
+        for (bool keep : {false, true}) {
+            for (size_t count : {size_t{0}, size_t{1}, size_t{15}, size_t{16}, size_t{17},
+                    slice_capacity - 1, slice_capacity, slice_capacity + 1, capacity - 1, capacity, capacity + 1})
+                check_memory_first_scan(shared, k, count, FirstScanPattern::Hit, keep);
+            for (size_t count : {size_t{15}, size_t{16}, size_t{17}, slice_capacity - 1, slice_capacity, slice_capacity + 1})
+                for (auto pattern : {FirstScanPattern::Miss, FirstScanPattern::Alternating})
+                    check_memory_first_scan(shared, k, count, pattern, keep);
+            check_memory_first_scan(shared, k, export_capacity + 17, FirstScanPattern::Miss, keep);
+            check_memory_first_scan(shared, k, export_capacity + 21, FirstScanPattern::LongMissRun, keep, true);
+            check_memory_first_scan(shared, k, 2 * capacity + 17, FirstScanPattern::SingleRoot, keep);
+            check_memory_first_scan(shared, k, 2 * capacity + 37, FirstScanPattern::Alternating, keep, true);
+            check_memory_first_scan(shared, k, 5 * capacity + 37, FirstScanPattern::SplitRuns, keep);
+        }
+    }
+    const size_t segment_capacity = FIRST_SEGMENT_SIZE / 9;
+    for (bool keep : {false, true}) {
+        for (auto pattern : {FirstScanPattern::Miss, FirstScanPattern::Hit, FirstScanPattern::Alternating})
+            check_memory_first_scan(shared, 33, 2 * segment_capacity + 17, pattern, keep, true);
+        check_memory_first_scan(shared, 33, 2 * 7281 + 17, FirstScanPattern::AllRoots, keep);
+    }
+}
+
+void check_memory_first_inline_storage(Shared& shared)
+{
+    using Access = FastqClassifierTestAccess;
+    k_length = 33;
+    constexpr size_t bytes = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> a(0, &shared.inputs, &local_a, &global, &tree, &pool, barrier,
+        nullptr, 0, true);
+    // This Classifier owns no roots, and must still submit every global hit.
+    FastqClassifier<uint32_t> b(1, &shared.inputs, &local_b, &global, &tree, &pool, barrier,
+        nullptr, 0, true);
+    std::array<Key, 4> keys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys[i] = make_key(33, 8831 + i);
+        keys[i][0] = 17 + 64 * i;
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[keys[i][0]]);
+        const auto probe = bloom->prepare_insert(keys[i].data());
+        bloom->get_bins()[2 * probe.block_idx].store(probe.insert_num);
+    }
+    std::map<Key, uint64_t> expected;
+    const size_t count = bytes / kmer_bytes() + 17;
+    for (size_t i = 0; i < count; ++i) {
+        Access::push(a, keys[i % 2]);
+        ++expected[keys[i % 2]];
+    }
+    pool.seal_thread_first();
+    for (size_t i = 0; i < count; ++i) {
+        Access::push(b, keys[2 + i % 2]);
+        ++expected[keys[2 + i % 2]];
+    }
+    a.classify_first_pass();
+    b.classify_first_pass();
+    pool.freeze_first();
+    auto scan_a = std::async(std::launch::async, [&] { a.process_memory_first<false>(); });
+    b.process_memory_first<false>();
+    scan_a.get();
+    require(a.first_memory_tree_batches + b.first_memory_tree_batches == 2,
+        "inline storage did not accommodate independent 64KB hit batches");
+    // Each Classifier must accumulate its own pending batch, including non-owner roots.
+    for (size_t worker = 0; worker < 2; ++worker) {
+        for (size_t offset = 0; offset < count;) {
+            const size_t take = std::min(count / 3, count - offset);
+            char* block;
+            shared.inputs.producer_dequeue(block);
+            for (size_t i = 0; i < take; ++i) {
+                const auto& key = keys[2 * worker + (offset + i) % 2];
+                std::memcpy(block + i * kmer_bytes(), key.data(), kmer_bytes());
+                ++expected[key];
+            }
+            if (worker == 0) local_a.enqueue({block, take});
+            else local_b.enqueue({block, take});
+            offset += take;
+        }
+    }
+    auto low_a = std::async(std::launch::async, [&] { a.reconcile_low<false>(); });
+    b.reconcile_low<false>();
+    low_a.get();
+    require(a.low_tree_batches == 2 && b.low_tree_batches == 2
+        && a.low_records_scanned == count && b.low_records_scanned == count
+        && a.low_records_recovered == count && b.low_records_recovered == count,
+        "parallel pending batches were shared or prematurely flushed");
+    require(a.first_memory_to_tree + b.first_memory_to_tree == 2 * count
+        && a.first_memory_tree_batches + b.first_memory_tree_batches == 2,
+        "parallel pending recovery changed FIRST statistics");
+    std::map<Key, uint64_t> actual;
+    collect_roots(Access::roots(a), actual);
+    collect_roots(Access::roots(b), actual);
+    Task<uint32_t> task;
+    while (layers->get_queue(0)->try_dequeue(task)) {
+        for (size_t b = 0; b < task.count; ++b)
+            for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
+                require(task.current_node == tree.root_nodes + key[0], "parallel recovery task has the wrong root");
+                ++actual[key];
+            }
+    }
+    require(actual == expected, "parallel inline hit buffers overlapped or lost non-owner roots");
+    std::map<Key, uint64_t> exported;
+    collect_exports(shared, exported);
+    require(exported.empty(), "inline all-hit scan exported records");
+}
+
+void check_direct_first_segments(Shared& shared)
+{
+    for (uint32_t k : {1u, 31u, 33u, 65u, 128u}) {
+        k_length = k;
+        ConcurrentMemoryPool pool(64ULL << 20);
+            pool.init_arenas();
+        auto layers = std::make_unique<LayerQueues<uint32_t>>();
+        KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+        prefix_owners.fill(0);
+        bloom_filter_capacity.fill(4096);
+        PhaseBarrier barrier(1);
+        MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+        MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        const auto key = make_key(k, 8831);
+        const size_t capacity = FIRST_SEGMENT_SIZE / ((k + 3) / 4);
+        // Thousands of small input batches must keep writing the same pool-owned
+        // buffer. No partially filled shared descriptor may become visible.
+        for (size_t offset = 0; offset + 1 < capacity; ++offset) {
+            FastqClassifierTestAccess::push(classifier, key);
+            if (offset % 37 == 0) require(!pool.first_empty(), "direct fill lost its owned segment");
+        }
+        require(classifier.first_tail_records() == capacity - 1, "TLS continuation lost records");
+        FastqClassifierTestAccess::push(classifier, key);
+        require(!pool.first_empty() && classifier.first_tail_records() == 0, "full pool-owned segment was not sealed");
+        pool.freeze_first();
+        for (size_t i = 0; i < capacity + 17; ++i) FastqClassifierTestAccess::push(classifier, key);
+        require(classifier.first_direct_pending == capacity + 17 && classifier.first_tail_records() == 0,
+            "rejected FIRST records changed pending ownership");
+        classifier.classify_first_pass();
+        std::map<Key, uint64_t> pending;
+        collect_exports(shared, pending);
+        require(pending == std::map<Key, uint64_t>{{key, capacity + 17}}, "direct pending handoff lost records");
+        ConcurrentMemoryPool::FirstSegmentView view;
+        require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, view) == ConcurrentMemoryPool::FirstClaimStatus::Data
+            && view.record_count == capacity, "published full segment missing");
+        for (size_t i = 0; i < capacity; ++i)
+            require(std::memcmp(view.records + i * kmer_bytes(), key.data(), kmer_bytes()) == 0, "full segment record changed");
+        require(pool.complete_first(view), "full segment completion failed");
+        require(pool.first_empty(), "full extraction retained a segment");
+    }
+}
+
+void check_soft_pressure_keeps_filling(Shared& shared)
+{
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    const auto key = make_key(33, 8831);
+    FastqClassifierTestAccess::push(classifier, key);
+    const size_t high = arena_watermark(pool.segment_capacity(0) * FIRST_SEGMENT_SIZE, 8);
+    pool.allocate_large_from_numa(pool.gap_bytes(0) - high + BLOCK_SIZE, 0);
+    require(pool.pressure(0) == MemoryPressure::Soft, "soft-pressure fixture did not reach Soft");
+    std::vector<Key> input{key};
+    FastqClassifierTestAccess::feed(classifier, input, true);
+    const bool kept = pool.thread_first_records() == 2 && pool.first_publications.load() == 0;
+    // Always finish the fixture before checking: a failed test must not retain
+    // an active TLS owner or an ordinary Export block.
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> exported;
+    collect_exports(shared, exported);
+    pool.freeze_first();
+    ConcurrentMemoryPool::FirstSegmentView source;
+    require(pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, source)
+        == ConcurrentMemoryPool::FirstClaimStatus::Data && source.record_count == 2,
+        "soft-pressure fixture lost its records");
+    pool.complete_first(source);
+    require(kept, "Soft pressure sealed a usable Filling segment");
+}
+
+void check_sparse_input_keeps_filling(Shared& shared, bool reclaim_while_idle = false)
+{
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    shared.inputs.reset_producers(1);
+    std::vector<char*> held;
+    char* block = nullptr;
+    while (shared.inputs.producer_try_dequeue(block)) held.push_back(block);
+    block = held.back();
+    held.pop_back();
+    auto worker = std::async(std::launch::async, [&] {
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        classifier.classify_first_pass();
+        std::map<Key, uint64_t> roots;
+        collect_roots(FastqClassifierTestAccess::roots(classifier), roots);
+        return roots;
+    });
+    std::map<Key, uint64_t> expected;
+    for (size_t pulse = 0; pulse < 32; ++pulse) {
+        for (size_t i = 0; i < 32; ++i) {
+            auto key = make_key(33, 100000 + pulse * 32 + i);
+            key[0] = 0;
+            std::memcpy(block + i * 9, key.data(), 9);
+            ++expected[key];
+        }
+        local.enqueue({block, 32});
+        SpinBackoff<> backoff;
+        while (!shared.inputs.producer_try_dequeue(block)) backoff.backoff();
+        // Deliberately pace real input arrivals; this is normal producer idle,
+        // with ample RAM and no outstanding reclaim request.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const uint64_t early_publications = pool.first_publications.load();
+    std::map<Key, uint64_t> reclaimed;
+    bool published_while_idle = false;
+    if (reclaim_while_idle) {
+        // The owner is already waiting for input when reclamation starts.
+        // It must observe the request without another input block or EOF.
+        pool.set_spill_service(true);
+        pool.request_first_drain();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        ConcurrentMemoryPool::FirstSegmentView source;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, source)
+                == ConcurrentMemoryPool::FirstClaimStatus::Data) {
+                for (size_t i = 0; i < source.record_count; ++i) ++reclaimed[read_key(source.records + i * 9)];
+                pool.complete_first(source);
+                published_while_idle = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+    shared.inputs.producer_set_finished();
+    auto actual = worker.get();
+    for (const auto& [key, count] : reclaimed) actual[key] += count;
+    held.push_back(block);
+    for (char* page : held) shared.inputs.consumer_enqueue(page);
+    collect_exports(shared, actual);
+    pool.freeze_first();
+    ConcurrentMemoryPool::FirstSegmentView source;
+    while (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Scan, source)
+        == ConcurrentMemoryPool::FirstClaimStatus::Data) {
+        for (size_t i = 0; i < source.record_count; ++i) ++actual[read_key(source.records + i * 9)];
+        pool.complete_first(source);
+    }
+    require(actual == expected, "sparse input did not conserve exact records");
+    std::cout << "Paced FIRST publications: " << pool.first_publications.load()
+        << ", valid bytes: " << pool.first_valid_records.load() * kmer_bytes()
+        << ", unused bytes: " << pool.first_unused_bytes.load() << '\n';
+    require(early_publications == 0 && pool.first_publications.load() == 1,
+        "input queue idle repeatedly sealed partially filled segments");
+    require(!reclaim_while_idle || published_while_idle,
+        "an input-idle owner did not publish after reclamation started");
+}
+
+void check_export_wait_reclaim(Shared& shared)
+{
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    std::promise<void> ready, resume;
+    auto resume_signal = resume.get_future();
+    const auto key = make_key(33, 8831);
+    auto worker = std::async(std::launch::async, [&] {
+        FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+        FastqClassifierTestAccess::push(classifier, key);
+        ready.set_value();
+        resume_signal.wait();
+        char* block;
+        FastqClassifierTestAccess::acquire_export_block(classifier, block);
+        shared.exports.consumer_enqueue(block);
+        classifier.classify_first_pass();
+    });
+    ready.get_future().get();
+    std::vector<char*> held;
+    char* block;
+    while (shared.exports.producer_try_dequeue(block)) held.push_back(block);
+    resume.set_value();
+    const bool blocked = worker.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    const bool kept = pool.first_publications.load() == 0;
+    pool.set_spill_service(true);
+    pool.request_first_drain();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    ConcurrentMemoryPool::FirstSegmentView source;
+    bool reclaimed = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pool.try_claim_first(0, ConcurrentMemoryPool::FirstConsumer::Spill, source)
+            == ConcurrentMemoryPool::FirstClaimStatus::Data) {
+            reclaimed = source.record_count == 1 && std::memcmp(source.records, key.data(), 9) == 0;
+            pool.complete_first(source);
+            break;
+        }
+        std::this_thread::yield();
+    }
+    const bool still_blocked = worker.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+    for (char* page : held) shared.exports.consumer_enqueue(page);
+    worker.get();
+    std::map<Key, uint64_t> exported;
+    collect_exports(shared, exported);
+    require(blocked && kept && still_blocked && reclaimed && pool.first_empty(),
+        "an export waiter did not retain FIRST until reclaim and publish while still waiting");
+}
+
+void check_memory_first_wait_failure(Shared& shared)
+{
+    Fixture fixture(shared, 33);
+    std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> queues{fixture.local};
+    ClassifierThreadPool<uint32_t> workers(fixture.tree.get(), &shared.inputs, queues, &fixture.global,
+        nullptr, &fixture.pool, 1);
+    auto waiting = std::async(std::launch::async, [&] {
+        try { workers.wait_for_memory_first(); }
+        catch (const std::runtime_error& error) { return std::strcmp(error.what(), "memory-first failure") == 0; }
+        return false;
+    });
+    const bool blocked = waiting.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    fixture.pool.run_state().fail(std::make_exception_ptr(std::runtime_error("memory-first failure")), "test");
+    require(waiting.get() && blocked, "memory completion wait ignored the shared error");
+}
+
+void check_low_scan(Shared& shared, uint32_t k, size_t count, FirstScanPattern pattern,
+    bool keep_singletons, bool small_blocks = false, bool direct = false)
+{
+    using Access = FastqClassifierTestAccess;
+    Fixture fixture(shared, k);
+    auto& classifier = *fixture.classifier;
+    if (!direct || !keep_singletons) classifier.classify_first_pass();
+    std::map<Key, uint64_t> exported;
+    collect_exports(shared, exported);
+    const size_t width = kmer_bytes();
+    const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / width;
+    const size_t roots = pattern == FirstScanPattern::AllRoots ? 256 : 4;
+    std::vector<Key> keys;
+    std::vector<std::vector<uint64_t>> bloom_before;
+    for (size_t r = 0; r < roots; ++r) {
+        auto key = make_key(k, 8831 + r);
+        key[0] = roots == 256 ? r : r * 64;
+        keys.push_back(key);
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+        auto& snapshot = bloom_before.emplace_back(2 * bloom_filter_capacity[key[0]]);
+        for (size_t b = 0; b < snapshot.size(); ++b) {
+            snapshot[b] = b % 2 ? (0x5a5a5a5a5a5a5a5aULL ^ b)
+                : (roots == 256 || r % 2 == 0 ? UINT64_MAX : 0);
+            bloom->get_bins()[b].store(snapshot[b]);
+        }
+    }
+    Access::packed(classifier).fill(0xa5);
+    const auto packed_before = Access::packed(classifier);
+    std::map<Key, uint64_t> expected_tree, expected_low;
+    std::vector<std::pair<char*, std::vector<char>>> input_before;
+    size_t hits = 0, hit_count = 0, blocks = 0;
+    for (size_t offset = 0; offset < count;) {
+        const size_t take = std::min(small_blocks ? capacity / 3 : capacity, count - offset);
+        char* block;
+        shared.inputs.producer_dequeue(block);
+        for (size_t i = 0; i < take; ++i) {
+            const size_t index = offset + i;
+            const bool hit = pattern == FirstScanPattern::Hit || pattern == FirstScanPattern::SingleRoot
+                || pattern == FirstScanPattern::AllRoots
+                || (pattern == FirstScanPattern::Alternating && index % 2 == 0)
+                || (pattern == FirstScanPattern::LongMissRun && index == EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / width + 3)
+                || (pattern == FirstScanPattern::SplitRuns && (index < capacity - 1 || index >= 4 * capacity - 1));
+            const auto& key = keys[pattern == FirstScanPattern::SingleRoot ? 0
+                : roots == 256 ? index % roots : (index % 3 == 1 ? 2 : 0) + !hit];
+            std::memcpy(block + i * width, key.data(), width);
+            ++(hit ? expected_tree : expected_low)[key];
+            hits += hit;
+        }
+        input_before.emplace_back(block, std::vector<char>(block, block + take * width));
+        if (direct) {
+            if (keep_singletons) Access::low_block<true>(classifier, {block, take}, hit_count);
+            else Access::low_block(classifier, {block, take}, hit_count);
+            require(std::equal(input_before.back().second.begin(), input_before.back().second.end(), block),
+                "pending scan changed input records");
+            // Returned input storage can immediately be reused by the Parser.
+            std::memset(block, 0xcc, take * width);
+            require(hit_count == hits % capacity && classifier.low_tree_batches == hits / capacity
+                && classifier.low_records_recovered == hits - hit_count,
+                "pending scan flushed or discarded a partial batch before EOF");
+        } else if (blocks % 2 == 0) {
+            fixture.local->enqueue({block, take});
+        } else {
+            fixture.global.enqueue({block, take});
+        }
+        ++blocks;
+        offset += take;
+    }
+    std::vector<char*> held;
+    if (!keep_singletons) {
+        char* block;
+        while (shared.exports.producer_try_dequeue(block)) held.push_back(block);
+    }
+    if (direct) {
+        Access::flush_low(classifier, hit_count);
+        Access::flush_low(classifier, hit_count);
+        require(hit_count == 0, "pending final flush retained records");
+        if (keep_singletons) classifier.classify_first_pass();
+    } else if (keep_singletons) {
+        classifier.reconcile_low<true>();
+    } else {
+        classifier.reconcile_low<false>();
+    }
+    if (!direct)
+        for (const auto& [block, bytes] : input_before)
+            require(std::equal(bytes.begin(), bytes.end(), block), "pending replay changed input records");
+    for (auto* block : held) shared.exports.consumer_enqueue(block);
+    std::map<Key, uint64_t> actual;
+    collect_roots(Access::roots(classifier), actual);
+    Task<uint32_t> task;
+    while (fixture.layers->get_queue(0)->try_dequeue(task)) {
+        for (size_t b = 0; b < task.count; ++b)
+            for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i) {
+                const auto key = read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth);
+                require(task.current_node == fixture.tree->root_nodes + key[0], "pending task has the wrong root");
+                ++actual[key];
+            }
+    }
+    require(actual == expected_tree, "pending Tree multiset differs during rollover");
+    require(classifier.low_records_scanned == count && classifier.low_records_recovered == hits
+        && classifier.total_kmers_send_to_tree == hits, "pending query conservation differs");
+    require(classifier.total_kmers_exported == (keep_singletons ? count - hits : 0),
+        "pending export statistics differ");
+    require(classifier.low_tree_batches == hits / capacity + (hits % capacity != 0),
+        "pending scan did not accumulate full 64KB batches across input tasks");
+    require(classifier.first_memory_to_tree == 0 && classifier.recovered_first_count == 0
+        && classifier.first_memory_tree_batches == 0 && classifier.repeat_query_count == 0,
+        "pending recovery changed FIRST statistics");
+    collect_exports(shared, exported);
+    require(exported == (keep_singletons ? expected_low : std::map<Key, uint64_t>{}),
+        "pending singleton multiset differs");
+    require(Access::packed(classifier) == packed_before, "pending replay changed the old 32KB ring buffer");
+    for (size_t r = 0; r < roots; ++r) {
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[keys[r][0]]);
+        for (size_t b = 0; b < bloom_before[r].size(); ++b)
+            require(bloom->get_bins()[b].load() == bloom_before[r][b], "pending query modified a Bloom layer");
+    }
+    std::set<char*> returned;
+    char* block;
+    while (shared.inputs.producer_try_dequeue(block))
+        require(returned.insert(block).second, "pending replay returned an input block twice");
+    require(returned.size() == shared.inputs.capacity(), "pending replay leaked an input block");
+    for (auto* data : returned) shared.inputs.consumer_enqueue(data);
+}
+
+void check_low_scan_boundaries(Shared& shared)
+{
+    for (uint32_t k : {1u, 31u, 33u, 65u, 128u}) {
+        const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / ((k + 3) / 4);
+        const size_t export_capacity = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / ((k + 3) / 4);
+        for (bool keep : {false, true}) {
+            for (size_t count : {size_t{0}, size_t{1}, size_t{15}, size_t{16}, size_t{17},
+                    capacity - 1, capacity, capacity + 1, 2 * capacity + 17})
+                check_low_scan(shared, k, count, FirstScanPattern::Hit, keep);
+            for (size_t count : {size_t{15}, size_t{16}, size_t{17}})
+                for (auto pattern : {FirstScanPattern::Miss, FirstScanPattern::Alternating})
+                    check_low_scan(shared, k, count, pattern, keep);
+            check_low_scan(shared, k, capacity, FirstScanPattern::Hit, keep, true);
+            check_low_scan(shared, k, export_capacity + 17, FirstScanPattern::Miss, keep);
+            check_low_scan(shared, k, export_capacity + 17, FirstScanPattern::Miss, keep, false, true);
+            check_low_scan(shared, k, export_capacity + 21, FirstScanPattern::LongMissRun, keep, false, true);
+            check_low_scan(shared, k, 2 * capacity + 17, FirstScanPattern::SingleRoot, keep);
+            check_low_scan(shared, k, 2 * capacity + 17, FirstScanPattern::Alternating, keep, true);
+        }
+        // C-1 hits, three zero-hit blocks, one hit: never flush the tail early.
+        check_low_scan(shared, k, 4 * capacity, FirstScanPattern::SplitRuns, false, false, true);
+        // A long run crosses both the buffered tail and the next full-batch boundary.
+        check_low_scan(shared, k, 5 * capacity + 17, FirstScanPattern::SplitRuns, false, false, true);
+    }
+    for (bool keep : {false, true})
+        check_low_scan(shared, 33, 2 * (65536 / 9) + 17, FirstScanPattern::AllRoots, keep, true);
+}
+
+void check_scan_failures(Shared& shared)
+{
+    using Access = FastqClassifierTestAccess;
+    for (bool keep : {false, true}) {
+        Fixture fixture(shared, 33);
+        auto key = make_key(33, 8831);
+        auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+        bloom->insert(key.data());
+        bloom->insert(key.data());
+        char* block;
+        shared.inputs.producer_dequeue(block);
+        std::memcpy(block, key.data(), kmer_bytes());
+        fixture.pool.run_state().fail(std::make_exception_ptr(std::runtime_error("pending scan failure")), "test");
+        size_t hit_count = 0;
+        bool failed = false;
+        try {
+            if (keep) Access::low_block<true>(*fixture.classifier, {block, 1}, hit_count);
+            else Access::low_block(*fixture.classifier, {block, 1}, hit_count);
+        } catch (const std::runtime_error& error) {
+            failed = std::strcmp(error.what(), "pending scan failure") == 0;
+            shared.inputs.consumer_enqueue(block);
+        }
+        require(failed && hit_count == 0 && fixture.classifier->low_records_scanned == 0,
+            "pending block ignored an existing failure");
+    }
+
+    k_length = 33;
+    ConcurrentMemoryPool pool(64ULL << 20);
+    pool.init_arenas();
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&pool, layers.get(), &shared.exports);
+    prefix_owners.fill(0);
+    bloom_filter_capacity.fill(4096);
+    PhaseBarrier barrier(1);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    FastqClassifier<uint32_t> classifier(0, &shared.inputs, &local, &global, &tree, &pool, barrier, nullptr, 0, true);
+    auto key = make_key(33, 8831);
+    auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+    for (size_t i = 0; i < 2 * bloom_filter_capacity[key[0]]; ++i) bloom->get_bins()[i].store(0);
+    const size_t count = 2 * (EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes()) + 17;
+    for (size_t i = 0; i < count; ++i) Access::push(classifier, key);
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> first_exports;
+    collect_exports(shared, first_exports);
+    pool.freeze_first();
+    std::vector<char*> held;
+    char* block;
+    while (shared.exports.producer_try_dequeue(block)) held.push_back(block);
+    require(!held.empty(), "failure fixture has no export transport");
+    shared.exports.consumer_enqueue(held.back());
+    held.pop_back();
+    auto worker = std::async(std::launch::async, [&] {
+        try { classifier.process_memory_first<true>(); }
+        catch (const std::runtime_error& error) { return std::strcmp(error.what(), "memory scan failure") == 0; }
+        return false;
+    });
+    SpinBackoff<> backoff;
+    content_type content;
+    while (!shared.exports.consumer_try_dequeue(content)) backoff.backoff();
+    // The scan is blocked acquiring another export block. Publish failure before
+    // returning that block; no global active state supplies a backoff shortcut.
+    pool.run_state().fail(std::make_exception_ptr(std::runtime_error("memory scan failure")), "test");
+    shared.exports.consumer_enqueue(content.data);
+    while (worker.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        while (shared.exports.consumer_try_dequeue(content)) shared.exports.consumer_enqueue(content.data);
+        backoff.backoff();
+    }
+    const bool failed = worker.get();
+    if (auto* tail = Access::export_block(classifier))
+        shared.exports.consumer_enqueue(reinterpret_cast<char*>(const_cast<ExportBlock*>(tail)));
+    for (auto* data : held) shared.exports.consumer_enqueue(data);
+    std::map<Key, uint64_t> ignored;
+    collect_exports(shared, ignored);
+    require(failed && classifier.first_memory_kept < count,
+        "memory FIRST scan did not stop at a scan-slice failure check");
+}
+
+void check_low_queue_pause(Shared& shared)
+{
+    using Access = FastqClassifierTestAccess;
+    RunState state;
+    ActiveRunScope active(state);
+    Fixture fixture(shared, 33);
+    auto& classifier = *fixture.classifier;
+    classifier.classify_first_pass();
+    std::map<Key, uint64_t> exported;
+    collect_exports(shared, exported);
+    const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
+    auto key = make_key(33, 8831);
+    auto* bloom = static_cast<ConcurrentBloomFilter*>(global_bloom_filter[key[0]]);
+    bloom->insert(key.data());
+    bloom->insert(key.data());
+    char* first;
+    shared.inputs.producer_dequeue(first);
+    for (size_t i = 0; i < capacity - 2; ++i)
+        std::memcpy(first + i * kmer_bytes(), key.data(), kmer_bytes());
+    fixture.local->enqueue({first, capacity - 2});
+    std::vector<char*> held;
+    char* block;
+    while (shared.inputs.producer_try_dequeue(block)) held.push_back(block);
+    shared.inputs.reset_producers(1);
+    auto consumer = std::async(std::launch::async, [&] { classifier.reconcile_low<false>(); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!shared.inputs.producer_try_dequeue(block)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            state.fail(std::make_exception_ptr(std::runtime_error("pending queue pause timed out")), "test");
+            consumer.get();
+        }
+        std::this_thread::yield();
+    }
+    require(block == first, "normal pending task returned an unexpected block");
+    // The empty-queue interval must retain the C-2 hit tail.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    char* last_owner = held.back();
+    held.pop_back();
+    std::memcpy(last_owner, key.data(), kmer_bytes());
+    std::memcpy(block, key.data(), kmer_bytes());
+    fixture.local->enqueue({last_owner, 1});
+    fixture.global.enqueue({block, 1});
+    shared.inputs.producer_set_finished();
+    consumer.get();
+    for (auto* data : held) shared.inputs.consumer_enqueue(data);
+    require(classifier.low_records_scanned == capacity && classifier.low_records_recovered == capacity
+        && classifier.low_tree_batches == 1, "queue pause or EOF drain prematurely flushed a hit tail");
+    std::map<Key, uint64_t> actual;
+    collect_roots(Access::roots(classifier), actual);
+    Task<uint32_t> task;
+    while (fixture.layers->get_queue(0)->try_dequeue(task))
+        for (size_t b = 0; b < task.count; ++b)
+            for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)
+                ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
+    require(actual == std::map<Key, uint64_t>{{key, capacity}}, "normal and EOF queues lost pending hits");
+}
+}
+
+int main(int argc, char* argv[])
 {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--first-pause") == 0) {
+            Shared shared;
+            check_first_pause_refresh(shared);
+            return 0;
+        }
+        if (argc == 2 && (std::strcmp(argv[1], "--first-soft") == 0 || std::strcmp(argv[1], "--first-idle") == 0
+            || std::strcmp(argv[1], "--first-idle-reclaim") == 0 || std::strcmp(argv[1], "--first-export-wait") == 0)) {
+            Shared shared;
+            if (std::strcmp(argv[1], "--first-soft") == 0) check_soft_pressure_keeps_filling(shared);
+            else if (std::strcmp(argv[1], "--first-export-wait") == 0) check_export_wait_reclaim(shared);
+            else check_sparse_input_keeps_filling(shared, std::strcmp(argv[1], "--first-idle-reclaim") == 0);
+            return 0;
+        }
+        check_parser_transfers();
+        if (argc == 2 && std::strcmp(argv[1], "--parser-transfer") == 0) {
+            std::cout << "Parser transfer tests passed\n";
+            return 0;
+        }
         check_parser_returns_empty_blocks();
         Shared shared;
+        for (uint32_t k : {1u, 31u, 33u, 65u, 128u}) check_export_batches(shared, k);
+        check_scan_failures(shared);
+        if (argc == 2 && std::strcmp(argv[1], "--low-full-block") == 0) {
+            check_low_scan(shared, 33, 65536 / 9, FirstScanPattern::Hit, false);
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--low-small-blocks") == 0) {
+            check_low_scan(shared, 33, 65536 / 9, FirstScanPattern::Hit, false, true);
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--memory-first") == 0) {
+            check_memory_first_scan_boundaries(shared);
+            check_memory_first_inline_storage(shared);
+            check_memory_first_batches(shared, true);
+            check_memory_first_batches(shared, false);
+            return 0;
+        }
+        check_low_scan_boundaries(shared);
+        check_low_queue_pause(shared);
+        if (argc == 2 && std::strcmp(argv[1], "--low-replay") == 0) return 0;
         check_group_and_decode(shared, 31);
         check_group_and_decode(shared, 33);
         check_group_and_decode(shared, 65);
@@ -1108,6 +2395,19 @@ int main()
         check_first_boundaries(shared, 128);
         check_cross_classifier_finish(shared);
         check_low_owner_and_global_queues(shared);
+        check_direct_first_segments(shared);
+        check_first_pause_refresh(shared);
+        check_soft_pressure_keeps_filling(shared);
+        check_sparse_input_keeps_filling(shared);
+        check_sparse_input_keeps_filling(shared, true);
+        check_export_wait_reclaim(shared);
+        check_dynamic_safe_points(shared, true);
+        check_dynamic_safe_points(shared, false);
+        check_memory_first_batches(shared, true);
+        check_memory_first_batches(shared, false);
+        check_memory_first_scan_boundaries(shared);
+        check_memory_first_inline_storage(shared);
+        check_memory_first_wait_failure(shared);
         for (uint32_t k : {33u, 65u, 81u, 128u})
             std::async(std::launch::async, [&] { check_final_drain_runs(shared, k); }).get();
         for (bool hashed : {false, true}) {

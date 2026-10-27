@@ -13,7 +13,10 @@ class FinalDrainWriter
 private:
     uint64_t local_sorted_kmer_count = 0;
     const size_t kmer_bytes = ::kmer_bytes();
-    const uint32_t total_bytes = static_cast<uint32_t>(kmer_bytes + count_max_bytes);
+    uint32_t record_bytes_ = static_cast<uint32_t>(kmer_bytes + count_max_bytes);
+    uint8_t prefix_bytes_ = 0;
+    uint32_t group_records_ = 0;
+    uint64_t group_offset_ = 0;
 
     RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY>* pool_;
     char* current_block_;
@@ -47,6 +50,7 @@ public:
     {
         if (current_block_ != nullptr)
         {
+            finish_group();
             pool_->producer_enqueue({ current_block_, current_offset_ });
             current_block_ = nullptr;
         }
@@ -66,25 +70,56 @@ public:
 
     ~FinalDrainWriter()
     {
-        close();
+        if (!RunState::active || !RunState::active->failed()) close();
+    }
+
+    // Tree supplies P < key width. Prefix bytes come from the first emitted key;
+    // the disk header matches low.bin: uint8 P, native uint32 N, P key bytes.
+    void begin_node(uint8_t prefix_bytes)
+    {
+        finish_group();
+        prefix_bytes_ = prefix_bytes;
+        record_bytes_ = static_cast<uint32_t>(kmer_bytes - prefix_bytes_ + count_max_bytes);
     }
 
     void write_kmer_record(const unsigned char* kmer_data, const uint32_t count)
     {
         local_sorted_kmer_count++;
-        if (current_offset_ + total_bytes > FINAL_DRAIN_RING_POOL_BLOCK_SIZE) [[unlikely]]
+        if (current_offset_ + record_bytes_ > FINAL_DRAIN_RING_POOL_BLOCK_SIZE) [[unlikely]]
             flush_block();
 
-        std::memcpy(current_block_ + current_offset_, kmer_data, kmer_bytes);
-        current_offset_ += kmer_bytes;
+        if (group_records_ == 0) [[unlikely]]
+        {
+            if (current_offset_ + 5 + prefix_bytes_ + record_bytes_ > FINAL_DRAIN_RING_POOL_BLOCK_SIZE)
+                flush_block();
+            group_offset_ = current_offset_;
+            current_block_[current_offset_] = static_cast<char>(prefix_bytes_);
+            current_offset_ += 5; // N is filled before the block is published.
+            std::memcpy(current_block_ + current_offset_, kmer_data, prefix_bytes_);
+            current_offset_ += prefix_bytes_;
+        }
+
+        std::memcpy(current_block_ + current_offset_, kmer_data + prefix_bytes_, kmer_bytes - prefix_bytes_);
+        current_offset_ += kmer_bytes - prefix_bytes_;
 
         std::memcpy(current_block_ + current_offset_, &count, count_max_bytes);
         current_offset_ += count_max_bytes;
+        ++group_records_;
     }
 
 private:
+    void finish_group()
+    {
+        if (group_records_ != 0)
+        {
+            std::memcpy(current_block_ + group_offset_ + 1, &group_records_, sizeof(group_records_));
+            group_records_ = 0;
+        }
+    }
+
     void flush_block()
     {
+        finish_group();
         if (pool_->producer_try_enqueue({ current_block_, current_offset_ }))
         {
             enqueue_backoff.double_decay();

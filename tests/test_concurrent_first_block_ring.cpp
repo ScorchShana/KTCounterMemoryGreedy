@@ -49,7 +49,7 @@ void expect_exit(const std::function<void()>& action)
     const pid_t child = fork();
     require(child >= 0, "fork failed");
     if (child == 0) {
-        action();
+        try { action(); } catch (const std::bad_alloc&) { _exit(255); }
         _exit(0);
     }
     int status = 0;

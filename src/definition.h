@@ -69,6 +69,8 @@ constexpr uint32_t MAX_DEPTH = 4;  // 树的最大深度 (第 4 层将自动合�
 constexpr uint32_t NODE_SIZE = 256;
 
 constexpr size_t CACHE_LINE_SIZE = 64;
+constexpr size_t EXPORT_WRITER_BUFFER_BYTES = 2ULL << 20;
+constexpr size_t EXPORT_WRITER_BUFFER_COUNT = 2;
 
 constexpr uint32_t MAX_K = 128;
 
@@ -85,7 +87,7 @@ constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 
 constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE = 32ULL * 1024; // 环形内存池块大小（字节）
 
 // LowFrequencyReader 与 LowFrequencyParser：512 × 256 KiB = 128 MiB
-constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY = 1ULL << 9;
+constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY = 512ULL;
 constexpr uint64_t LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE = 256ULL * 1024;
 
 // Parser与Classifier之间的RingMemoryPool配置常量
@@ -144,6 +146,8 @@ constexpr uint64_t KMER_BATCH_PREFIX_BASES = ROOT_BASES;    // 根节点使用�
 constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节），包括计数和前缀
 
 // ExportWriter配置常量
+constexpr uint64_t LOW_PENDING_SHARD_BYTES = 20ULL << 30; // Target size; rotate between complete export blocks.
+static_assert(LOW_PENDING_SHARD_BYTES > 0);
 constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
 constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节点的导出缓冲区大小（字节）
 
@@ -159,11 +163,13 @@ inline uint32_t k_length = 0;
 inline size_t kmer_bytes() noexcept { return (k_length + 3) / 4; }
 
 struct kmer_block;
+template<typename CountType = uint32_t>
 struct node;
 
+template<typename CountType = uint32_t>
 struct alignas(64) Task
 {
-    node* current_node = nullptr;
+    node<CountType>* current_node = nullptr;
     uint64_t depth;
     uint64_t count;
     std::array<kmer_block*, MAX_KMER_BLOCK_NUM> kmer_blocks{};
@@ -181,6 +187,7 @@ alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> filtered_above_max_count{ 
 
 // 临时文件目录
 inline std::string temp_dir = "./tmp/";
+inline std::string mapping_filename = "mapping.tmp";
 
 // 布隆过滤器最大最小数目
 constexpr uint64_t MIN_BLOOM_FILTER_CAPACITY = 1ULL << 12; // 最低Bloom Filter容量，单位为元素数量

@@ -67,6 +67,14 @@ int main()
     try {
         ConcurrentMemoryPool pool(8ULL << 20);
         pool.init_arenas();
+        bool rejected = false;
+        try { ConcurrentBloomFilter huge(1ULL << 61, &pool); }
+        catch (const std::overflow_error&) { rejected = true; }
+        require(rejected, "overflowing Bloom capacity was not rejected before allocation");
+        rejected = false;
+        try { ConcurrentBloomFilter invalid(3, &pool); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "non-power-of-two Bloom capacity accepted");
         check_queries<1>(pool);
         check_queries<2>(pool);
         check_queries<4>(pool);
