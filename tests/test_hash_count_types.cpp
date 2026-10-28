@@ -109,7 +109,7 @@ template<typename T> void check(uint32_t k, uint32_t cap)
         std::array<Counts, 2> sorted;
         for (const auto& [key, count] : leaf_truth) {
             const auto saturated = std::min<uint64_t>(count, cap);
-            if (minimum <= saturated && saturated <= filter_max) reference[key] = saturated;
+            reference[key] = saturated;
         }
         auto collect = [&](Counts& result, uint32_t depth) {
             content_type content;
@@ -152,6 +152,38 @@ template<typename T> void check(uint32_t k, uint32_t cap)
         }
         require(hashed == reference && sorted[0] == reference && sorted[1] == reference,
             "suffix leaf/hash reconstruction, saturation or filtering differs");
+    }
+    // Exercise cap boundaries without materializing billions of occurrences.
+    for (uint64_t frequency : {uint64_t(cap) - 1, uint64_t(cap), uint64_t(cap) + 1}) {
+        for (uint64_t low : {0ULL, 1ULL}) {
+            if (!frequency || low > frequency) continue;
+            const Key bytes = suffix(hot, MAX_DEPTH - 1);
+            node<T> owner; owner.prefix_code = prefix(hot, MAX_DEPTH - 1);
+            ConcurrentOpenAddressHashMap<T> map(16, cap, bytes.size());
+            uint64_t unique = 0;
+            for (uint64_t left = frequency - low; left;) {
+                const auto take = static_cast<T>(std::min<uint64_t>(left, std::numeric_limits<T>::max()));
+                map.increment(bytes.data(), take, unique);
+                left -= take;
+            }
+            { FinalDrainWriter writer(&output);
+              KmerTreeAllocationTestAccess::export_map(tree, writer, &owner, MAX_DEPTH - 1, &map); writer.close(); }
+            uint64_t high = 0, records = 0;
+            content_type content;
+            while (output.consumer_try_dequeue(content)) {
+                for (const auto& record : high_prefix_test::decode(
+                        {reinterpret_cast<const uint8_t*>(content.data), content.length}, kmer_bytes(), count_max_bytes)) {
+                    require(record.key == hot, "cap-boundary export changed the key");
+                    high = record.count;
+                    ++records;
+                }
+                output.consumer_enqueue(content.data);
+            }
+            require(records == (frequency > low ? 1u : 0u) && high == std::min<uint64_t>(cap, frequency - low),
+                "cap-boundary high remainder differs");
+            require(std::min<uint64_t>(cap, high + low) == std::min<uint64_t>(cap, frequency),
+                "split count does not reconstruct the capped frequency");
+        }
     }
 }
 }

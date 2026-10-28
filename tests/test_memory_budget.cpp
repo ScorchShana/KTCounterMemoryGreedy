@@ -29,16 +29,14 @@ int main()
     try {
         const auto rings = ring_pool_budget();
         constexpr size_t mib = 1ULL << 20;
-        require(rings.run_data == 896 * mib && rings.replay_data == 896 * mib &&
+        require(rings.run_data == 896 * mib && rings.replay_data == 0 && rings.replay_bytes == 0 &&
             rings.final_data == 768 * mib, "RingPool lifetime data accounting");
         require(rings.peak_bytes > rings.run_data, "RingPool object metadata missing");
         require(rings.peak_bytes == std::max({rings.run_bytes, rings.replay_bytes, rings.final_bytes}),
             "RingPool peak must use simultaneous lifetimes");
-        constexpr size_t pending_buffers = msd_prefix::FINAL_LOW_BUFFER_BYTES;
+        constexpr size_t writer_buffers = msd_prefix::FINAL_LOW_BUFFER_BYTES;
         require(msd_prefix::FINAL_LOW_BUFFER_BYTES == 8 * mib, "FinalLow four-buffer budget");
-        const size_t peak = std::max({rings.run_bytes + pending_buffers,
-            rings.replay_bytes + msd_prefix::FINAL_LOW_BUFFER_BYTES + LowFrequencyReader::READ_CACHE_BYTES,
-            rings.final_bytes + 2 * msd_prefix::FINAL_LOW_BUFFER_BYTES});
+        const size_t peak = std::max(rings.run_bytes, rings.final_bytes) + writer_buffers;
         require(main_pool_overhead_bytes() == peak, "exact phase overhead omits a live buffer");
         require(main_pool_budget(1) == ((1ULL << 30) - peak) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE,
             "main pool stage peak deduction/alignment");
@@ -48,7 +46,7 @@ int main()
                 && gib * (1ULL << 30) - main - peak < HUGE_PAGE_SIZE,
                 "writer buffers escaped original memory limit");
         }
-        require(bloom_bytes(4096) == 2 * 4096 * sizeof(std::atomic<uint64_t>), "Bloom needs two words per bin");
+        require(bloom_bytes(4096) == 4096 * sizeof(std::atomic<uint64_t>), "Bloom needs one word per bin");
         bool overflow = false;
         try { (void)bloom_bytes(4096, SIZE_MAX); } catch (const std::overflow_error&) { overflow = true; }
         require(overflow, "Bloom aggregate capacity overflow accepted");

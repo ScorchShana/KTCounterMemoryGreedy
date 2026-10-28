@@ -11,7 +11,6 @@
 #include "FastqPreReader.h"
 #include "FastqParser.h"
 #include "FastqPreParser.h"
-#include "LowFrequencyReader.h"
 #include "definition.h"
 #include "MemoryBudget.h"
 
@@ -46,7 +45,6 @@ uint64_t memory_limit; // 全局最大内存限制，单位为 GB
 uint64_t estimated_file_size;    // 输入 FASTQ 文件的估计大小，单位为字节
 std::vector<std::string> filenames;
 size_t pool_budget_bytes = 0;
-bool first_cache_enabled = true;
 
 void get_MAX_BLOOM_FILTER_CAPACITY()
 {
@@ -54,10 +52,10 @@ void get_MAX_BLOOM_FILTER_CAPACITY()
     std::cout << "Average quality score: " << avgQuality << std::endl;
 #endif
     const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
-    const uint64_t quarter_memory_average_capacity = pool_budget_bytes / 4 / (2 * sizeof(std::atomic<uint64_t>)) / (1ULL << (2 * ROOT_BASES));
+    const uint64_t eighth_memory_average_capacity = pool_budget_bytes / 8 / sizeof(std::atomic<uint64_t>) / (1ULL << (2 * ROOT_BASES));
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_length);
     const double error_factor = 0.5 + singleton_rate_cause_by_error;
-    const auto corrected_memory_average_capacity = std::bit_floor(static_cast<uint64_t>(static_cast<double>(quarter_memory_average_capacity) * error_factor));
+    const auto corrected_memory_average_capacity = std::bit_floor(static_cast<uint64_t>(static_cast<double>(eighth_memory_average_capacity) * error_factor));
     MAX_BLOOM_FILTER_CAPACITY = std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, corrected_memory_average_capacity);
 }
 
@@ -119,7 +117,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_length);
     const double capacity_error_factor = 0.5 + singleton_rate_cause_by_error;
-    uint64_t bloom_filter_memroy_budget = static_cast<uint64_t>(pool_budget_bytes / 4 * capacity_error_factor);
+    uint64_t bloom_filter_memroy_budget = static_cast<uint64_t>(pool_budget_bytes / 8 * capacity_error_factor);
     const uint64_t minimum_bytes = bloom_bytes(MIN_BLOOM_FILTER_CAPACITY, bloom_filter_capacity.size());
     if (pool_budget_bytes <= minimum_bytes + HUGE_PAGE_SIZE)
         throw std::invalid_argument("main pool cannot hold minimum Bloom configuration");
@@ -193,7 +191,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
         q.push(i);
     }
 
-    if (MAX_BLOOM_FILTER_CAPACITY > SIZE_MAX / (4 * 2 * sizeof(std::atomic<uint64_t>)))
+    if (MAX_BLOOM_FILTER_CAPACITY > SIZE_MAX / (4 * sizeof(std::atomic<uint64_t>)))
         throw std::overflow_error("Bloom growth capacity overflow");
     const uint64_t final_max_bloom_filter_capacity = MAX_BLOOM_FILTER_CAPACITY * 4;
     while (!q.empty()) {
@@ -223,7 +221,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     }
 #ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
-    std::cout << "Total Bloom Filter size: " << 2 * total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
+    std::cout << "Total Bloom Filter size: " << bloom_bytes(total_bloom_filter_size) / (1024 * 1024) << " MB" << std::endl;
 #endif
 }
 
@@ -335,8 +333,6 @@ int process_main()
 
     const uint32_t remaining = n_thread - reader_num - 1;  // -1: export writer
     const uint32_t parser_num = std::max(1U, remaining / 10);
-    constexpr uint32_t low_reader_num = 1;
-    const uint32_t low_parser_num = reader_num + parser_num - low_reader_num;
     const uint32_t worker_budget = remaining - parser_num;
 
     const auto init_start = std::chrono::steady_clock::now();
@@ -566,16 +562,16 @@ int process_main()
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
     auto task_thread_pool = std::make_shared<SchedulerThreadPool<CountType>>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
-    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<CountType>>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_cache_enabled);
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<CountType>>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
     auto parser_thread_pool = std::make_shared<ParserThreadPool>(classifier_task_queues, global_classifier_task_queue.get(), pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
-    auto export_writer = std::make_shared<ExportWriter>(export_ring_pool.get(), temp_dir + "low.pending.bin", ExportWriter::OutputKind::Pending, pool.get(), nullptr, ExportWriter::ReclaimLifetime::UntilExplicitStop);
+    auto export_writer = std::make_shared<ExportWriter>(export_ring_pool.get(), temp_dir + "low.final.tmp", ExportWriter::OutputKind::FinalLow);
 
     // 正式计数阶段
     reader_parser_ring_pool->reset_producers(reader_num);
     parser_classifier_ring_pool->reset_producers(parser_num);
-    // 预置最终导出任务，第二阶段回灌完成后才执行。
+    // 预置最终导出任务，全部 Classifier flush 本地 root 后才执行。
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
@@ -609,102 +605,18 @@ int process_main()
     const auto parser_end = std::chrono::steady_clock::now();
 #endif
     reader_parser_ring_pool.reset();
-    classifier_thread_pool->wait_for_first_pass();
-    pool->freeze_first();
+    classifier_thread_pool->join();
 #ifdef TEST_MODE
     const auto classifier_end = std::chrono::steady_clock::now();
-    pool->input_finished_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        classifier_end.time_since_epoch()).count(), std::memory_order_relaxed);
-#endif
-
-    // Drain and permanently detach the ordinary Ring; raw reclamation stays live.
-#ifdef TEST_MODE
-    const auto normal_drain_start = std::chrono::steady_clock::now();
-#endif
-    tree->mark_finish_export();
-    export_writer->wait_for_normal_drain();
-#ifdef TEST_MODE
-    const auto normal_drain_end = std::chrono::steady_clock::now();
-    std::cout << "FIRST sealed records: " << pool->first_valid_records.load()
-        << "\nFIRST input conservation: "
-        << (classifier_thread_pool->input_first_records.load() == classifier_thread_pool->input_pending_records.load() + pool->first_valid_records.load()) << '\n';
-#endif
-
-    // Scheduler 继续处理入树任务，此时不进入 final drain。
-#ifdef TEST_MODE
-    const auto low_start = std::chrono::steady_clock::now();
-#endif
-    const bool write_low = filter_min <= 1 && filter_max >= 1;
-    parser_classifier_ring_pool->reset_producers(low_parser_num);
-    std::unique_ptr<ExportWriter> low_writer;
-    if (write_low) {
-        export_ring_pool->reset_producers(1);
-        low_writer = std::make_unique<ExportWriter>(export_ring_pool.get(), temp_dir + "low.final.tmp", ExportWriter::OutputKind::FinalLow);
-        low_writer->start();
-    }
-#ifdef TEST_MODE
-    const auto memory_first_start = std::chrono::steady_clock::now();
-#endif
-    classifier_thread_pool->start_low_pass();
-    classifier_thread_pool->wait_for_memory_first();
-#ifdef TEST_MODE
-    const auto memory_first_end = std::chrono::steady_clock::now();
-#endif
-#ifdef TEST_MODE
     const auto export_join_start = std::chrono::steady_clock::now();
 #endif
-    export_writer->finish_reclaim();
+    tree->mark_finish_export();
     export_writer->join();
 #ifdef TEST_MODE
     const auto export_join_end = std::chrono::steady_clock::now();
 #endif
-    [[maybe_unused]] uint64_t low_records_read = 0;
-    uint64_t pending_encoded_read = 0;
-    {
-        SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> low_ring_pool(
-            LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, low_reader_num);
-        LowFrequencyReader low_reader(low_ring_pool);
-        try {
-        parser_thread_pool->start_low_pass(low_ring_pool, low_parser_num);
-        low_reader.start(temp_dir + "low.pending.bin", export_writer->shard_count());
-        low_reader.join();
-        runtime.check();
-        parser_thread_pool->join();
-    runtime.check();
-        low_records_read = low_reader.records_read();
-        pending_encoded_read = low_reader.encoded_bytes_read();
-        } catch (...) {
-            runtime.fail(std::current_exception(), "pending replay");
-            low_reader.join();
-            parser_thread_pool->join();
-            throw;
-        }
-    }
-    classifier_thread_pool->join();
-    if (write_low) {
-        tree->mark_finish_export();
-        low_writer->join();
-    } else {
-        const int low_fd = ::open((temp_dir + "low.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (low_fd < 0) {
-            std::perror("Failed to create empty final low file");
-            std::exit(-1);
-        }
-        if (::close(low_fd) != 0) {
-            std::perror("Failed to close empty final low file");
-            std::exit(-1);
-        }
-    }
-    const uint64_t low_records_unrecovered = classifier_thread_pool->low_records_scanned
-        - classifier_thread_pool->low_records_recovered;
-    const uint64_t singleton_records = low_records_unrecovered + classifier_thread_pool->first_drain_singletons;
-    const uint64_t low_records_kept = write_low ? singleton_records : 0;
-    const uint64_t low_records_discarded = write_low ? 0 : singleton_records;
-#ifdef TEST_MODE
-    const auto low_end = std::chrono::steady_clock::now();
-#endif
 
-    // 所有 Classifier 已完成回灌和本地 root flush，再进入 final drain。
+    // 所有 Classifier 已完成本地 root flush，再进入 final drain。
     // Scheduler 排空剩余任务，直接导出 high.bin。
 #ifdef TEST_MODE
     const auto final_start = std::chrono::steady_clock::now();
@@ -728,15 +640,7 @@ int process_main()
 #endif
 
     std::cout << "Total read k-mer count: " << parser_thread_pool->get_total_read_kmer() << std::endl;
-    std::cout << "Low frequency records scanned: " << classifier_thread_pool->low_records_scanned << std::endl;
-    std::cout << "Low frequency records recovered: " << classifier_thread_pool->low_records_recovered << std::endl;
-    std::cout << "FIRST drain singleton records: " << classifier_thread_pool->first_drain_singletons << std::endl;
-    std::cout << "Low frequency records kept: " << low_records_kept << std::endl;
-    std::cout << "Low frequency records discarded: " << low_records_discarded << std::endl;
-#ifdef TEST_MODE
-    std::cout << "Low frequency reconciliation elapsed us: "
-        << std::chrono::duration_cast<std::chrono::microseconds>(low_end - low_start).count() << std::endl;
-#endif
+    std::cout << "Low output records: " << classifier_thread_pool->low_output_records << '\n';
 
     const auto total_end = std::chrono::steady_clock::now();
 
@@ -762,14 +666,10 @@ int process_main()
     std::cout << "Final elapsed us: " << final_elapsed_us << std::endl;
 #endif
 
-    std::cout << "Pending encoded bytes written: " << export_writer->encoded_bytes_written() << '\n';
-    std::cout << "Pending encoded bytes read: " << pending_encoded_read << '\n';
+    std::cout << "Low encoded bytes written: " << export_writer->encoded_bytes_written() << '\n';
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 #ifdef TEST_MODE
     std::cout << "RUN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - mid_start).count() << '\n';
-    std::cout << "MEMORY_FIRST elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(memory_first_end - memory_first_start).count() << '\n';
-    std::cout << "NORMAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(normal_drain_end - normal_drain_start).count() << '\n';
-    std::cout << "CLOSE_PENDING elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(export_join_end - export_join_start).count() << '\n';
     std::cout << "FINAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count() << '\n';
     std::cout << "FIRST spill bytes: " << pool->spill_bytes.load() << '\n';
     std::cout << "FIRST returned bytes: " << pool->returned_bytes.load() << '\n';
@@ -823,12 +723,7 @@ int process_main()
     std::cout << "KmerTree total kmers added: " << tree->total_kmers_added.load() << std::endl;
     std::cout << "Kmer total kmers exported: " << classifier_thread_pool->total_kmers_exported.load() << std::endl;
     std::cout << "Kmer total kmers sent to tree: " << classifier_thread_pool->total_kmers_send_to_tree.load() << std::endl;
-    std::cout << "equal : " << ((tree->total_kmers_added.load() + low_records_kept + low_records_discarded) == parser_thread_pool->get_total_read_kmer()) << std::endl;
-    std::cout << "Low frequency conservation: "
-        << (low_records_read == classifier_thread_pool->low_records_scanned &&
-            classifier_thread_pool->low_records_scanned + classifier_thread_pool->first_drain_singletons
-                == classifier_thread_pool->low_records_recovered + low_records_kept + low_records_discarded) << std::endl;
-
+    std::cout << "equal : " << ((tree->total_kmers_added.load() + classifier_thread_pool->low_output_records) == parser_thread_pool->get_total_read_kmer()) << std::endl;
     for (uint32_t i = 0;i < MAX_DEPTH;i++)
     {
         std::cout << "Depth " << i << " queue size: " << layer_queues->get_queue(i)->size() << std::endl;
@@ -837,25 +732,21 @@ int process_main()
 #endif
 
     std::cout << "High frequency unique k-mer : " << sorted_kmer_count.load() << std::endl;
-    std::cout << "Unique k-mers filtered below filter_min: "
-        << filtered_below_min_count.load(std::memory_order_relaxed)
-            + (filter_min > 1 ? singleton_records : 0) << std::endl;
-    std::cout << "Unique k-mers filtered above filter_max: "
-        << filtered_above_max_count.load(std::memory_order_relaxed)
-            + (filter_max < 1 ? singleton_records : 0) << std::endl;
-
+    std::cout << "Unique k-mers filtered below filter_min: 0\n";
+    std::cout << "Unique k-mers filtered above filter_max: 0\n";
 
     return 0;
 }
 
 int main(int argc, char* argv[])
 {
+    bool first_compat_options = false;
     std::vector<char*> positional{argv[0]};
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
-        if (argument == "--first-cache=auto") first_cache_enabled = true;
-        else if (argument == "--first-cache=off") first_cache_enabled = false;
-        else if (argument == "--first-reclaim=spill") {}
+        if (argument == "--first-cache=auto") first_compat_options = true;
+        else if (argument == "--first-cache=off") first_compat_options = true;
+        else if (argument == "--first-reclaim=spill") first_compat_options = true;
         else if (argument == "--first-reclaim=compact") {
             std::cerr << "--first-reclaim=compact is no longer supported; use --first-reclaim=spill\n";
             return 1;
@@ -975,6 +866,9 @@ int main(int argc, char* argv[])
         std::cout << "  Map capacity: " << concurrent_hash_map_max_capacity << std::endl;
         std::cout << "  Filter min: " << filter_min << std::endl;
         std::cout << "  Filter max: " << filter_max << std::endl;
+        std::cout << "Frequency filtering: disabled in single-Bloom output; apply after merging low.bin and high.bin\n";
+        if (first_compat_options)
+            std::cout << "FIRST compatibility options: ignored in single-Bloom output\n";
         std::cout << "  Count max: " << count_max << std::endl;
     }
     catch (const std::exception&)

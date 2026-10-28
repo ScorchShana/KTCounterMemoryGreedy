@@ -3,7 +3,6 @@
 
 #include "RingMemoryPool.h"
 #include "MsdPrefixCodec.h"
-#include "LowFrequencyReader.h"
 #include <algorithm>
 #include <atomic>
 #include <limits>
@@ -21,14 +20,12 @@ inline RingPoolBudget ring_pool_budget() noexcept
     constexpr size_t parser = PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY * PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE;
     constexpr size_t output = EXPORT_RING_MEMORY_POOL_CAPACITY * EXPORT_RING_MEMORY_POOL_BLOCK_SIZE;
     constexpr size_t drain = FINAL_DRAIN_RING_POOL_CAPACITY * FINAL_DRAIN_RING_POOL_BLOCK_SIZE;
-    constexpr size_t low = LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY * LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE;
     constexpr size_t common_metadata = sizeof(RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>)
         + sizeof(RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>)
         + sizeof(RingMemoryPool<FINAL_DRAIN_RING_POOL_CAPACITY>);
-    RingPoolBudget result{reader + parser + output + drain, low + parser + output + drain,
+    RingPoolBudget result{reader + parser + output + drain, 0,
         parser + output + drain, 0, 0, 0, 0};
     result.run_bytes = result.run_data + common_metadata + sizeof(RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>);
-    result.replay_bytes = result.replay_data + common_metadata + sizeof(SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY>);
     result.final_bytes = result.final_data + common_metadata;
     result.peak_bytes = std::max({result.run_bytes, result.replay_bytes, result.final_bytes});
     return result;
@@ -38,10 +35,7 @@ inline size_t main_pool_overhead_bytes() noexcept
 {
     const auto phases = ring_pool_budget();
     constexpr size_t writer = msd_prefix::FINAL_LOW_BUFFER_BYTES;
-    return std::max({phases.run_bytes + writer,
-        phases.final_bytes + 2 * writer, // Pending reclamation overlaps FinalLow.
-        phases.replay_bytes + writer + LowFrequencyReader::READ_CACHE_BYTES,
-        phases.final_bytes + writer});
+    return std::max(phases.run_bytes, phases.final_bytes) + writer;
 }
 
 inline size_t main_pool_budget(uint64_t gib)
@@ -59,7 +53,7 @@ inline size_t main_pool_budget(uint64_t gib)
 
 inline size_t bloom_bytes(uint64_t capacity, size_t filters = 1)
 {
-    constexpr size_t unit = 2 * sizeof(std::atomic<uint64_t>);
+    constexpr size_t unit = sizeof(std::atomic<uint64_t>);
     if (capacity > std::numeric_limits<size_t>::max() / unit)
         throw std::overflow_error("Bloom capacity overflow");
     const size_t bytes = static_cast<size_t>(capacity) * unit;

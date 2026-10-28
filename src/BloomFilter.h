@@ -148,7 +148,7 @@ class ConcurrentBloomFilter
 {
 
 private:
-    // Even words register repeats; odd words register first occurrences.
+    // One atomic word records all seen bits for a block.
     std::atomic<uint64_t>* bins = nullptr;
     uint64_t capacity_;
     uint64_t mod;
@@ -175,8 +175,7 @@ public:
         bins = static_cast<std::atomic<uint64_t>*>(storage ? storage : memory_pool->allocate_large(bytes));
         for (size_t i = 0; i < capacity_; ++i)
         {
-            new (&bins[2 * i]) std::atomic<uint64_t>(0); // BF1 全置0
-            new (&bins[2 * i + 1]) std::atomic<uint64_t>(0); // BF2 全置0
+            new (&bins[i]) std::atomic<uint64_t>(0);
         }
     }
 
@@ -224,7 +223,7 @@ public:
     void prefetch_insert(const InsertProbe& probe) const noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx * 2, 0, 0);
+        __builtin_prefetch(bins + probe.block_idx, 0, 0);
 #else
         (void)probe;
 #endif
@@ -232,48 +231,21 @@ public:
 
     Occurrence insert_prepared(const InsertProbe& probe) noexcept
     {
-        std::atomic<uint64_t>& cell1 = bins[probe.block_idx * 2];
-        std::atomic<uint64_t>& cell2 = bins[probe.block_idx * 2 + 1];
-        const uint64_t bf1_word = cell1.load(std::memory_order_relaxed);
-        if ((bf1_word & probe.insert_num) == probe.insert_num)
+        std::atomic<uint64_t>& cell = bins[probe.block_idx];
+        const uint64_t word = cell.load(std::memory_order_relaxed);
+        if ((word & probe.insert_num) == probe.insert_num)
         {
             return Occurrence::REPEAT;
         }
 
-        const uint64_t bf2_word_before = cell2.fetch_or(probe.insert_num, std::memory_order_relaxed);
-        if ((bf2_word_before & probe.insert_num) != probe.insert_num)
-        {
-            return Occurrence::FIRST;
-        }
-
-        cell1.fetch_or(probe.insert_num, std::memory_order_relaxed);
-        return Occurrence::REPEAT;
+        const uint64_t before = cell.fetch_or(probe.insert_num, std::memory_order_relaxed);
+        return (before & probe.insert_num) == probe.insert_num ? Occurrence::REPEAT : Occurrence::FIRST;
     }
 
     Occurrence insert(const unsigned char* k_mer) noexcept
     {
         const InsertProbe probe = prepare_insert(k_mer);
         return insert_prepared(probe);
-    }
-
-    void prefetch_contains(const InsertProbe& probe) const noexcept
-    {
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(bins + probe.block_idx * 2, 0, 1);
-#else
-        (void)probe;
-#endif
-    }
-
-    bool contains_repeat_prepared(const InsertProbe& probe) const noexcept
-    {
-        const uint64_t word = bins[probe.block_idx * 2].load(std::memory_order_relaxed);
-        return (word & probe.insert_num) == probe.insert_num;
-    }
-
-    bool contains_repeat(const unsigned char* key) const noexcept
-    {
-        return contains_repeat_prepared(prepare_insert(key));
     }
 
     std::atomic<uint64_t>* get_bins()

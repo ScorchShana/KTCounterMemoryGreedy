@@ -1523,17 +1523,6 @@ private:
     void append_export_record(FinalDrainWriter& writer, const unsigned char* key, const uint32_t count,
         const node<CountType>* source, uint32_t depth)
     {
-        if (count < filter_min)
-        {
-            ++writer.local_filtered_below_min_count;
-            return;
-        }
-        if (count > filter_max)
-        {
-            ++writer.local_filtered_above_max_count;
-            return;
-        }
-
         std::array<unsigned char, (MAX_K + 3) / 4> full_key;
         key_ops.restore_full_key(full_key.data(), key, source->prefix_code, depth);
         writer.write_kmer_record(full_key.data(), count);
