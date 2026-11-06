@@ -1,19 +1,15 @@
 #include "HistogramRunner.h"
-#include "HighFrequencyThreadPool.h"
-#include "MsdGroupReader.h"
-#include "LowFrequencyThreadPool.h"
+#include "HistogramParser.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
-#include <memory>
-#include <pthread.h>
+#include <stdexcept>
 #include <sys/stat.h>
+#include <vector>
 
 namespace
 {
-    constexpr uint64_t RING_CAPACITY = 1ULL << 8;
-    constexpr uint64_t BLOCK_BYTES = 512ULL * 1024;
-
     class ProgressPrinter
     {
     public:
@@ -37,20 +33,18 @@ namespace
         unsigned last_ = 0;
     };
 
-    uint64_t file_size(const std::string& path, uint64_t record_bytes)
+    uint64_t input_size(const std::string& path)
     {
         struct stat st{};
         if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
             throw std::runtime_error("failed to stat regular input " + path);
-        uint64_t bytes = static_cast<uint64_t>(st.st_size);
-        if (bytes % record_bytes) throw std::runtime_error("misaligned compact input " + path);
-        return bytes;
+        return static_cast<uint64_t>(st.st_size);
     }
 
     void read_infos(Options& options)
     {
         const std::string path = options.tmp_dir + "infos.bin";
-        if (file_size(path, 1) != 8) throw std::runtime_error("invalid infos.bin size");
+        if (input_size(path) != 8) throw std::runtime_error("invalid infos.bin size");
         uint32_t fields[2]{};
         std::ifstream input(path, std::ios::binary);
         if (!input.read(reinterpret_cast<char*>(fields), sizeof(fields)))
@@ -63,208 +57,14 @@ namespace
             options.count_max <= 16777215 ? 3 : 4;
     }
 
-    uint64_t checked_add(uint64_t a, uint64_t b)
-    {
-        if (b > std::numeric_limits<uint64_t>::max() - a)
-            throw std::runtime_error("histogram memory estimate overflow");
-        return a + b;
-    }
-
-    uint64_t checked_multiply(uint64_t a, uint64_t b)
-    {
-        if (b && a > std::numeric_limits<uint64_t>::max() / b)
-            throw std::runtime_error("histogram memory estimate overflow");
-        return a * b;
-    }
-
-    // High and low phases are sequential: exactly one ring and reader are live.
-    // Include all local histograms, default worker stacks, and allocation/I/O
-    // slack, in addition to the mmap table.
-    uint64_t fixed_memory_bytes(uint32_t workers, size_t buckets)
-    {
-        pthread_attr_t attr;
-        if (pthread_attr_init(&attr) != 0) throw std::runtime_error("failed to query thread attributes");
-        size_t stack_bytes = 0;
-        int error = pthread_attr_getstacksize(&attr, &stack_bytes);
-        pthread_attr_destroy(&attr);
-        if (error) throw std::runtime_error("failed to query thread stack size");
-        uint64_t bytes = RING_CAPACITY * BLOCK_BYTES;
-        bytes = checked_add(bytes, checked_multiply(buckets, sizeof(std::atomic<int64_t>)));
-        bytes = checked_add(bytes, checked_multiply(checked_multiply(buckets, sizeof(int64_t)), workers));
-        bytes = checked_add(bytes, checked_multiply(workers, checked_add(stack_bytes, 4096)));
-        return checked_add(bytes, 2ULL * 1024 * 1024);
-    }
-
-    // Decode records straight out of the group stream into flat worker blocks.
-    void enqueue_records(const msd_group::File& source,
-                         SPMCRingMemoryPool<RING_CAPACITY>& pool, ProgressPrinter& progress,
-                         uint64_t first = 0, uint64_t count = std::numeric_limits<uint64_t>::max())
-    {
-        if (first >= source.records)
-        {
-            pool.producer_set_finished();
-            return;
-        }
-        uint64_t remaining = std::min(count, source.records - first);
-        const uint64_t record_bytes = uint64_t(source.key_bytes) + source.count_bytes;
-        const uint64_t capacity = BLOCK_BYTES / record_bytes;
-        std::vector<char> scratch;
-        while (remaining > 0)
-        {
-            char* block = nullptr;
-            pool.producer_dequeue(block);
-            const uint64_t batch = std::min(remaining, capacity);
-            uint64_t bytes = 0;
-            const uint64_t records = source.read_flat_records(first, batch, block, scratch, &bytes);
-            if (records == 0)
-                throw std::runtime_error("short read from " + source.path);
-            pool.producer_enqueue(content_type{block, records});
-            progress.add(bytes);
-            first += records;
-            remaining -= records;
-        }
-        pool.producer_set_finished();
-    }
-
-    void write_histogram(const Options& options, const AtomicHistogram& histogram)
+    void write_histogram(const Options& options, const std::vector<int64_t>& histogram)
     {
         std::ofstream output(options.output_file, std::ios::trunc);
         if (!output) throw std::runtime_error("failed to open output file: " + options.output_file);
         for (size_t i = 0; i < histogram.size(); ++i)
-            output << static_cast<uint64_t>(options.min_freq) + i << '\t'
-                   << histogram[i].load(std::memory_order_relaxed) << '\n';
+            output << static_cast<uint64_t>(options.min_freq) + i << '\t' << histogram[i] << '\n';
         output.close();
         if (!output) throw std::runtime_error("failed to write output file: " + options.output_file);
-    }
-
-    template <uint32_t N>
-    void process_exact_segment(const Options& options, const msd_group::File& high,
-                               const msd_group::File& low, uint64_t first, uint64_t records,
-                               AtomicHistogram& histogram, ProgressPrinter& progress,
-                               SPMCRingMemoryPool<RING_CAPACITY>& pool,
-                               std::atomic<uint64_t>* matched)
-    {
-        const uint32_t table_k_len = options.k_len;
-        FlatConcurrentHashMap<N> hash_map(records, options.max_threads, table_k_len);
-        pool.reset_producers(1);
-        {
-            HighFrequencyThreadPool<N, RING_CAPACITY> threads(
-                &pool, &hash_map, &histogram, options.max_threads, options.k_len,
-                options.count_bytes, options.min_freq, options.max_freq, histogram.size());
-            threads.start();
-            enqueue_records(high, pool, progress, first, records);
-            threads.join();
-            if (threads.insert_failed()) throw std::runtime_error("failed to insert high-frequency records");
-        }
-        hash_map.seal();
-        pool.reset_producers(1);
-        {
-            LowFrequencyThreadPool<N, RING_CAPACITY> threads(
-                &pool, &hash_map, &histogram, options.max_threads, options.k_len,
-                options.min_freq, options.max_freq, histogram.size(), options.count_max, matched);
-            threads.start();
-            enqueue_records(low, pool, progress);
-            threads.join();
-        }
-    }
-
-    template <uint32_t N>
-    int run_precise(const Options& options, const msd_group::File& high,
-                    const msd_group::File& low, size_t buckets, uint64_t fixed)
-    {
-        const uint64_t records = high.records;
-        const uint64_t high_bytes = high.size;
-        const uint64_t low_bytes = low.size;
-        uint64_t available = options.max_memory_bytes - fixed;
-        const uint32_t table_k_len = options.k_len;
-        if (FlatConcurrentHashMap<N>::required_mmap_bytes(records ? 1 : 0, table_k_len) > available)
-            throw std::runtime_error("insufficient memory budget for histogram hash table");
-        uint64_t per_segment = records;
-        bool segmented = FlatConcurrentHashMap<N>::required_mmap_bytes(records, table_k_len) > available;
-        if (segmented)
-        {
-            // Find the largest contiguous range whose actual rounded mmap fits.
-            uint64_t lo = 1, hi = records;
-            while (lo < hi)
-            {
-                uint64_t mid = lo + (hi - lo + 1) / 2;
-                if (FlatConcurrentHashMap<N>::required_mmap_bytes(mid, table_k_len) <= available) lo = mid;
-                else hi = mid - 1;
-            }
-            per_segment = lo;
-        }
-        uint64_t segments = records ? 1 + (records - 1) / per_segment : 1;
-        if (segmented)
-            std::cout << "Streaming mode: " << records << " high records in " << segments << " segment(s)\n";
-        ProgressPrinter progress(static_cast<long double>(high_bytes) +
-                                 static_cast<long double>(low_bytes) * segments);
-        AtomicHistogram histogram(buckets);
-        for (auto& value : histogram) value.store(0, std::memory_order_relaxed);
-        // Reuse the raw block storage after every joined phase and segment.
-        SPMCRingMemoryPool<RING_CAPACITY> pool(BLOCK_BYTES, 1);
-        std::atomic<uint64_t> matched{0};
-        uint64_t first = 0;
-        for (uint64_t segment = 0; segment < segments; ++segment)
-        {
-            uint64_t count = std::min(per_segment, records - first);
-            process_exact_segment<N>(options, high, low, first, count, histogram, progress, pool,
-                                     segmented ? &matched : nullptr);
-            first += count;
-        }
-        if (segmented)
-        {
-            uint64_t low_count = low.records;
-            uint64_t matched_count = matched.load(std::memory_order_relaxed);
-            if (matched_count > low_count) throw std::runtime_error("invalid duplicate high-frequency keys across segments");
-            if (in_range(1, options.min_freq, options.max_freq))
-                histogram[histogram_index(1, options.min_freq)].fetch_add(
-                    static_cast<int64_t>(low_count - matched_count), std::memory_order_relaxed);
-        }
-        write_histogram(options, histogram);
-        progress.finish();
-        return 0;
-    }
-
-    template <uint32_t N>
-    int run(const Options& options)
-    {
-        msd_group::File high = msd_group::open_file(options.tmp_dir + "high.bin",
-                                                    options.k_len, options.count_bytes);
-        const bool include_singletons = in_range(1, options.min_freq, options.max_freq);
-        const bool need_low = options.is_precise || include_singletons;
-        std::unique_ptr<msd_group::File> low;
-        if (need_low)
-            low = std::make_unique<msd_group::File>(
-                msd_group::open_file(options.tmp_dir + "low.bin", options.k_len, 0));
-        const uint64_t high_bytes = high.size;
-        const uint64_t low_bytes = low ? low->size : 0;
-        size_t buckets = static_cast<size_t>(static_cast<uint64_t>(options.max_freq) - options.min_freq + 1);
-        uint64_t fixed = fixed_memory_bytes(options.max_threads, buckets);
-        if (fixed > options.max_memory_bytes)
-            throw std::runtime_error("insufficient memory budget for histogram buffers and workers");
-        if (options.is_precise)
-            return run_precise<N>(options, high, *low, buckets, fixed);
-
-        ProgressPrinter progress(high_bytes);
-        AtomicHistogram histogram(buckets);
-        for (auto& value : histogram) value.store(0, std::memory_order_relaxed);
-        {
-            SPMCRingMemoryPool<RING_CAPACITY> pool(BLOCK_BYTES, 1);
-            ApproximateHighFrequencyThreadPool<N, RING_CAPACITY> threads(
-                &pool, &histogram, options.max_threads, options.k_len, options.count_bytes,
-                options.min_freq, options.max_freq, buckets);
-            threads.start();
-            enqueue_records(high, pool, progress);
-            threads.join();
-        }
-        // Tree reconciles pending occurrences before publishing low.bin, so
-        // each final low record contributes one distinct frequency-one key.
-        if (include_singletons)
-            histogram[histogram_index(1, options.min_freq)].fetch_add(
-                static_cast<int64_t>(low->records), std::memory_order_relaxed);
-        write_histogram(options, histogram);
-        progress.finish();
-        return 0;
     }
 }
 
@@ -272,10 +72,30 @@ int run_histogram_tool(Options options)
 {
     if (options.tmp_dir.empty()) options.tmp_dir = "./";
     if (options.tmp_dir.back() != '/') options.tmp_dir += '/';
-    if (!options.max_threads || options.max_freq < options.min_freq)
-        throw std::runtime_error("invalid histogram options");
+    if (options.max_freq < options.min_freq)
+        throw std::runtime_error("invalid histogram frequency range");
     read_infos(options);
-    if (options.k_len <= 32) return run<1>(options);
-    if (options.k_len <= 64) return run<2>(options);
-    return run<4>(options);
+
+    const std::string high_path = options.tmp_dir + "high.bin";
+    const std::string low_path = options.tmp_dir + "low.bin";
+    const bool include_singletons = options.min_freq <= 1 && options.max_freq >= 1;
+    uint64_t total_bytes = input_size(high_path);
+    if (include_singletons) total_bytes += input_size(low_path);
+
+    const size_t buckets = static_cast<size_t>(
+        static_cast<uint64_t>(options.max_freq) - options.min_freq + 1);
+    std::vector<int64_t> histogram(buckets, 0);
+    const size_t width = (options.k_len + 3) / 4;
+
+    ProgressPrinter progress(static_cast<long double>(total_bytes));
+    const auto on_bytes = [&progress](uint64_t bytes) { progress.add(bytes); };
+    parse_group_file(high_path, width, options.count_bytes, options.min_freq,
+                     options.max_freq, histogram, on_bytes);
+    if (include_singletons)
+        parse_group_file(low_path, width, 0, options.min_freq, options.max_freq,
+                         histogram, on_bytes);
+
+    write_histogram(options, histogram);
+    progress.finish();
+    return 0;
 }

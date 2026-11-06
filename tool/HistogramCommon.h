@@ -14,12 +14,9 @@
 struct Options
 {
     std::string tmp_dir;
-    bool is_precise = false;
     uint32_t k_len = 0;
     uint32_t count_max = 0;
     uint32_t count_bytes = 4;
-    uint32_t max_threads = 0;
-    uint64_t max_memory_bytes = 0;
     std::string output_file;
     uint32_t min_freq = 1;
     uint32_t max_freq = 10000;
