@@ -179,6 +179,11 @@ if(HAVE_NUMA_H)
     target_link_libraries(dump_tool numa)
 endif()
 
+add_executable(dump_tool_test tests/test_dump_tool.cpp)
+add_dependencies(dump_tool_test dump_tool)
+add_test(NAME DumpToolTest COMMAND dump_tool_test $<TARGET_FILE:dump_tool>)
+set_tests_properties(DumpToolTest PROPERTIES TIMEOUT 180)
+
 add_executable(histogram_tool_test tests/test_histogram_tool.cpp)
 target_link_libraries(histogram_tool_test rt)
 target_link_libraries(histogram_tool_test pthread)
