@@ -4,8 +4,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -14,7 +12,18 @@
 
 namespace
 {
-    using Records = std::vector<std::pair<uint64_t, uint32_t>>;
+    struct HighGroup
+    {
+        uint8_t prefix;
+        std::vector<uint32_t> counts;
+    };
+
+    struct LowGroup
+    {
+        uint8_t prefix;
+        uint32_t records;
+    };
+
     std::filesystem::path test_dir;
     std::string tool;
 
@@ -30,200 +39,322 @@ namespace
         return result + "'";
     }
 
-    // Independent encoder: base-4 digits occupy the most significant bits of
-    // each word; complete words and the high bytes of a partial word go to disk.
-    void write_key(std::ofstream& out, uint32_t k, uint64_t id)
+    std::filesystem::path input(const char* name)
     {
-        for (uint32_t base = 0; base < k; base += 32)
+        return test_dir / name;
+    }
+
+    uint32_t count_width(uint32_t count_max)
+    {
+        return count_max <= 255 ? 1 : count_max <= 65535 ? 2 :
+            count_max <= 16777215 ? 3 : 4;
+    }
+
+    size_t batch_limit(size_t width)
+    {
+        return (2ULL * 1024 * 1024 - 5) / width;
+    }
+
+    void write_infos(uint32_t k, uint32_t count_max)
+    {
+        std::ofstream out(input("infos.bin"), std::ios::binary | std::ios::trunc);
+        require(static_cast<bool>(out), "failed to create infos.bin");
+        out.write(reinterpret_cast<const char*>(&k), sizeof(k));
+        out.write(reinterpret_cast<const char*>(&count_max), sizeof(count_max));
+        out.close();
+        require(static_cast<bool>(out), "failed to write infos.bin");
+    }
+
+    // Independent encoder: u8 P | u32 N | prefix[P] |
+    // N * { suffix[W-P]; count[count_bytes] }, with counts omitted when null.
+    void write_group(std::ofstream& out, uint8_t prefix, size_t width, uint32_t records,
+                     uint32_t count_bytes, const uint32_t* counts, uint32_t seed)
+    {
+        require(prefix < width && records > 0 && records <= batch_limit(width),
+                "invalid fixture group");
+        std::vector<uint8_t> buffer;
+        buffer.reserve(5 + prefix + size_t(records) * (width - prefix + count_bytes));
+        buffer.push_back(prefix);
+        for (uint32_t shift = 0; shift < 32; shift += 8)
+            buffer.push_back(static_cast<uint8_t>(records >> shift));
+        for (size_t i = 0; i < prefix; ++i)
+            buffer.push_back(static_cast<uint8_t>(seed + i));
+        for (uint32_t record = 0; record < records; ++record)
         {
-            uint64_t word = 0;
-            uint32_t bases = std::min(32U, k - base);
-            uint64_t digits = id ^ ((base / 32) * 0x9e3779b97f4a7c15ULL);
-            for (uint32_t j = 0; j < bases; ++j)
-            {
-                word |= (digits & 3) << (62 - 2 * j);
-                digits >>= 2;
-            }
-            uint32_t bytes = (bases + 3) / 4;
-            const char* data = reinterpret_cast<const char*>(&word);
-            out.write(data + (bases == 32 ? 0 : 8 - bytes), bytes);
+            for (size_t i = 0; i < width - prefix; ++i)
+                buffer.push_back(static_cast<uint8_t>(seed + record * 13 + i));
+            if (counts)
+                for (uint32_t byte = 0; byte < count_bytes; ++byte)
+                    buffer.push_back(static_cast<uint8_t>(counts[record] >> (8 * byte)));
+        }
+        out.write(reinterpret_cast<const char*>(buffer.data()),
+                  static_cast<std::streamsize>(buffer.size()));
+        require(static_cast<bool>(out), "failed to write fixture group");
+    }
+
+    void fixture(uint32_t k, uint32_t count_max, const std::vector<HighGroup>& high,
+                 const std::vector<LowGroup>& low)
+    {
+        const size_t width = (k + 3) / 4;
+        const uint32_t count_bytes = count_width(count_max);
+        write_infos(k, count_max);
+        {
+            std::ofstream out(input("high.bin"), std::ios::binary | std::ios::trunc);
+            require(static_cast<bool>(out), "failed to create high.bin");
+            for (size_t i = 0; i < high.size(); ++i)
+                write_group(out, high[i].prefix, width,
+                            static_cast<uint32_t>(high[i].counts.size()), count_bytes,
+                            high[i].counts.data(), static_cast<uint32_t>(i * 31 + 7));
+            out.close();
+            require(static_cast<bool>(out), "failed to write high.bin");
+        }
+        {
+            std::ofstream out(input("low.bin"), std::ios::binary | std::ios::trunc);
+            require(static_cast<bool>(out), "failed to create low.bin");
+            for (size_t i = 0; i < low.size(); ++i)
+                write_group(out, low[i].prefix, width, low[i].records, 0, nullptr,
+                            static_cast<uint32_t>(i * 31 + 19));
+            out.close();
+            require(static_cast<bool>(out), "failed to write low.bin");
         }
     }
 
-    void fixture(uint32_t k, uint32_t cap, const Records& high, const std::vector<uint64_t>& low)
+    int invoke(const std::vector<std::string>& args)
     {
-        std::ofstream info(test_dir / "infos.bin", std::ios::binary);
-        info.write(reinterpret_cast<const char*>(&k), 4);
-        info.write(reinterpret_cast<const char*>(&cap), 4);
-        uint32_t bytes = cap <= 255 ? 1 : cap <= 65535 ? 2 : cap <= 16777215 ? 3 : 4;
-        std::ofstream high_out(test_dir / "high.bin", std::ios::binary);
-        for (auto [key, count] : high)
-        {
-            write_key(high_out, k, key);
-            high_out.write(reinterpret_cast<const char*>(&count), bytes);
-        }
-        std::ofstream low_out(test_dir / "low.bin", std::ios::binary);
-        for (uint64_t key : low) write_key(low_out, k, key);
-    }
-
-    int run(const std::string& mode, uint32_t threads, const std::string& memory,
-            uint32_t min, uint32_t max, const std::string& output = "hist.tsv")
-    {
-        std::string command = quote(tool) + " " + mode + " " + quote(test_dir.string()) + " " +
-            std::to_string(threads) + " " + memory + " " + quote((test_dir / output).string()) +
-            " " + std::to_string(min) + " " + std::to_string(max) + " > " +
-            quote((test_dir / "stdout").string()) + " 2> " + quote((test_dir / "stderr").string());
+        std::string command = quote(tool);
+        for (const auto& arg : args) command += " " + quote(arg);
+        command += " > " + quote((test_dir / "stdout").string()) +
+            " 2> " + quote((test_dir / "stderr").string());
         return std::system(command.c_str());
+    }
+
+    int run(uint32_t min, uint32_t max, const std::string& output = "hist.tsv")
+    {
+        return invoke({test_dir.string(), (test_dir / output).string(),
+                       std::to_string(min), std::to_string(max)});
     }
 
     std::string read(const char* name)
     {
-        std::ifstream input(test_dir / name);
-        return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        std::ifstream input_file(test_dir / name);
+        return {std::istreambuf_iterator<char>(input_file), std::istreambuf_iterator<char>()};
     }
 
-    void check(const Records& high, const std::vector<uint64_t>& low, uint32_t cap,
-               uint32_t min, uint32_t max, bool precise, uint32_t threads = 4,
-               const std::string& memory = "1", bool segmented = false)
+    void patch_byte(const char* name, std::streamoff offset, uint8_t value)
     {
-        // Serial reference joins unique keys, then builds the histogram of final
-        // counts. It does not repeat the production histogram correction rules.
-        std::map<uint64_t, uint64_t> counts;
-        for (auto [key, count] : high) counts.emplace(key, count);
-        if (precise)
-            for (uint64_t key : low)
-            {
-                auto found = counts.find(key);
-                if (found == counts.end()) counts[key] = 1;
-                else found->second = std::min<uint64_t>(cap, found->second + 1);
-            }
+        std::fstream file(input(name), std::ios::in | std::ios::out | std::ios::binary);
+        require(static_cast<bool>(file), std::string("failed to open ") + name);
+        file.seekp(offset);
+        file.put(static_cast<char>(value));
+        file.close();
+        require(static_cast<bool>(file), std::string("failed to patch ") + name);
+    }
+
+    void patch_u32(const char* name, std::streamoff offset, uint32_t value)
+    {
+        std::fstream file(input(name), std::ios::in | std::ios::out | std::ios::binary);
+        require(static_cast<bool>(file), std::string("failed to open ") + name);
+        file.seekp(offset);
+        file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        file.close();
+        require(static_cast<bool>(file), std::string("failed to patch ") + name);
+    }
+
+    void append(const char* name, const std::string& bytes)
+    {
+        std::ofstream file(input(name), std::ios::binary | std::ios::app);
+        require(static_cast<bool>(file), std::string("failed to open ") + name);
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        file.close();
+        require(static_cast<bool>(file), std::string("failed to append ") + name);
+    }
+
+    void verify(uint32_t min, uint32_t max, const std::vector<HighGroup>& high,
+                const std::vector<LowGroup>& low)
+    {
         std::vector<int64_t> expected(static_cast<size_t>(max) - min + 1, 0);
-        for (auto [key, count] : counts)
-            if (count >= min && count <= max) ++expected[count - min];
-        // Final low.bin contains one distinct singleton per record. The fast
-        // path can count these directly without joining their keys with high.
-        if (!precise && min <= 1 && max >= 1)
-            expected[1 - min] += low.size();
-        int status = run(precise ? "precise" : "approximate", threads, memory, min, max);
+        for (const auto& group : high)
+            for (uint32_t count : group.counts)
+                if (count >= min && count <= max) ++expected[count - min];
+        if (min <= 1 && max >= 1)
+        {
+            uint64_t low_records = 0;
+            for (const auto& group : low) low_records += group.records;
+            expected[1 - min] += static_cast<int64_t>(low_records);
+        }
+
+        const int status = run(min, max);
         require(status == 0, "tool failed: " + read("stderr"));
-        std::ifstream input(test_dir / "hist.tsv");
+        std::ifstream tsv(input("hist.tsv"));
         uint64_t freq;
         int64_t count;
-        // The TSV has no header: verify its first bucket as well as every other.
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            require(static_cast<bool>(input >> freq >> count), "missing TSV row");
-            require(freq == min + i && count == expected[i], "histogram mismatch at " + std::to_string(min + i));
+            require(static_cast<bool>(tsv >> freq >> count), "missing TSV row");
+            require(freq == static_cast<uint64_t>(min) + i, "wrong TSV frequency");
+            require(count == expected[i], "histogram mismatch at " + std::to_string(freq));
         }
-        require(!(input >> freq), "extra TSV rows");
-        auto output = read("stdout");
+        require(!(tsv >> freq), "extra TSV rows");
+        const std::string output = read("stdout");
         require(output.find("progress 0%") != std::string::npos &&
                 output.find("progress 100%") != std::string::npos, "missing progress");
-        if (segmented) require(output.find("Streaming mode:") != std::string::npos, "segmented path not exercised");
-        else require(output.find("Streaming mode:") == std::string::npos, "unexpected extra low-file scans");
+        require(output.find("Streaming mode:") == std::string::npos,
+                "unexpected segmented histogram output");
+    }
+
+    void check(uint32_t k, uint32_t count_max, const std::vector<HighGroup>& high,
+               const std::vector<LowGroup>& low, uint32_t min, uint32_t max)
+    {
+        fixture(k, count_max, high, low);
+        verify(min, max, high, low);
+    }
+
+    void reset_fixture()
+    {
+        fixture(33, 255, {{2, {1, 2}}, {0, {5}}}, {{1, 3}});
+    }
+
+    void require_failure(uint32_t min, uint32_t max, const std::string& message)
+    {
+        require(run(min, max) != 0, message + ": " + read("stderr"));
     }
 
     void test_boundaries()
     {
-        for (uint32_t k : {1U, 4U, 18U, 31U, 32U, 33U, 41U, 63U, 64U, 65U, 81U, 95U, 96U, 97U, 127U, 128U})
-            for (uint32_t cap : {1U, 255U, 65535U, 16777215U, 4294967295U})
+        for (uint32_t k : {1U, 4U, 18U, 31U, 32U, 33U, 41U, 63U, 64U, 65U, 81U, 95U,
+                           96U, 97U, 127U, 128U})
+        {
+            const size_t width = (k + 3) / 4;
+            const auto second_prefix = static_cast<uint8_t>(std::min<size_t>(2, width - 1));
+            for (uint32_t count_max : {1U, 255U, 65535U, 16777215U, 4294967295U})
             {
-                // Two keys also fit k=1. A saturated high record must stay in
-                // its original bucket when it is present in low.bin.
-                Records high{{0, 1}, {1, cap}};
-                std::vector<uint64_t> low{0, 1, 2};
-                fixture(k, cap, high, low);
-                check(high, low, cap, 1, 4, true, 1);
-                check(high, low, cap, 1, 4, true, 4);
-                check(high, low, cap, cap - 1, cap, true);
-                check(high, low, cap, 1, 4, false);
-                check(high, low, cap, cap - 1, cap, false);
+                const auto clamp = [count_max](uint32_t value)
+                {
+                    return std::min(value, count_max);
+                };
+                const std::vector<HighGroup> high{
+                    {0, {1, 1, clamp(2), clamp(3), clamp(4), count_max}},
+                    {second_prefix, {count_max, count_max, 1, clamp(2)}}};
+                const std::vector<LowGroup> low{{0, 3}, {second_prefix, 2}};
+                check(k, count_max, high, low, 1, 4);
+                check(k, count_max, high, low, count_max - 1, count_max);
+                check(k, count_max, high, low, 2, 4);
             }
-        Records high{{0, 1}, {1, 2}, {2, 5}};
-        std::vector<uint64_t> low{0, 1, 2, 3};
-        fixture(33, 255, high, low);
-        check(high, low, 255, 3, 5, true);
-        check(high, low, 255, 0, 5, true);
+        }
     }
 
     void test_empty_and_errors()
     {
-        for (Records high : {Records{}, Records{{0, 2}}})
-            for (std::vector<uint64_t> low : {std::vector<uint64_t>{}, std::vector<uint64_t>{0, 1}})
+        const std::vector<HighGroup> full_high{{2, {1, 2}}, {0, {5}}};
+        const std::vector<LowGroup> full_low{{1, 3}};
+        for (const auto& high : {std::vector<HighGroup>{}, full_high})
+            for (const auto& low : {std::vector<LowGroup>{}, full_low})
             {
-                fixture(33, 255, high, low);
-                check(high, low, 255, 1, 4, true);
-                check(high, low, 255, 1, 4, false);
+                check(33, 255, high, low, 1, 4);
+                check(33, 255, high, low, 2, 4);
             }
-        for (const std::string mode : {"precise", "approximate"})
+
+        require(invoke({}) != 0, "missing arguments accepted");
+        require(invoke({test_dir.string()}) != 0, "missing output accepted");
+        reset_fixture();
+        require(invoke({test_dir.string(), (test_dir / "hist.tsv").string(), "1", "4", "5"}) != 0,
+                "extra argument accepted");
+        require(run(4, 1) != 0, "reversed range accepted");
+        require(invoke({test_dir.string(), (test_dir / "hist.tsv").string(), "-1", "4"}) != 0,
+                "negative min accepted");
+        require(invoke({test_dir.string(), (test_dir / "hist.tsv").string(), "abc", "4"}) != 0,
+                "non-numeric min accepted");
+        require(invoke({test_dir.string(), (test_dir / "hist.tsv").string(), "", "4"}) != 0,
+                "empty min accepted");
+        require(run(1, 4, "missing/out.tsv") != 0, "invalid output path accepted");
+        if (std::filesystem::exists("/dev/full"))
         {
-            fixture(33, 255, {{0, 2}}, {});
-            require(run(mode, 1, "0.001", 1, 4) != 0, "insufficient budget accepted");
-            require(run(mode, 1, "nan", 1, 4) != 0, "NaN budget accepted");
-            require(run(mode, 1, "inf", 1, 4) != 0, "infinite budget accepted");
-            require(run(mode, 1, "1", 1, 4, "missing/out.tsv") != 0, "bad output path accepted");
-            // A writable file that fails on flush catches buffered output errors.
-            if (std::filesystem::exists("/dev/full"))
-            {
-                std::filesystem::create_symlink("/dev/full", test_dir / "full");
-                require(run(mode, 1, "1", 1, 4, "full") != 0, "output write failure ignored");
-                std::filesystem::remove(test_dir / "full");
-            }
-            for (const char* name : {"infos.bin", "high.bin", "low.bin"})
-            {
-                fixture(33, 255, {{0, 2}}, {});
-                std::ofstream corrupt(test_dir / name, std::ios::binary | std::ios::app);
-                corrupt.put('x');
-                corrupt.close();
-                require(run(mode, 1, "1", 1, 4) != 0, "misaligned input accepted: " + std::string(name));
-            }
-            for (auto [k, cap] : Records{{0, 255}, {129, 255}, {33, 0}})
-            {
-                fixture(static_cast<uint32_t>(k), cap, {}, {});
-                require(run(mode, 1, "1", 1, 4) != 0, "bad metadata accepted");
-            }
-            for (const char* name : {"infos.bin", "high.bin", "low.bin"})
-            {
-                fixture(33, 255, {{0, 2}}, {});
-                std::filesystem::remove(test_dir / name);
-                require(run(mode, 1, "1", 1, 4) != 0, "missing input accepted");
-            }
+            std::filesystem::create_symlink("/dev/full", test_dir / "full");
+            require(run(1, 4, "full") != 0, "output write failure ignored");
+            std::filesystem::remove(test_dir / "full");
         }
+
+        for (const char* name : {"infos.bin", "high.bin", "low.bin"})
+        {
+            reset_fixture();
+            std::filesystem::remove(input(name));
+            require_failure(1, 4, std::string("missing input accepted: ") + name);
+        }
+        // A missing or corrupt low.bin is irrelevant unless frequency 1 is requested.
+        reset_fixture();
+        std::filesystem::remove(input("low.bin"));
+        require(run(2, 4) == 0, "unused low.bin was required");
+        reset_fixture();
+        std::filesystem::resize_file(input("low.bin"),
+                                     std::filesystem::file_size(input("low.bin")) - 1);
+        require(run(2, 4) == 0, "unused low.bin was parsed");
+        require_failure(1, 4, "truncated low.bin accepted");
+
+        reset_fixture();
+        std::filesystem::resize_file(input("infos.bin"), 7);
+        require_failure(1, 4, "short infos.bin accepted");
+        reset_fixture();
+        append("infos.bin", "x");
+        require_failure(1, 4, "long infos.bin accepted");
+        for (auto [k, count_max] : {std::pair<uint32_t, uint32_t>{0, 255}, {129, 255}, {33, 0}})
+        {
+            reset_fixture();
+            write_infos(k, count_max);
+            require_failure(1, 4, "invalid infos.bin metadata accepted");
+        }
+
+        reset_fixture();
+        std::filesystem::resize_file(input("high.bin"), 3);
+        require_failure(1, 4, "partial group header accepted");
+        reset_fixture();
+        std::filesystem::resize_file(input("high.bin"), 6);
+        require_failure(1, 4, "partial group prefix accepted");
+        reset_fixture();
+        std::filesystem::resize_file(input("high.bin"),
+                                     std::filesystem::file_size(input("high.bin")) - 1);
+        require_failure(1, 4, "truncated high count accepted");
+        reset_fixture();
+        append("high.bin", std::string(1, '\0'));
+        require_failure(1, 4, "trailing partial header accepted");
+        reset_fixture();
+        append("high.bin", std::string(5, '\0'));
+        require_failure(1, 4, "trailing empty group accepted");
+        reset_fixture();
+        patch_byte("high.bin", 0, 9);
+        require_failure(1, 4, "invalid prefix length accepted");
+        reset_fixture();
+        patch_u32("high.bin", 1, 0);
+        require_failure(1, 4, "empty group accepted");
+        reset_fixture();
+        patch_u32("high.bin", 1, static_cast<uint32_t>(batch_limit(9) + 1));
+        require_failure(1, 4, "oversized group accepted");
     }
 
     void test_large_stream()
     {
-        Records high;
-        std::vector<uint64_t> low;
-        for (uint64_t i = 0; i < 300000; ++i)
+        constexpr uint32_t k = 33;
+        constexpr uint32_t count_max = 255;
+        constexpr uint32_t group_records = 200000;
+        std::vector<HighGroup> high;
+        std::vector<LowGroup> low;
+        for (uint32_t group = 0; group < 12; ++group)
         {
-            high.emplace_back(i, static_cast<uint32_t>(1 + i % 10));
-            if (i % 2 == 0) low.push_back(i);
+            HighGroup spec{static_cast<uint8_t>(group % 4), {}};
+            spec.counts.resize(group_records);
+            for (uint32_t i = 0; i < group_records; ++i)
+                spec.counts[i] = i % 997 == 0 ? count_max : 1 + (group * 7 + i) % 9;
+            high.push_back(std::move(spec));
         }
-        low.push_back(400000);
-        fixture(18, 255, high, low);
-        check(high, low, 255, 1, 11, false, 1);
-        check(high, low, 255, 1, 11, true, 1);
-        check(high, low, 255, 1, 11, true, 4);
-        check(high, low, 255, 1, 11, true, 1, "0.142", true);
-        fixture(128, 255, high, low);
-        check(high, low, 255, 1, 11, false, 1);
-        check(high, low, 255, 1, 11, false, 4);
-        check(high, low, 255, 1, 11, true, 1);
-        check(high, low, 255, 1, 11, true, 4);
-        check(high, low, 255, 1, 11, true, 1, "0.150", true);
-        check(high, low, 255, 1, 11, true, 4, "0.170", true);
-        check(high, low, 255, 3, 9, true, 1, "0.150", true);
-        fixture(128, 255, high, {});
-        check(high, {}, 255, 1, 11, true, 1, "0.150", true);
-        // Same budget formerly required multiple scans with 32-byte keys.
-        fixture(65, 255, high, low);
-        check(high, low, 255, 1, 11, true, 1, "0.150", false);
-        check(high, low, 255, 1, 11, true, 1, "0.146", true);
-        check(high, low, 255, 1, 11, true, 4, "0.170", false);
-        fixture(41, 255, high, low);
-        check(high, low, 255, 1, 11, true, 1, "0.145", false);
-        check(high, low, 255, 1, 11, true, 1, "0.143", true);
+        for (uint32_t group = 0; group < 8; ++group)
+            low.push_back({static_cast<uint8_t>(group % 3), group_records});
+
+        fixture(k, count_max, high, low);
+        require(std::filesystem::file_size(input("high.bin")) > 8ULL * 1024 * 1024,
+                "high stream does not span the AIO window depth");
+        require(std::filesystem::file_size(input("low.bin")) > 8ULL * 1024 * 1024,
+                "low stream does not span the AIO window depth");
+        verify(1, 10, high, low);
+        verify(3, 7, high, low);
     }
 }
 
@@ -237,18 +368,11 @@ int main(int argc, char* argv[])
     test_dir = dir;
     try
     {
-        // Finalized files are disjoint; include high-side Bloom false positives
-        // at frequency one as well as the three records in low.bin.
-        Records high{{0, 1}, {1, 2}, {2, 255}};
-        std::vector<uint64_t> low{3, 4, 5};
-        fixture(33, 255, high, low);
-        check(high, low, 255, 1, 4, false);
-        check(high, low, 255, 1, 4, true);
         test_boundaries();
         test_empty_and_errors();
         test_large_stream();
         std::filesystem::remove_all(test_dir);
-        std::cout << "Histogram serial-reference, boundary, error and segmented tests passed\n";
+        std::cout << "Histogram group-format, boundary, error and AIO-window tests passed\n";
         return 0;
     }
     catch (const std::exception& ex)
