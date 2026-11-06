@@ -1,6 +1,7 @@
 #include "low_msd_test_helpers.h"
 #include "high_prefix_test_helpers.h"
 #include "../src/FastqClassifier.h"
+#include "../src/NoBloomFastqClassifier.h"
 #include "../src/ConcurrentFirstBlockRing.h"
 #include "../src/FastqParser.h"
 #include "../src/LowFrequencyReader.h"
@@ -63,6 +64,17 @@ struct ConcurrentFirstBlockRingTestAccess
 
 struct FastqClassifierTestAccess
 {
+    static void feed(NoBloomFastqClassifier<uint32_t>& classifier, const std::vector<Key>& keys, bool owned)
+    {
+        const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / kmer_bytes();
+        const auto bytes = flatten(keys);
+        for (size_t pos = 0; pos < keys.size(); pos += capacity) {
+            const auto count = std::min(capacity, keys.size() - pos);
+            if (owned) classifier.process_owned_block(bytes.data() + pos * kmer_bytes(), count);
+            else classifier.process_other_block(bytes.data() + pos * kmer_bytes(), count);
+        }
+    }
+    static auto* roots(NoBloomFastqClassifier<uint32_t>& classifier) { return classifier.local_root_nodes.data(); }
     static bool paused(const FastqClassifier<uint32_t>& classifier) { return classifier.first_paused_; }
     static void refresh(FastqClassifier<uint32_t>& classifier) { classifier.refresh_first_state(); }
     static void checkpoint(FastqClassifier<uint32_t>& classifier) { classifier.record_checkpoint(); }
@@ -2320,11 +2332,273 @@ void check_low_queue_pause(Shared& shared)
                 ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
     require(actual == std::map<Key, uint64_t>{{key, capacity}}, "normal and EOF queues lost pending hits");
 }
+struct NoBloomFixture
+{
+    Shared& shared;
+    ConcurrentMemoryPool pool{64ULL << 20};
+    std::unique_ptr<LayerQueues<uint32_t>> layers = std::make_unique<LayerQueues<uint32_t>>();
+    std::unique_ptr<KmerTree<uint32_t>> tree;
+    std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>> local =
+        std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>();
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    PhaseBarrier start{1};
+    std::unique_ptr<NoBloomFastqClassifier<uint32_t>> classifier;
+    NoBloomFixture(Shared& state, uint32_t k) : shared(state)
+    {
+        k_length = k;
+        pool.init_arenas();
+        for (size_t prefix = 0; prefix < prefix_owners.size(); ++prefix)
+            prefix_owners[prefix] = (prefix / 64 + prefix % 2) % 2;
+        tree = std::make_unique<KmerTree<uint32_t>>( &pool, layers.get(), &shared.exports);
+        classifier = std::make_unique<NoBloomFastqClassifier<uint32_t>>(0, &shared.inputs, local.get(), &global,
+            tree.get(), &pool, start);
+    }
+};
+
+void check_no_bloom_root_block_rollover(Shared& shared)
+{
+    NoBloomFixture fixture(shared, 33);
+    auto* roots = FastqClassifierTestAccess::roots(*fixture.classifier);
+    constexpr uint32_t prefix = 57;
+    auto key = make_key(33, 999);
+    key[0] = ((uint64_t{prefix} << 56)) >> 56;
+    const size_t block_capacity = 4092 / tree_record_bytes();
+    const size_t count = (MAX_KMER_BLOCK_NUM + 1) * block_capacity + 3;
+    std::vector<Key> keys(count, key);
+    fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), 0, prefix, roots);
+    require(roots[prefix].count == 0, "empty root append allocated a tree block");
+    fixture.tree->main_add_kmers_to_local_root(flatten(keys).data(), keys.size(), prefix, roots);
+    require(fixture.layers->size(0) == 1, "root rollover did not account for its queued task");
+    Task<uint32_t> task;
+    require(fixture.layers->get_queue(0)->try_dequeue(task), "full local root was not queued");
+    require(task.current_node == fixture.tree->root_nodes + prefix && task.depth == 0,
+        "rollover task points at the wrong global root");
+    require(task.count == MAX_KMER_BLOCK_NUM, "rollover task omitted full blocks");
+    std::map<Key, uint64_t> actual;
+    for (size_t b = 0; b < task.count; ++b)
+    {
+        require(task.kmer_blocks[b]->count == block_capacity, "rollover published a partial block");
+        for (size_t i = 0; i < task.kmer_blocks[b]->count; ++i)
+            ++actual[read_tree_key(task.kmer_blocks[b]->k_mers.data() + i * tree_record_bytes(task.depth), task.current_node, task.depth)];
+    }
+    // The ordinary multi-root interface must share the same append behavior.
+    auto other = key;
+    other[0] = ((173ULL << 56)) >> 56;
+    std::array<unsigned char, 27> more;
+    const auto more_bytes = flatten({key, key, other});
+    std::copy(more_bytes.begin(), more_bytes.end(), more.begin());
+    std::array<uint32_t, 256> counts{}, order{};
+    counts[prefix] = 2;
+    counts[173] = 1;
+    order[0] = prefix;
+    order[1] = 173;
+    fixture.tree->main_add_kmer_block_with_local_root_nodes(more, counts, order, 2, roots);
+    collect_roots(roots, actual);
+    const std::map<Key, uint64_t> expected{{key, count + 2}, {other, 1}};
+    require(actual == expected, "tree append lost data across a block or root boundary");
+}
+
+void collect_no_bloom_tasks(LayerQueues<uint32_t>& layers, std::map<Key, uint64_t>& counts)
+{
+    Task<uint32_t> task;
+    while (layers.get_queue(0)->try_dequeue(task)) {
+        require(task.depth == 0, "Classifier published a non-root task");
+        for (size_t b = 0; b < task.count; ++b) {
+            const auto* block = task.kmer_blocks[b];
+            for (size_t i = 0; i < block->count; ++i)
+                ++counts[read_tree_key(block->k_mers.data() + i * tree_record_bytes(), task.current_node)];
+        }
+    }
+}
+
+void check_no_bloom_all_occurrences(Shared& shared, uint32_t k, bool owned, size_t count)
+{
+    NoBloomFixture fixture(shared, k);
+    auto& classifier = *fixture.classifier;
+    using Access = FastqClassifierTestAccess;
+    std::vector<Key> keys;
+    std::map<Key, uint64_t> expected;
+    for (uint64_t seed = 1; keys.size() < count; ++seed) {
+        auto key = make_key(k, seed);
+        if (owned && prefix_owners[key[0]] != 0) continue;
+        ++expected[key];
+        keys.push_back(std::move(key));
+    }
+    Access::feed(classifier, keys, owned);
+    // These keys reappear only after the full batch has been submitted.
+    std::vector<Key> delayed(keys.begin(), keys.begin() + std::min(size_t{17}, keys.size()));
+    for (const auto& key : delayed) ++expected[key];
+    Access::feed(classifier, delayed, owned);
+    const auto total = keys.size() + delayed.size();
+    require(classifier.total_deal_kmer_count == total && classifier.total_kmers_send_to_tree == total
+        && static_cast<uint64_t>(fixture.tree->total_kmers_added.load()) == total,
+        "first pass did not submit every occurrence exactly once");
+    classifier.classify_first_pass();
+    classifier.finish_tree_input();
+    std::map<Key, uint64_t> actual;
+    collect_roots(fixture.tree->root_nodes, actual);
+    collect_no_bloom_tasks(*fixture.layers, actual);
+    require(actual == expected, "first pass or local root flush changed the complete occurrence multiset");
+    content_type content;
+    require(!shared.exports.consumer_try_dequeue(content), "Classifier submitted an ExportBlock");
+}
+
+void check_no_bloom_owner_and_global_queues(Shared& shared, bool before_eof)
+{
+    k_length = 33;
+    using Access = FastqClassifierTestAccess;
+    for (size_t i = 0; i < prefix_owners.size(); ++i) prefix_owners[i] = i % 2;
+    shared.inputs.reset_producers(1);
+    auto layers = std::make_unique<LayerQueues<uint32_t>>();
+    KmerTree<uint32_t> tree(&shared.pool, layers.get(), &shared.exports);
+    MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY> local_a, local_b;
+    MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY> global;
+    PhaseBarrier start(2);
+    auto constructing_a = std::async(std::launch::async, [&] {
+        return std::make_unique<NoBloomFastqClassifier<uint32_t>>(0, &shared.inputs, &local_a, &global,
+            &tree, &shared.pool, start);
+    });
+    NoBloomFastqClassifier<uint32_t> b(1, &shared.inputs, &local_b, &global, &tree, &shared.pool, start);
+    auto a = constructing_a.get();
+    auto even = make_key(k_length, 700), odd = make_key(k_length, 701);
+    even[0] = 16;
+    odd[0] = 17;
+    char* block;
+    shared.inputs.producer_dequeue(block);
+    std::memcpy(block, even.data(), kmer_bytes());
+    local_a.enqueue({block, 1});
+    shared.inputs.producer_dequeue(block);
+    std::memcpy(block, odd.data(), kmer_bytes());
+    local_b.enqueue({block, 1});
+    // Non-owner global work and a delayed duplicate from the owner queue.
+    shared.inputs.producer_dequeue(block);
+    std::memcpy(block, even.data(), kmer_bytes());
+    std::memcpy(block + kmer_bytes(), even.data(), kmer_bytes());
+    global.enqueue({block, 2});
+    if (!before_eof) shared.inputs.producer_set_finished();
+    auto finishing_b = std::async(std::launch::async, [&] { b.classify_first_pass(); });
+    if (before_eof) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (tree.total_kmers_added.load() != 3 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        const bool consumed = tree.total_kmers_added.load() == 3;
+        shared.inputs.producer_set_finished();
+        finishing_b.get();
+        require(consumed, "Classifier did not consume owner and foreign global tasks before EOF");
+        require(b.local_tasks == 1 && b.global_tasks == 1 && b.owner_tasks == 1,
+            "live task paths were not exercised");
+    } else {
+        require(finishing_b.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+            "first pass waited for another Classifier after EOF");
+        finishing_b.get();
+    }
+    a->classify_first_pass();
+    std::map<Key, uint64_t> a_counts, b_counts;
+    collect_roots(Access::roots(*a), a_counts);
+    collect_roots(Access::roots(b), b_counts);
+    require(a_counts == std::map<Key, uint64_t>{{even, 1}}, "owner queue was not consumed exactly once");
+    require(b_counts == std::map<Key, uint64_t>{{even, 2}, {odd, 1}},
+        "non-owner/global queue was not consumed exactly once");
+    a->finish_tree_input();
+    b.finish_tree_input();
+    std::map<Key, uint64_t> actual;
+    collect_roots(tree.root_nodes, actual);
+    collect_no_bloom_tasks(*layers, actual);
+    require(actual == std::map<Key, uint64_t>{{even, 3}, {odd, 1}},
+        "cross-Classifier local root flush lost occurrences");
+    content_type content;
+    require(!local_a.try_dequeue(content) && !local_b.try_dequeue(content) && !global.try_dequeue(content),
+        "first pass left queued tasks after EOF");
+    std::set<char*> returned;
+    while (shared.inputs.producer_try_dequeue(block))
+        require(returned.insert(block).second, "Classifier returned an input block twice");
+    require(returned.size() == shared.inputs.capacity(), "Classifier leaked an input block");
+    for (auto* data : returned) shared.inputs.consumer_enqueue(data);
+}
+
+void check_no_bloom_wait_failure(Shared& shared, bool returning_block, bool after_eof, bool global_task)
+{
+    NoBloomFixture fixture(shared, 33);
+    auto& state = fixture.pool.run_state();
+    ActiveRunScope active(state);
+    shared.inputs.reset_producers(after_eof ? 0 : 1);
+    std::vector<char> record(kmer_bytes());
+    if (returning_block) {
+        // The return queue is deliberately full, so returning this injected
+        // task blocks even though its Tree append has completed.
+        content_type content{record.data(), 1};
+        if (global_task) fixture.global.enqueue(content);
+        else fixture.local->enqueue(content);
+    }
+    std::promise<void> started;
+    auto running = std::async(std::launch::async, [&] {
+        started.set_value();
+        try { fixture.classifier->classify_first_pass(); }
+        catch (const std::runtime_error& error) { return std::strcmp(error.what(), "waiting failure") == 0; }
+        return false;
+    });
+    started.get_future().wait();
+    if (returning_block) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!fixture.tree->total_kmers_added.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+    }
+    const bool waiting = running.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    state.fail(std::make_exception_ptr(std::runtime_error("waiting failure")), "test");
+    require(running.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+        "Classifier did not exit a wait after RunState failure");
+    require(running.get() && waiting, "Classifier did not propagate the failure from a blocked wait");
+    require(!returning_block || fixture.tree->total_kmers_added.load() == 1,
+        "failure fixture did not reach input block return");
+    shared.inputs.reset_producers(0);
+}
+
+void check_no_bloom_first_pass_wait_failure(Shared& shared)
+{
+    NoBloomFixture fixture(shared, 33);
+    std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> queues{fixture.local};
+    ClassifierThreadPool<uint32_t> workers(fixture.tree.get(), &shared.inputs, queues, &fixture.global,
+        nullptr, &fixture.pool, 1, nullptr, false, false);
+    auto waiting = std::async(std::launch::async, [&] {
+        try { workers.wait_for_first_pass(); }
+        catch (const std::runtime_error& error) { return std::strcmp(error.what(), "first-pass failure") == 0; }
+        return false;
+    });
+    fixture.pool.run_state().fail(std::make_exception_ptr(std::runtime_error("first-pass failure")), "test");
+    require(waiting.wait_for(std::chrono::seconds(2)) == std::future_status::ready && waiting.get(),
+        "first-pass completion wait ignored failure");
+}
+
+void check_no_bloom_classifier()
+{
+    Shared shared;
+    for (uint32_t k : {1u, 31u, 33u, 65u, 81u, 128u}) {
+        const size_t capacity = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / ((k + 3) / 4);
+        for (bool owned : {false, true}) {
+            for (size_t count : {size_t{0}, size_t{1}, capacity - 1, capacity, capacity + 1})
+                std::async(std::launch::async, [&] { check_no_bloom_all_occurrences(shared, k, owned, count); }).get();
+        }
+    }
+    std::async(std::launch::async, [&] { check_no_bloom_root_block_rollover(shared); }).get();
+    for (bool before_eof : {false, true})
+        std::async(std::launch::async, [&] { check_no_bloom_owner_and_global_queues(shared, before_eof); }).get();
+    check_no_bloom_wait_failure(shared, false, false, false);
+    for (bool after_eof : {false, true}) {
+        for (bool global_task : {false, true})
+            std::async(std::launch::async, [&] { check_no_bloom_wait_failure(shared, true, after_eof, global_task); }).get();
+    }
+    std::async(std::launch::async, [&] { check_no_bloom_first_pass_wait_failure(shared); }).get();
+}
 }
 
 int main(int argc, char* argv[])
 {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--no-bloom") == 0) {
+            check_no_bloom_classifier();
+            std::cout << "NoBloomClassifier tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--first-pause") == 0) {
             Shared shared;
             check_first_pause_refresh(shared);

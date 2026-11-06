@@ -47,6 +47,7 @@ uint64_t estimated_file_size;    // 输入 FASTQ 文件的估计大小，单位�
 std::vector<std::string> filenames;
 size_t pool_budget_bytes = 0;
 bool first_cache_enabled = true;
+bool use_bloom_filter = true;
 
 void get_MAX_BLOOM_FILTER_CAPACITY()
 {
@@ -437,56 +438,60 @@ int process_main()
 
     runtime.check();
 
-    // 聚合各 reader 预读采样的字节数
-    uint64_t sampled_plain_bytes = 0;
-    uint64_t sampled_gz_decompressed_bytes = 0;
-    uint64_t sampled_gz_compressed_bytes = 0;
-    for (auto& pr : pre_readers)
-    {
-        sampled_plain_bytes += pr->get_sampled_plain_bytes();
-        sampled_gz_decompressed_bytes += pr->get_sampled_gz_decompressed_bytes();
-        sampled_gz_compressed_bytes += pr->get_sampled_gz_compressed_bytes();
-    }
-
-    // 预读线程已结束，质量值和采样统计已保存。
-    pre_readers.clear();
-
-    // 根据采样得到的实际解压比重新估计完整 FASTQ 大小(替代原来的 *4)
-    uint64_t total_plain_file_size = 0;
-    uint64_t total_gz_compressed_file_size = 0;
-    for (const auto& f : filenames)
-    {
-        int fd = ::open(f.data(), O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st;
-        if (::fstat(fd, &st) == 0)
-        {
-            unsigned char buf[2];
-            ssize_t n = ::read(fd, buf, 2);
-            if (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B)
-                total_gz_compressed_file_size += static_cast<uint64_t>(st.st_size);
-            else
-                total_plain_file_size += static_cast<uint64_t>(st.st_size);
-        }
-        ::close(fd);
-    }
-    double gz_ratio = 1.0;
-    if (sampled_gz_compressed_bytes > 0)
-        gz_ratio = static_cast<double>(sampled_gz_decompressed_bytes) / static_cast<double>(sampled_gz_compressed_bytes);
-    estimated_file_size = total_plain_file_size
-        + static_cast<uint64_t>(static_cast<double>(total_gz_compressed_file_size) * gz_ratio);
-    if (estimated_file_size == 0) estimated_file_size = 1;
-
-    // 保存预读得到的原始 prefix 计数(在 clamp 之前), 用于估计总 k-mer 数
-    uint64_t sampled_kmer_count = 0;
-    for (const auto& v : prefix_counts)
-        sampled_kmer_count += v.load(std::memory_order_relaxed);
-
-    const uint64_t sampled_raw_bytes = sampled_plain_bytes + sampled_gz_decompressed_bytes;
     uint64_t estimated_total_kmers = 1;
-    if (sampled_raw_bytes > 0)
-        estimated_total_kmers = static_cast<uint64_t>(
-            (static_cast<__uint128_t>(sampled_kmer_count) * estimated_file_size) / sampled_raw_bytes);
+    if (use_bloom_filter) {
+        // 聚合各 reader 预读采样的字节数
+        uint64_t sampled_plain_bytes = 0;
+        uint64_t sampled_gz_decompressed_bytes = 0;
+        uint64_t sampled_gz_compressed_bytes = 0;
+        for (auto& pr : pre_readers)
+        {
+            sampled_plain_bytes += pr->get_sampled_plain_bytes();
+            sampled_gz_decompressed_bytes += pr->get_sampled_gz_decompressed_bytes();
+            sampled_gz_compressed_bytes += pr->get_sampled_gz_compressed_bytes();
+        }
+
+        // 预读线程已结束，质量值和采样统计已保存。
+        pre_readers.clear();
+
+        // 根据采样得到的实际解压比重新估计完整 FASTQ 大小(替代原来的 *4)
+        uint64_t total_plain_file_size = 0;
+        uint64_t total_gz_compressed_file_size = 0;
+        for (const auto& f : filenames)
+        {
+            int fd = ::open(f.data(), O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st;
+            if (::fstat(fd, &st) == 0)
+            {
+                unsigned char buf[2];
+                ssize_t n = ::read(fd, buf, 2);
+                if (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B)
+                    total_gz_compressed_file_size += static_cast<uint64_t>(st.st_size);
+                else
+                    total_plain_file_size += static_cast<uint64_t>(st.st_size);
+            }
+            ::close(fd);
+        }
+        double gz_ratio = 1.0;
+        if (sampled_gz_compressed_bytes > 0)
+            gz_ratio = static_cast<double>(sampled_gz_decompressed_bytes) / static_cast<double>(sampled_gz_compressed_bytes);
+        estimated_file_size = total_plain_file_size
+            + static_cast<uint64_t>(static_cast<double>(total_gz_compressed_file_size) * gz_ratio);
+        if (estimated_file_size == 0) estimated_file_size = 1;
+
+        // 保存预读得到的原始 prefix 计数(在 clamp 之前), 用于估计总 k-mer 数
+        uint64_t sampled_kmer_count = 0;
+        for (const auto& v : prefix_counts)
+            sampled_kmer_count += v.load(std::memory_order_relaxed);
+
+        const uint64_t sampled_raw_bytes = sampled_plain_bytes + sampled_gz_decompressed_bytes;
+        if (sampled_raw_bytes > 0)
+            estimated_total_kmers = static_cast<uint64_t>(
+                (static_cast<__uint128_t>(sampled_kmer_count) * estimated_file_size) / sampled_raw_bytes);
+    } else {
+        pre_readers.clear();
+    }
 
     uint64_t average_count = 0;
 
@@ -519,25 +524,27 @@ int process_main()
     std::cout << "  classifier threads: " << classifier_num << std::endl;
     std::cout << "  task threads: " << tasker_num << std::endl;
 
-    get_MAX_BLOOM_FILTER_CAPACITY();
+    if (use_bloom_filter) get_MAX_BLOOM_FILTER_CAPACITY();
     lpt(prefix_counts, classifier_num);
-    calculate_bloom_filter_capacity(prefix_counts, estimated_total_kmers);
+    if (use_bloom_filter) calculate_bloom_filter_capacity(prefix_counts, estimated_total_kmers);
     // calculate_concurrent_map_capacity(prefix_counts);
 
     get_numa_nodes();
 
     std::array<void*, 256> bloom_storage{};
     size_t bloom_total_bytes = 0;
-    for (const auto capacity : bloom_filter_capacity) {
-        const size_t bytes = bloom_bytes(capacity);
-        if (bytes > SIZE_MAX - bloom_total_bytes) throw std::overflow_error("Bloom total bytes overflow");
-        bloom_total_bytes += bytes;
-    }
-    auto* bloom_begin = static_cast<unsigned char*>(pool->allocate_before_init_arenas(bloom_total_bytes));
-    size_t bloom_offset = 0;
-    for (size_t i = 0; i < bloom_storage.size(); ++i) {
-        bloom_storage[i] = bloom_begin + bloom_offset;
-        bloom_offset += bloom_bytes(bloom_filter_capacity[i]);
+    if (use_bloom_filter) {
+        for (const auto capacity : bloom_filter_capacity) {
+            const size_t bytes = bloom_bytes(capacity);
+            if (bytes > SIZE_MAX - bloom_total_bytes) throw std::overflow_error("Bloom total bytes overflow");
+            bloom_total_bytes += bytes;
+        }
+        auto* bloom_begin = static_cast<unsigned char*>(pool->allocate_before_init_arenas(bloom_total_bytes));
+        size_t bloom_offset = 0;
+        for (size_t i = 0; i < bloom_storage.size(); ++i) {
+            bloom_storage[i] = bloom_begin + bloom_offset;
+            bloom_offset += bloom_bytes(bloom_filter_capacity[i]);
+        }
     }
     pool->init_arenas();
 #ifdef TEST_MODE
@@ -566,7 +573,7 @@ int process_main()
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
     auto task_thread_pool = std::make_shared<SchedulerThreadPool<CountType>>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
-    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<CountType>>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, &bloom_storage, first_cache_enabled);
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<CountType>>(tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num, use_bloom_filter ? &bloom_storage : nullptr, first_cache_enabled, use_bloom_filter);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
     auto parser_thread_pool = std::make_shared<ParserThreadPool>(classifier_task_queues, global_classifier_task_queue.get(), pool.get(), parser_classifier_ring_pool.get(), parser_num);
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
@@ -610,99 +617,140 @@ int process_main()
 #endif
     reader_parser_ring_pool.reset();
     classifier_thread_pool->wait_for_first_pass();
-    pool->freeze_first();
+    if (use_bloom_filter) pool->freeze_first();
 #ifdef TEST_MODE
     const auto classifier_end = std::chrono::steady_clock::now();
-    pool->input_finished_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        classifier_end.time_since_epoch()).count(), std::memory_order_relaxed);
-#endif
-
-    // Drain and permanently detach the ordinary Ring; raw reclamation stays live.
-#ifdef TEST_MODE
-    const auto normal_drain_start = std::chrono::steady_clock::now();
-#endif
-    tree->mark_finish_export();
-    export_writer->wait_for_normal_drain();
-#ifdef TEST_MODE
-    const auto normal_drain_end = std::chrono::steady_clock::now();
-    std::cout << "FIRST sealed records: " << pool->first_valid_records.load()
-        << "\nFIRST input conservation: "
-        << (classifier_thread_pool->input_first_records.load() == classifier_thread_pool->input_pending_records.load() + pool->first_valid_records.load()) << '\n';
-#endif
-
-    // Scheduler 继续处理入树任务，此时不进入 final drain。
-#ifdef TEST_MODE
-    const auto low_start = std::chrono::steady_clock::now();
-#endif
-    const bool write_low = filter_min <= 1 && filter_max >= 1;
-    parser_classifier_ring_pool->reset_producers(low_parser_num);
-    std::unique_ptr<ExportWriter> low_writer;
-    if (write_low) {
-        export_ring_pool->reset_producers(1);
-        low_writer = std::make_unique<ExportWriter>(export_ring_pool.get(), temp_dir + "low.final.tmp", ExportWriter::OutputKind::FinalLow);
-        low_writer->start();
+    if (use_bloom_filter) {
+        pool->input_finished_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            classifier_end.time_since_epoch()).count(), std::memory_order_relaxed);
     }
-#ifdef TEST_MODE
-    const auto memory_first_start = std::chrono::steady_clock::now();
 #endif
-    classifier_thread_pool->start_low_pass();
-    classifier_thread_pool->wait_for_memory_first();
-#ifdef TEST_MODE
-    const auto memory_first_end = std::chrono::steady_clock::now();
-#endif
-#ifdef TEST_MODE
-    const auto export_join_start = std::chrono::steady_clock::now();
-#endif
-    export_writer->finish_reclaim();
-    export_writer->join();
-#ifdef TEST_MODE
-    const auto export_join_end = std::chrono::steady_clock::now();
-#endif
+
     [[maybe_unused]] uint64_t low_records_read = 0;
     uint64_t pending_encoded_read = 0;
-    {
-        SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> low_ring_pool(
-            LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, low_reader_num);
-        LowFrequencyReader low_reader(low_ring_pool);
-        try {
-        parser_thread_pool->start_low_pass(low_ring_pool, low_parser_num);
-        low_reader.start(temp_dir + "low.pending.bin", export_writer->shard_count());
-        low_reader.join();
-        runtime.check();
-        parser_thread_pool->join();
-    runtime.check();
-        low_records_read = low_reader.records_read();
-        pending_encoded_read = low_reader.encoded_bytes_read();
-        } catch (...) {
-            runtime.fail(std::current_exception(), "pending replay");
-            low_reader.join();
-            parser_thread_pool->join();
-            throw;
-        }
-    }
-    classifier_thread_pool->join();
-    if (write_low) {
-        tree->mark_finish_export();
-        low_writer->join();
-    } else {
-        const int low_fd = ::open((temp_dir + "low.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (low_fd < 0) {
-            std::perror("Failed to create empty final low file");
-            std::exit(-1);
-        }
-        if (::close(low_fd) != 0) {
-            std::perror("Failed to close empty final low file");
-            std::exit(-1);
-        }
-    }
-    const uint64_t low_records_unrecovered = classifier_thread_pool->low_records_scanned
-        - classifier_thread_pool->low_records_recovered;
-    const uint64_t singleton_records = low_records_unrecovered + classifier_thread_pool->first_drain_singletons;
-    const uint64_t low_records_kept = write_low ? singleton_records : 0;
-    const uint64_t low_records_discarded = write_low ? 0 : singleton_records;
+    uint64_t singleton_records = 0;
+    uint64_t low_records_kept = 0;
+    uint64_t low_records_discarded = 0;
 #ifdef TEST_MODE
-    const auto low_end = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point normal_drain_start{};
+    std::chrono::steady_clock::time_point normal_drain_end{};
+    std::chrono::steady_clock::time_point low_start{};
+    std::chrono::steady_clock::time_point low_end{};
+    std::chrono::steady_clock::time_point memory_first_start{};
+    std::chrono::steady_clock::time_point memory_first_end{};
+    std::chrono::steady_clock::time_point export_join_start{};
+    std::chrono::steady_clock::time_point export_join_end{};
 #endif
+
+    if (use_bloom_filter) {
+        // Drain and permanently detach the ordinary Ring; raw reclamation stays live.
+#ifdef TEST_MODE
+        normal_drain_start = std::chrono::steady_clock::now();
+#endif
+        tree->mark_finish_export();
+        export_writer->wait_for_normal_drain();
+#ifdef TEST_MODE
+        normal_drain_end = std::chrono::steady_clock::now();
+        std::cout << "FIRST sealed records: " << pool->first_valid_records.load()
+            << "\nFIRST input conservation: "
+            << (classifier_thread_pool->input_first_records.load() == classifier_thread_pool->input_pending_records.load() + pool->first_valid_records.load()) << '\n';
+#endif
+
+        // Scheduler 继续处理入树任务，此时不进入 final drain。
+#ifdef TEST_MODE
+        low_start = std::chrono::steady_clock::now();
+#endif
+        const bool write_low = filter_min <= 1 && filter_max >= 1;
+        parser_classifier_ring_pool->reset_producers(low_parser_num);
+        std::unique_ptr<ExportWriter> low_writer;
+        if (write_low) {
+            export_ring_pool->reset_producers(1);
+            low_writer = std::make_unique<ExportWriter>(export_ring_pool.get(), temp_dir + "low.final.tmp", ExportWriter::OutputKind::FinalLow);
+            low_writer->start();
+        }
+#ifdef TEST_MODE
+        memory_first_start = std::chrono::steady_clock::now();
+#endif
+        classifier_thread_pool->start_low_pass();
+        classifier_thread_pool->wait_for_memory_first();
+#ifdef TEST_MODE
+        memory_first_end = std::chrono::steady_clock::now();
+#endif
+#ifdef TEST_MODE
+        export_join_start = std::chrono::steady_clock::now();
+#endif
+        export_writer->finish_reclaim();
+        export_writer->join();
+#ifdef TEST_MODE
+        export_join_end = std::chrono::steady_clock::now();
+#endif
+        {
+            SPMCRingMemoryPool<LOW_FREQUENCY_RING_MEMORY_POOL_CAPACITY> low_ring_pool(
+                LOW_FREQUENCY_RING_MEMORY_POOL_BLOCK_SIZE, low_reader_num);
+            LowFrequencyReader low_reader(low_ring_pool);
+            try {
+            parser_thread_pool->start_low_pass(low_ring_pool, low_parser_num);
+            low_reader.start(temp_dir + "low.pending.bin", export_writer->shard_count());
+            low_reader.join();
+            runtime.check();
+            parser_thread_pool->join();
+        runtime.check();
+            low_records_read = low_reader.records_read();
+            pending_encoded_read = low_reader.encoded_bytes_read();
+            } catch (...) {
+                runtime.fail(std::current_exception(), "pending replay");
+                low_reader.join();
+                parser_thread_pool->join();
+                throw;
+            }
+        }
+        classifier_thread_pool->join();
+        if (write_low) {
+            tree->mark_finish_export();
+            low_writer->join();
+        } else {
+            const int low_fd = ::open((temp_dir + "low.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (low_fd < 0) {
+                std::perror("Failed to create empty final low file");
+                std::exit(-1);
+            }
+            if (::close(low_fd) != 0) {
+                std::perror("Failed to close empty final low file");
+                std::exit(-1);
+            }
+        }
+        const uint64_t low_records_unrecovered = classifier_thread_pool->low_records_scanned
+            - classifier_thread_pool->low_records_recovered;
+        singleton_records = low_records_unrecovered + classifier_thread_pool->first_drain_singletons;
+        low_records_kept = write_low ? singleton_records : 0;
+        low_records_discarded = write_low ? 0 : singleton_records;
+#ifdef TEST_MODE
+        low_end = std::chrono::steady_clock::now();
+#endif
+    } else {
+        classifier_thread_pool->join();
+
+        // Classifier 已提交全部本地 root；关闭空的 pending Writer 并清理本次分片。
+#ifdef TEST_MODE
+        export_join_start = std::chrono::steady_clock::now();
+#endif
+        tree->mark_finish_export();
+        export_writer->finish_reclaim();
+        export_writer->join();
+#ifdef TEST_MODE
+        export_join_end = std::chrono::steady_clock::now();
+#endif
+        for (uint64_t shard = 0; shard < export_writer->shard_count(); ++shard) {
+            const std::string path = temp_dir + "low.pending.bin." + std::to_string(shard);
+            if (::unlink(path.c_str()) != 0)
+                throw std::system_error(errno, std::generic_category(), "remove empty pending shard");
+        }
+        const int low_fd = ::open((temp_dir + "low.final.tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (low_fd < 0)
+            throw std::system_error(errno, std::generic_category(), "create empty final low output");
+        if (::close(low_fd) != 0)
+            throw std::system_error(errno, std::generic_category(), "close empty final low output");
+    }
 
     // 所有 Classifier 已完成回灌和本地 root flush，再进入 final drain。
     // Scheduler 排空剩余任务，直接导出 high.bin。
@@ -717,6 +765,8 @@ int process_main()
     const auto final_end = std::chrono::steady_clock::now();
 #endif
     if (::rename((temp_dir + "low.final.tmp").c_str(), (temp_dir + "low.bin").c_str()) != 0) {
+        if (!use_bloom_filter)
+            throw std::system_error(errno, std::generic_category(), "publish empty low output");
         std::perror("Failed to publish final low file");
         std::exit(-1);
     }
@@ -734,8 +784,10 @@ int process_main()
     std::cout << "Low frequency records kept: " << low_records_kept << std::endl;
     std::cout << "Low frequency records discarded: " << low_records_discarded << std::endl;
 #ifdef TEST_MODE
-    std::cout << "Low frequency reconciliation elapsed us: "
-        << std::chrono::duration_cast<std::chrono::microseconds>(low_end - low_start).count() << std::endl;
+    if (use_bloom_filter) {
+        std::cout << "Low frequency reconciliation elapsed us: "
+            << std::chrono::duration_cast<std::chrono::microseconds>(low_end - low_start).count() << std::endl;
+    }
 #endif
 
     const auto total_end = std::chrono::steady_clock::now();
@@ -767,8 +819,10 @@ int process_main()
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 #ifdef TEST_MODE
     std::cout << "RUN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - mid_start).count() << '\n';
-    std::cout << "MEMORY_FIRST elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(memory_first_end - memory_first_start).count() << '\n';
-    std::cout << "NORMAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(normal_drain_end - normal_drain_start).count() << '\n';
+    if (use_bloom_filter) {
+        std::cout << "MEMORY_FIRST elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(memory_first_end - memory_first_start).count() << '\n';
+        std::cout << "NORMAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(normal_drain_end - normal_drain_start).count() << '\n';
+    }
     std::cout << "CLOSE_PENDING elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(export_join_end - export_join_start).count() << '\n';
     std::cout << "FINAL_DRAIN elapsed us: " << std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count() << '\n';
     std::cout << "FIRST spill bytes: " << pool->spill_bytes.load() << '\n';
@@ -823,11 +877,16 @@ int process_main()
     std::cout << "KmerTree total kmers added: " << tree->total_kmers_added.load() << std::endl;
     std::cout << "Kmer total kmers exported: " << classifier_thread_pool->total_kmers_exported.load() << std::endl;
     std::cout << "Kmer total kmers sent to tree: " << classifier_thread_pool->total_kmers_send_to_tree.load() << std::endl;
-    std::cout << "equal : " << ((tree->total_kmers_added.load() + low_records_kept + low_records_discarded) == parser_thread_pool->get_total_read_kmer()) << std::endl;
-    std::cout << "Low frequency conservation: "
-        << (low_records_read == classifier_thread_pool->low_records_scanned &&
-            classifier_thread_pool->low_records_scanned + classifier_thread_pool->first_drain_singletons
-                == classifier_thread_pool->low_records_recovered + low_records_kept + low_records_discarded) << std::endl;
+    if (use_bloom_filter) {
+        std::cout << "equal : " << ((tree->total_kmers_added.load() + low_records_kept + low_records_discarded) == parser_thread_pool->get_total_read_kmer()) << std::endl;
+        std::cout << "Low frequency conservation: "
+            << (low_records_read == classifier_thread_pool->low_records_scanned &&
+                classifier_thread_pool->low_records_scanned + classifier_thread_pool->first_drain_singletons
+                    == classifier_thread_pool->low_records_recovered + low_records_kept + low_records_discarded) << std::endl;
+    } else {
+        std::cout << "equal : " << (tree->total_kmers_added.load() == classifier_thread_pool->total_kmers_send_to_tree.load()
+            && tree->total_kmers_added.load() == parser_thread_pool->get_total_read_kmer()) << std::endl;
+    }
 
     for (uint32_t i = 0;i < MAX_DEPTH;i++)
     {
@@ -853,7 +912,9 @@ int main(int argc, char* argv[])
     std::vector<char*> positional{argv[0]};
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
-        if (argument == "--first-cache=auto") first_cache_enabled = true;
+        if (argument == "--bloom=on") use_bloom_filter = true;
+        else if (argument == "--bloom=off") use_bloom_filter = false;
+        else if (argument == "--first-cache=auto") first_cache_enabled = true;
         else if (argument == "--first-cache=off") first_cache_enabled = false;
         else if (argument == "--first-reclaim=spill") {}
         else if (argument == "--first-reclaim=compact") {
@@ -869,7 +930,7 @@ int main(int argc, char* argv[])
     if (argc < 6 || argc > 11)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [mapping_filename=mapping.tmp] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
+            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [mapping_filename=mapping.tmp] [--bloom=on|off] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
         return 1;
     }
 
@@ -976,18 +1037,19 @@ int main(int argc, char* argv[])
         std::cout << "  Filter min: " << filter_min << std::endl;
         std::cout << "  Filter max: " << filter_max << std::endl;
         std::cout << "  Count max: " << count_max << std::endl;
+        std::cout << "  Bloom filter: " << (use_bloom_filter ? "on" : "off") << std::endl;
     }
     catch (const std::exception&)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
+            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [--bloom=on|off] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
         return 1;
     }
 
     if (concurrent_hash_map_max_capacity <= 1 || concurrent_hash_map_min_capacity > concurrent_hash_map_max_capacity || count_max == 0)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
+            << " <fastq_file> <k_length> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [filter_min=2] [filter_max=4294967295] [count_max=255] [--bloom=on|off] [--first-cache=auto|off] [--first-reclaim=spill]" << std::endl;
         return 1;
     }
 
