@@ -511,11 +511,16 @@ int process_main()
 #endif
 
     const uint32_t fewer_worker_num = std::max<uint32_t>(1U, worker_budget / (1.0 + TASK_CLASSIFIER_RATIO + 0.8));
-    const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
     const bool high_quailty = (avgQuality >= 33 + 30);
-    const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
+
+    // 低质量：classifier = worker_budget / (1 + 1.5) = 40%
+    const uint32_t low_classifier_num = std::max<uint32_t>(1U,
+        static_cast<uint32_t>(std::lround(
+            worker_budget / (1.0 + LOW_QUALITY_TASKER_PER_CLASSIFIER))));
+
+    const uint32_t classifier_num = high_quailty ? fewer_worker_num : low_classifier_num;
     if (classifier_num > 256) throw std::invalid_argument("too many Classifier owners");
-    const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
+    const uint32_t tasker_num = worker_budget - classifier_num;
     const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
 
     std::cout << "Thread split:" << std::endl;

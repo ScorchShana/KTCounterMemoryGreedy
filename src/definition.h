@@ -115,6 +115,7 @@ struct content_type
 
 // 解析线程配置常量
 constexpr double TASK_CLASSIFIER_RATIO = 1; // 分类与任务线程比例
+constexpr double LOW_QUALITY_TASKER_PER_CLASSIFIER = 1.5; // 低质量 classifier : tasker = 1 : 1.5
 
 // 任务线程配置常量
 constexpr uint32_t LOCAL_STACK_SIZE = 64;
