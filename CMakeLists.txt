@@ -262,12 +262,18 @@ if(ENABLE_TSAN_TESTS)
 endif()
 add_test(NAME BloomRepeatTest COMMAND bloom_repeat_test)
 add_test(NAME ClassifierFirstBatchTest COMMAND classifier_first_batch_test)
+add_test(NAME NoBloomClassifierTest COMMAND classifier_first_batch_test --no-bloom)
+set_tests_properties(NoBloomClassifierTest PROPERTIES TIMEOUT 60)
 set_tests_properties(BloomRepeatTest ClassifierFirstBatchTest PROPERTIES TIMEOUT 60)
 add_executable(get_kmer_test tests/test_get_kmer.cpp)
 add_test(NAME GetKmerTest COMMAND get_kmer_test)
 set_tests_properties(GetKmerTest PROPERTIES TIMEOUT 30)
 find_program(PYTHON3_EXECUTABLE NAMES python3)
 if(PYTHON3_EXECUTABLE)
+    add_test(NAME BloomModeSwitchTest
+        COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bloom_mode_switch.py
+            $<TARGET_FILE:Tree> $<TARGET_FILE:dump_tool>)
+    set_tests_properties(BloomModeSwitchTest PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
     add_test(NAME HighPrefixDecoderTest
         COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/high_prefix_format.py)
     add_test(NAME ClassifierEndToEndTest
